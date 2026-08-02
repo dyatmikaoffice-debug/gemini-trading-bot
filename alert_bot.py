@@ -2,7 +2,6 @@ import os
 import asyncio
 import httpx
 import pandas as pd
-import yfinance as yf
 from fastapi import FastAPI
 from google import genai
 from google.genai import types
@@ -12,9 +11,11 @@ from pydantic import BaseModel, Field
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
-TICKER_SYMBOL = "GC=F"  # Gold Futures / XAUUSD proxy
+SYMBOL = "XAU/USD"
+EXCHANGE = "OANDA"  # Matches TradingView OANDA Gold Spot
 
 app = FastAPI()
 
@@ -23,26 +24,52 @@ class SignalOutput(BaseModel):
     confidence: float
     summary: str
 
-def calculate_key_levels(df_1h):
+def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
     """
-    Calculates Daily Pivot Points and 1H Swing High/Low levels for Gold.
+    Fetches real-time OHLC candles for Spot Gold from Twelve Data (OANDA exchange).
     """
-    df_daily = yf.download(TICKER_SYMBOL, period="5d", interval="1d", progress=False)
-    
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&exchange={EXCHANGE}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
+    res = httpx.get(url).json()
+
+    if "values" not in res:
+        print(f"Error fetching Twelve Data ({interval}): {res}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(res["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+
+    # Rename columns to match standard pandas indicators (Capitalized)
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+    return df
+
+def calculate_key_levels():
+    """
+    Calculates Daily Pivot Points and 1H Swing High/Low levels for Gold using 1D and 1H data.
+    """
+    df_daily = fetch_twelve_data(interval="1day", outputsize=5)
+    df_1h = fetch_twelve_data(interval="1h", outputsize=30)
+
+    if df_daily.empty or df_1h.empty:
+        return None
+
     # Daily Pivot Points (from previous completed daily candle)
     prev_day = df_daily.iloc[-2]
     high = float(prev_day['High'])
     low = float(prev_day['Low'])
     close = float(prev_day['Close'])
-    
+
     pivot = (high + low + close) / 3
     r1 = (2 * pivot) - low
     s1 = (2 * pivot) - high
-    
+
     # Recent 1H Swing High & Low (20-candle lookback)
     swing_high = float(df_1h['High'].tail(20).max())
     swing_low = float(df_1h['Low'].tail(20).min())
-    
+
     return {
         "pivot": round(pivot, 2),
         "r1": round(r1, 2),
@@ -80,15 +107,15 @@ def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, em
 
 def get_mtf_data():
     """
-    Downloads multi-timeframe OHLC data from Yahoo Finance.
+    Fetches multi-timeframe OHLC data via Twelve Data REST API.
     """
-    df_5m = yf.download(TICKER_SYMBOL, period="2d", interval="5m", progress=False)
-    df_15m = yf.download(TICKER_SYMBOL, period="5d", interval="15m", progress=False)
-    df_1h = yf.download(TICKER_SYMBOL, period="10d", interval="1h", progress=False)
+    df_5m = fetch_twelve_data(interval="5min", outputsize=60)
+    df_15m = fetch_twelve_data(interval="15min", outputsize=60)
+    df_1h = fetch_twelve_data(interval="1h", outputsize=60)
+    df_4h = fetch_twelve_data(interval="4h", outputsize=60)
 
-    df_4h = df_1h.resample('4h').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-    }).dropna()
+    if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
+        return None
 
     return {
         "5m": calculate_indicators(df_5m),
@@ -108,20 +135,18 @@ def analyze_and_alert():
     """
     Main loop function to check multi-timeframe alignment and ask Gemini.
     """
-    print("Checking Multi-Timeframe Gold Data...")
+    print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
     mtf = get_mtf_data()
+    levels = calculate_key_levels()
 
-    if not all([mtf["5m"], mtf["15m"], mtf["1h"], mtf["4h"]]):
+    if not mtf or not levels or not all([mtf["5m"], mtf["15m"], mtf["1h"], mtf["4h"]]):
+        print("Waiting for valid data stream...")
         return
 
     price = mtf["5m"]["close"]
-    
-    # Calculate Key Levels
-    df_1h_raw = yf.download(TICKER_SYMBOL, period="5d", interval="1h", progress=False)
-    levels = calculate_key_levels(df_1h_raw)
 
     prompt = f"""
-Analyze this Full Multi-Timeframe (MTF) Alignment setup for Gold ({TICKER_SYMBOL}):
+Analyze this Full Multi-Timeframe (MTF) Alignment setup for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
 KEY LEVELS & LIQUIDITY ZONES:
@@ -147,7 +172,7 @@ If decision is BUY or SELL, set action to "BUY" or "SELL" and write the summary 
 
 🚨 TRADE SIGNAL ALERT
 
-Asset: XAUUSD (Gold)
+Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
 Entry Price: ${price:.2f}
 

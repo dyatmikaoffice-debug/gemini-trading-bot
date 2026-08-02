@@ -8,13 +8,13 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-# Load API credentials from environment or defaults
+# Load API credentials from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
-TICKER_SYMBOL = "GC=F"
+TICKER_SYMBOL = "GC=F"  # Gold Futures / XAUUSD proxy
 
 app = FastAPI()
 
@@ -23,7 +23,38 @@ class SignalOutput(BaseModel):
     confidence: float
     summary: str
 
+def calculate_key_levels(df_1h):
+    """
+    Calculates Daily Pivot Points and 1H Swing High/Low levels for Gold.
+    """
+    df_daily = yf.download(TICKER_SYMBOL, period="5d", interval="1d", progress=False)
+    
+    # Daily Pivot Points (from previous completed daily candle)
+    prev_day = df_daily.iloc[-2]
+    high = float(prev_day['High'])
+    low = float(prev_day['Low'])
+    close = float(prev_day['Close'])
+    
+    pivot = (high + low + close) / 3
+    r1 = (2 * pivot) - low
+    s1 = (2 * pivot) - high
+    
+    # Recent 1H Swing High & Low (20-candle lookback)
+    swing_high = float(df_1h['High'].tail(20).max())
+    swing_low = float(df_1h['Low'].tail(20).min())
+    
+    return {
+        "pivot": round(pivot, 2),
+        "r1": round(r1, 2),
+        "s1": round(s1, 2),
+        "swing_high": round(swing_high, 2),
+        "swing_low": round(swing_low, 2)
+    }
+
 def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, ema_period=50):
+    """
+    Computes 50 EMA and Stochastic (14,3,3) metrics.
+    """
     if len(df) < max(stoch_k + stoch_d + smooth_k, ema_period):
         return None
 
@@ -37,26 +68,24 @@ def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, em
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    stoch_cross_up = (prev['%K'] < prev['%D']) and (latest['%K'] > latest['%D'])
-    stoch_cross_down = (prev['%K'] > prev['%D']) and (latest['%K'] < latest['%D'])
-    is_above_ema = latest['Close'] > latest['EMA_50']
-
     return {
         "close": float(latest['Close']),
         "ema_50": float(latest['EMA_50']),
-        "is_above_ema": bool(is_above_ema),
+        "is_above_ema": bool(latest['Close'] > latest['EMA_50']),
         "stoch_k": float(latest['%K']),
         "stoch_d": float(latest['%D']),
-        "stoch_cross_up": bool(stoch_cross_up),
-        "stoch_cross_down": bool(stoch_cross_down)
+        "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
+        "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D'])
     }
 
 def get_mtf_data():
-    ticker = yf.Ticker(TICKER_SYMBOL)
-    df_5m = ticker.history(period="5d", interval="5m")
-    df_15m = ticker.history(period="5d", interval="15m")
-    df_1h = ticker.history(period="1mo", interval="1h")
-    
+    """
+    Downloads multi-timeframe OHLC data from Yahoo Finance.
+    """
+    df_5m = yf.download(TICKER_SYMBOL, period="2d", interval="5m", progress=False)
+    df_15m = yf.download(TICKER_SYMBOL, period="5d", interval="15m", progress=False)
+    df_1h = yf.download(TICKER_SYMBOL, period="10d", interval="1h", progress=False)
+
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -69,10 +98,16 @@ def get_mtf_data():
     }
 
 def send_telegram_message(text: str):
+    """
+    Dispatches signal alerts directly to Telegram.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 def analyze_and_alert():
+    """
+    Main loop function to check multi-timeframe alignment and ask Gemini.
+    """
     print("Checking Multi-Timeframe Gold Data...")
     mtf = get_mtf_data()
 
@@ -80,64 +115,93 @@ def analyze_and_alert():
         return
 
     price = mtf["5m"]["close"]
+    
+    # Calculate Key Levels
+    df_1h_raw = yf.download(TICKER_SYMBOL, period="5d", interval="1h", progress=False)
+    levels = calculate_key_levels(df_1h_raw)
 
     prompt = f"""
-    Analyze this Full Multi-Timeframe (MTF) Alignment setup for Gold ({TICKER_SYMBOL}):
-    Current Price: ${price:.2f}
+Analyze this Full Multi-Timeframe (MTF) Alignment setup for Gold ({TICKER_SYMBOL}):
+Current Price: ${price:.2f}
 
-    - 4H Timeframe: Above 50 EMA = {mtf['4h']['is_above_ema']}
-    - 1H Timeframe: Above 50 EMA = {mtf['1h']['is_above_ema']}
-    - 15M Timeframe: Above 50 EMA = {mtf['15m']['is_above_ema']}
-    - 5M Timeframe: Above 50 EMA = {mtf['5m']['is_above_ema']}, Stoch %K = {mtf['5m']['stoch_k']:.1f}, Stoch Cross Up = {mtf['5m']['stoch_cross_up']}, Stoch Cross Down = {mtf['5m']['stoch_cross_down']}
+KEY LEVELS & LIQUIDITY ZONES:
+- 1H Swing High (Major Resistance): ${levels['swing_high']}
+- Daily Pivot R1: ${levels['r1']}
+- Central Pivot: ${levels['pivot']}
+- Daily Pivot S1: ${levels['s1']}
+- 1H Swing Low (Major Support): ${levels['swing_low']}
 
-    Strategy Rules:
-    - BUY: 4H & 1H strictly Bullish (Price > 50 EMA), 5M pulls back and crosses up on Stochastic (14,3,3) while reclaiming 5M 50 EMA.
-    - SELL: 4H & 1H strictly Bearish (Price < 50 EMA), 5M pulls back and crosses down on Stochastic (14,3,3) while falling below 5M 50 EMA.
-    - HOLD: If timeframes conflict.
+TECHNICAL METRICS:
+- 4H Timeframe: Above 50 EMA = {mtf['4h']['is_above_ema']}
+- 1H Timeframe: Above 50 EMA = {mtf['1h']['is_above_ema']}
+- 15M Timeframe: Above 50 EMA = {mtf['15m']['is_above_ema']}
+- 5M Timeframe: Above 50 EMA = {mtf['5m']['is_above_ema']}, Stoch %K = {mtf['5m']['stoch_k']:.1f}, Stoch Cross Up = {mtf['5m']['stoch_cross_up']}, Stoch Cross Down = {mtf['5m']['stoch_cross_down']}
 
-    Evaluate if 100% MTF alignment is confirmed.
-    """
+Strategy Rules:
+- BUY: 4H & 1H strictly Bullish (Price > 50 EMA), 5M pulls back and crosses up on Stochastic (14,3,3) while reclaiming 5M 50 EMA.
+- SELL: 4H & 1H strictly Bearish (Price < 50 EMA), 5M pulls back and crosses down on Stochastic (14,3,3) while falling below 5M 50 EMA.
+- HOLD: If timeframes conflict or lack 100% alignment.
 
-    config = types.GenerateContentConfig(
-        temperature=0.1,
-        response_mime_type="application/json",
-        response_schema=SignalOutput,
-        system_instruction="You are a professional Gold (XAUUSD) analyst enforcing strict MTF Confluence."
-    )
+Instructions for "summary" field:
+If decision is BUY or SELL, set action to "BUY" or "SELL" and write the summary EXACTLY in this format:
 
-    response = genai_client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt,
-        config=config
-    )
+🚨 TRADE SIGNAL ALERT
 
-    signal = SignalOutput.model_validate_json(response.text)
-    print(f"Decision: {signal.action} ({signal.confidence * 100:.0f}%)")
+Asset: XAUUSD (Gold)
+Action: [BUY or SELL]
+Entry Price: ${price:.2f}
 
-    if signal.action in ["BUY", "SELL"]:
-        msg = (
-            f"🎯 **FULL MTF ALIGNMENT SIGNAL ({signal.action})**\n\n"
-            f"• **Asset:** Gold (`GC=F`)\n"
-            f"• **Price:** `${price:.2f}`\n"
-            f"• **Macro (4H/1H):** `{'BULLISH' if mtf['1h']['is_above_ema'] else 'BEARISH'}`\n"
-            f"• **Trigger (5M Stoch 14,3,3):** `%K={mtf['5m']['stoch_k']:.1f}`\n"
-            f"• **Confidence:** `{int(signal.confidence * 100)}%`\n\n"
-            f"📝 **Reasoning:** _{signal.summary}_"
+Stop Loss (SL): $[Price]
+Take Profit 1 (TP1): $[Price]
+Take Profit 2 (TP2): $[Price]
+
+📍 NEAREST KEY LEVELS:
+• Resistance 2 (R2): ${levels['swing_high']} (1H Major High)
+• Resistance 1 (R1): ${levels['r1']} (Daily Pivot R1)
+---------------------------------------------
+• Current Price:     ${price:.2f}
+---------------------------------------------
+• Support 1 (S1):    ${levels['s1']} (Daily Pivot S1)
+• Support 2 (S2):    ${levels['swing_low']} (1H Major Low)
+
+📊 Confluence Reasoning: [2-sentence explanation]
+
+If decision is HOLD, set action to "HOLD" and summary to "HOLD".
+"""
+
+    try:
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=SignalOutput,
         )
-        send_telegram_message(msg)
+        response = genai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=config,
+        )
+
+        output = SignalOutput.model_validate_json(response.text)
+        print(f"Decision: {output.action} ({output.confidence * 100:.0f}%)")
+
+        if output.action in ["BUY", "SELL"]:
+            send_telegram_message(output.summary)
+
+    except Exception as e:
+        print(f"Error in bot loop: {e}")
 
 async def background_loop():
     while True:
         try:
             analyze_and_alert()
         except Exception as e:
-            print(f"Error in bot loop: {e}")
-        await asyncio.sleep(60)
+            print(f"Loop Exception: {e}")
+        await asyncio.sleep(300)  # Check every 5 minutes
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_loop())
 
 @app.get("/")
-def health_check():
-    return {"status": "running", "bot": "Gemini MTF Gold Alert Bot Active"}
+def head_check():
+    return {"status": "ok"}

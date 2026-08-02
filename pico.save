@@ -1,0 +1,68 @@
+test_send.py
+import os
+import httpx
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+
+# Load environment variables or paste your exact keys here for testing
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+
+# Initialize Gemini Client
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+class SignalOutput(BaseModel):
+    action: str = Field(description="BUY or SELL")
+    confidence: float
+    summary: str
+
+def test_pipeline():
+    print("1. Prompting Gemini AI...")
+    
+    # Fake market data payload for testing
+    fake_data = {
+        "symbol": "BTC-USD",
+        "current_price": 65000,
+        "rsi": 25.4, # Extremely oversold condition
+        "note": "Testing pipeline connection"
+    }
+
+    config = types.GenerateContentConfig(
+        temperature=0.1,
+        response_mime_type="application/json",
+        response_schema=SignalOutput,
+        system_instruction="You are a trading bot. Evaluate the oversold RSI condition and output a trade decision."
+    )
+
+    # Call Gemini
+    response = genai_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"Analyze test data: {fake_data}",
+        config=config
+    )
+
+    signal = SignalOutput.model_validate_json(response.text)
+    print(f"2. Gemini Output: {signal.action} (Confidence: {signal.confidence})")
+
+    # Send directly to Telegram
+    print("3. Sending to Telegram...")
+    msg = (
+        f"🧪 **TEST SIGNAL SUCCESSFUL** 🧪\n\n"
+        f"• **Symbol:** `BTC-USD`\n"
+        f"• **Action:** `{signal.action}`\n"
+        f"• **Confidence:** `{int(signal.confidence * 100)}%`\n"
+        f"• **Rationale:** _{signal.summary}_"
+    )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    res = httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+    if res.status_code == 200:
+        print("✅ SUCCESS: Telegram message delivered!")
+    else:
+        print(f"❌ FAILED: Telegram API returned error {res.status_code}\n{res.text}")
+
+if __name__ == "__main__":
+    test_pipeline()

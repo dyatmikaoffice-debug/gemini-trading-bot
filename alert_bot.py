@@ -29,38 +29,40 @@ def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
     Fetches real-time OHLC candles for Spot Gold from Twelve Data (OANDA exchange).
     """
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&exchange={EXCHANGE}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
-    res = httpx.get(url).json()
+    try:
+        res = httpx.get(url, timeout=10.0).json()
+    except Exception as e:
+        print(f"HTTP Request failed ({interval}): {e}")
+        return pd.DataFrame()
 
     if "values" not in res:
-        print(f"Error fetching Twelve Data ({interval}): {res}")
+        print(f"Twelve Data API Error ({interval}): {res.get('message', res)}")
         return pd.DataFrame()
 
     df = pd.DataFrame(res["values"])
+    if df.empty:
+        return pd.DataFrame()
+
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
-    # Rename lowercase keys from Twelve Data API to Title Case
+    # Rename Twelve Data lower-case keys to Title Case
     df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
 
     for col in ["Open", "High", "Low", "Close"]:
-        df[col] = df[col].astype(float)
+        if col in df.columns:
+            df[col] = df[col].astype(float)
 
-    return df
-    # Rename columns to match standard pandas indicators (Capitalized)
-    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
     return df
 
 def calculate_key_levels():
-    """
-    Calculates Daily Pivot Points and 1H Swing High/Low levels for Gold using 1D and 1H data.
-    """
     df_daily = fetch_twelve_data(interval="1day", outputsize=5)
     df_1h = fetch_twelve_data(interval="1h", outputsize=30)
 
-    if df_daily.empty or df_1h.empty:
+    # Early exit if data is missing or insufficient
+    if df_daily.empty or df_1h.empty or len(df_daily) < 2 or len(df_1h) < 20:
         return None
 
-    # Daily Pivot Points (from previous completed daily candle)
     prev_day = df_daily.iloc[-2]
     high = float(prev_day['High'])
     low = float(prev_day['Low'])
@@ -70,7 +72,6 @@ def calculate_key_levels():
     r1 = (2 * pivot) - low
     s1 = (2 * pivot) - high
 
-    # Recent 1H Swing High & Low (20-candle lookback)
     swing_high = float(df_1h['High'].tail(20).max())
     swing_low = float(df_1h['Low'].tail(20).min())
 
@@ -83,10 +84,7 @@ def calculate_key_levels():
     }
 
 def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, ema_period=50):
-    """
-    Computes 50 EMA and Stochastic (14,3,3) metrics.
-    """
-    if len(df) < max(stoch_k + stoch_d + smooth_k, ema_period):
+    if df.empty or len(df) < max(stoch_k + stoch_d + smooth_k, ema_period):
         return None
 
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
@@ -108,7 +106,6 @@ def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, em
         "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
         "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D'])
     }
-
 def get_mtf_data():
     """
     Fetches multi-timeframe OHLC data via Twelve Data REST API.

@@ -1,5 +1,6 @@
 import os
 import asyncio
+from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
 from fastapi import FastAPI
@@ -17,7 +18,31 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"  # Matches TradingView OANDA Gold Spot
 
-app = FastAPI()
+async def background_scanning_loop():
+    """Runs the analysis every 5 minutes in a non-blocking background loop."""
+    while True:
+        try:
+            # Run the synchronous analysis in a background thread
+            await asyncio.to_thread(analyze_and_alert)
+        except Exception as e:
+            print(f"Loop Exception caught: {e}")
+        
+        # Wait 300 seconds (5 minutes)
+        await asyncio.sleep(300)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start background task when Uvicorn boots
+    task = asyncio.create_task(background_scanning_loop())
+    yield
+    # Cancel task on shutdown
+    task.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "Trading bot background scanner is active!"}
 
 class SignalOutput(BaseModel):
     action: str = Field(description="BUY, SELL, or HOLD")
@@ -231,3 +256,4 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
 
     except Exception as e:
         print(f"Error parsing Gemini response: {e}")
+    

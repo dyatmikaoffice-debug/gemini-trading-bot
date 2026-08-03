@@ -18,41 +18,37 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"  # Matches TradingView OANDA Gold Spot
 
-async def background_scanning_loop():
-    """Runs the analysis every 5 minutes in a non-blocking background loop."""
-    while True:
-        try:
-            # Run the synchronous analysis in a background thread
-            await asyncio.to_thread(analyze_and_alert)
-        except Exception as e:
-            print(f"Loop Exception caught: {e}")
-        
-        # Wait 600 seconds (10 minutes)
-        await asyncio.sleep(600)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Start background task when Uvicorn boots
-    task = asyncio.create_task(background_scanning_loop())
-    yield
-    # Cancel task on shutdown
-    task.cancel()
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Trading bot background scanner is active!"}
 
 class SignalOutput(BaseModel):
     action: str = Field(description="BUY, SELL, or HOLD")
     confidence: float
     summary: str
 
-def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
-    """
-    Fetches real-time OHLC candles for Spot Gold from Twelve Data (OANDA exchange).
-    """
+
+def send_telegram_message(message: str):
+    """Sends a formatted notification to your Telegram Channel/Chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing. Skipping notification.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        res = httpx.post(url, json=payload, timeout=10.0)
+        if res.status_code == 200:
+            print("Telegram alert sent successfully.")
+        else:
+            print(f"Failed to send Telegram alert: {res.text}")
+    except Exception as e:
+        print(f"Telegram HTTP Error: {e}")
+
+
+def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
+    """Fetches real-time OHLC candles for Spot Gold from Twelve Data."""
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&exchange={EXCHANGE}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = httpx.get(url, timeout=10.0).json()
@@ -71,7 +67,6 @@ def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
-    # Rename Twelve Data lower-case keys to Title Case
     df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
 
     for col in ["Open", "High", "Low", "Close"]:
@@ -80,47 +75,36 @@ def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
 
     return df
 
-def calculate_key_levels():
-    df_daily = fetch_twelve_data(interval="1day", outputsize=5)
-    df_1h = fetch_twelve_data(interval="1h", outputsize=30)
 
-    # Early exit if data is missing or insufficient
-    if df_daily.empty or df_1h.empty or len(df_daily) < 2 or len(df_1h) < 20:
+def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50):
+    """Calculates EMA 50, True Stoch RSI (3,3,14,14), and Swing Levels."""
+    if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
-    prev_day = df_daily.iloc[-2]
-    high = float(prev_day['High'])
-    low = float(prev_day['Low'])
-    close = float(prev_day['Close'])
-
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-
-    swing_high = float(df_1h['High'].tail(20).max())
-    swing_low = float(df_1h['Low'].tail(20).min())
-
-    return {
-        "pivot": round(pivot, 2),
-        "r1": round(r1, 2),
-        "s1": round(s1, 2),
-        "swing_high": round(swing_high, 2),
-        "swing_low": round(swing_low, 2)
-    }
-
-def calculate_indicators(df: pd.DataFrame, stoch_k=8, stoch_d=3, smooth_k=3, ema_period=50):
-    if df.empty or len(df) < max(stoch_k + stoch_d + smooth_k, ema_period):
-        return None
-
+    # 1. EMA 50
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
-    low_min = df['Low'].rolling(window=stoch_k).min()
-    high_max = df['High'].rolling(window=stoch_k).max()
-    fast_k = 100 * ((df['Close'] - low_min) / (high_max - low_min))
-    df['%K'] = fast_k.rolling(window=smooth_k).mean()
-    df['%D'] = df['%K'].rolling(window=stoch_d).mean()
+
+    # 2. RSI Calculation
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # 3. Stochastic RSI (3,3,14,14)
+    rsi_min = df['RSI'].rolling(window=stoch_period).min()
+    rsi_max = df['RSI'].rolling(window=stoch_period).max()
+    stoch_rsi = (df['RSI'] - rsi_min) / (rsi_max - rsi_min)
+
+    df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
+    df['%D'] = df['%K'].rolling(window=d_period).mean()
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
+
+    # Calculate recent 15M Swing High/Low for SL calculation
+    swing_high = float(df['High'].tail(15).max())
+    swing_low = float(df['Low'].tail(15).min())
 
     return {
         "close": float(latest['Close']),
@@ -129,95 +113,94 @@ def calculate_indicators(df: pd.DataFrame, stoch_k=8, stoch_d=3, smooth_k=3, ema
         "stoch_k": float(latest['%K']),
         "stoch_d": float(latest['%D']),
         "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
-        "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D'])
+        "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D']),
+        "swing_high": swing_high,
+        "swing_low": swing_low
     }
-def get_mtf_data():
-    """
-    Fetches multi-timeframe OHLC data via Twelve Data REST API.
-    """
-    df_5m = fetch_twelve_data(interval="5min", outputsize=60)
-    df_15m = fetch_twelve_data(interval="15min", outputsize=60)
-    df_1h = fetch_twelve_data(interval="1h", outputsize=60)
-    df_4h = fetch_twelve_data(interval="4h", outputsize=60)
 
-    if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
+
+def get_mtf_data():
+    df_15m = fetch_twelve_data("15min", outputsize=100)
+    df_1h = fetch_twelve_data("1h", outputsize=100)
+
+    if df_15m.empty or df_1h.empty:
         return None
 
     return {
-        "5m": calculate_indicators(df_5m),
-        "15m": calculate_indicators(df_15m),
-        "1h": calculate_indicators(df_1h),
-        "4h": calculate_indicators(df_4h)
+        "15m": calculate_stoch_rsi(df_15m),
+        "1h": calculate_stoch_rsi(df_1h)
     }
 
-def send_telegram_message(text: str):
-    """
-    Dispatches signal alerts directly to Telegram.
-    """
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 def analyze_and_alert():
-    """
-    Main loop function to check multi-timeframe alignment and ask Gemini.
-    """
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
     mtf = get_mtf_data()
-    levels = calculate_key_levels()
 
-    if not mtf or not levels or not all([mtf["5m"], mtf["15m"], mtf["1h"], mtf["4h"]]):
+    if not mtf or not mtf["15m"] or not mtf["1h"]:
         print("Waiting for valid data stream...")
         return
 
-    price = mtf["5m"]["close"]
+    price = mtf["15m"]["close"]
 
     prompt = f"""
-Analyze this Full Multi-Timeframe (MTF) Alignment setup for Spot Gold (XAU/USD OANDA):
+Analyze this 1H / 15M Stochastic RSI Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-KEY LEVELS & LIQUIDITY ZONES:
-- 1H Swing High (Major Resistance): ${levels['swing_high']}
-- Daily Pivot R1: ${levels['r1']}
-- Central Pivot: ${levels['pivot']}
-- Daily Pivot S1: ${levels['s1']}
-- 1H Swing Low (Major Support): ${levels['swing_low']}
+1H TIMEFRAME (Higher Timeframe Trend Direction):
+- Price: ${mtf['1h']['close']:.2f} | 1H EMA 50: ${mtf['1h']['ema_50']:.2f} (Above EMA: {mtf['1h']['is_above_ema']})
+- 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f} | %D: {mtf['1h']['stoch_d']:.1f}
 
-TECHNICAL METRICS:
-- 4H Timeframe: Above 50 EMA = {mtf['4h']['is_above_ema']}
-- 1H Timeframe: Above 50 EMA = {mtf['1h']['is_above_ema']}
-- 15M Timeframe: Above 50 EMA = {mtf['15m']['is_above_ema']}
-- 5M Timeframe: Above 50 EMA = {mtf['5m']['is_above_ema']}, Stoch %K = {mtf['5m']['stoch_k']:.1f}, Stoch Cross Up = {mtf['5m']['stoch_cross_up']}, Stoch Cross Down = {mtf['5m']['stoch_cross_down']}
+15M TIMEFRAME (Execution & Momentum):
+- Price: ${mtf['15m']['close']:.2f} | 15M EMA 50: ${mtf['15m']['ema_50']:.2f} (Above EMA: {mtf['15m']['is_above_ema']})
+- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | %D: {mtf['15m']['stoch_d']:.1f}
+- 15M Stoch Cross Up: {mtf['15m']['stoch_cross_up']} | Cross Down: {mtf['15m']['stoch_cross_down']}
+- 15M Recent Swing High: ${mtf['15m']['swing_high']:.2f}
+- 15M Recent Swing Low: ${mtf['15m']['swing_low']:.2f}
 
-Strategy Rules:
-- BUY: 1H trend is Bullish (Price > 50 EMA) AND 5M Stochastic (14,3,3) crosses up.
-- SELL: 1H trend is Bearish (Price < 50 EMA) AND 5M Stochastic (14,3,3) crosses down.
-- Ignore 4H trend conflicts if 1H and 5M show clear momentum.
+STRATEGY ENTRY RULES:
+- BUY ENTRY: 
+  * 1H Trend is Bullish (Price > 1H EMA 50 OR 1H Stoch RSI pointing up).
+  * BOTH 1H and 15M Stoch RSI show oversold conditions (< 20 or returning from oversold).
+  * 15M Stoch RSI confirms a Cross Up (%K > %D).
+- SELL ENTRY: 
+  * 1H Trend is Bearish (Price < 1H EMA 50 OR 1H Stoch RSI pointing down).
+  * BOTH 1H and 15M Stoch RSI show overbought conditions (> 80 or returning from overbought).
+  * 15M Stoch RSI confirms a Cross Down (%K < %D).
+- HOLD: If 1H and 15M timeframes conflict or lack clear extreme Stoch RSI conditions.
+
+SL/TP CALCULATIONS (IF BUY OR SELL):
+- BUY:
+  * Stop Loss (SL) = 15M Swing Low - $1.50
+  * Risk = Entry Price - SL
+  * Take Profit 1 (TP1) = Entry Price + (1.5 * Risk)
+  * Take Profit 2 (TP2) = Entry Price + (2.5 * Risk)
+- SELL:
+  * Stop Loss (SL) = 15M Swing High + $1.50
+  * Risk = SL - Entry Price
+  * Take Profit 1 (TP1) = Entry Price - (1.5 * Risk)
+  * Take Profit 2 (TP2) = Entry Price - (2.5 * Risk)
 
 Instructions for "summary" field:
-If decision is BUY or SELL, set action to "BUY" or "SELL" and write the summary EXACTLY in this format:
+If BUY or SELL, output the alert message formatted EXACTLY like this:
 
-🚨 TRADE SIGNAL ALERT
+🚨 STOCH RSI TRADE SIGNAL
 
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
 Entry Price: ${price:.2f}
 
-Stop Loss (SL): $[Price]
-Take Profit 1 (TP1): $[Price]
-Take Profit 2 (TP2): $[Price]
+Stop Loss (SL): $[Calculated SL]
+Take Profit 1 (TP1): $[Calculated TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
 
-📍 NEAREST KEY LEVELS:
-• Resistance 2 (R2): ${levels['swing_high']} (1H Major High)
-• Resistance 1 (R1): ${levels['r1']} (Daily Pivot R1)
----------------------------------------------
-• Current Price:     ${price:.2f}
----------------------------------------------
-• Support 1 (S1):    ${levels['s1']} (Daily Pivot S1)
-• Support 2 (S2):    ${levels['swing_low']} (1H Major Low)
+📍 INDICATOR METRICS:
+• 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}
+• 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}
+• 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
 
-📊 Confluence Reasoning: [2-sentence explanation]
+📊 Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
 
-If decision is HOLD, set action to "HOLD" and summary to "HOLD".
+If HOLD, set action to "HOLD" and summary to "HOLD".
 """
 
     config = types.GenerateContentConfig(
@@ -226,8 +209,7 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
         response_schema=SignalOutput,
     )
 
-    # Models to attempt in sequence if primary hits 503 capacity limit
-    models_to_try = ['gemini-3-flash-preview', 'gemini-2.0-flash']
+    models_to_try = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash']
     response = None
 
     for model_name in models_to_try:
@@ -237,9 +219,9 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
                 contents=prompt,
                 config=config,
             )
-            break  # Success! Exit retry loop
+            break
         except Exception as e:
-            print(f"Model {model_name} failed ({e}). Retrying fallback...")
+            print(f"Model {model_name} failed ({e}). Trying fallback...")
             import time
             time.sleep(2)
 
@@ -256,4 +238,30 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
 
     except Exception as e:
         print(f"Error parsing Gemini response: {e}")
-    
+
+
+async def background_scanning_loop():
+    """Runs the analysis every 10 minutes in a non-blocking background loop."""
+    while True:
+        try:
+            await asyncio.to_thread(analyze_and_alert)
+        except Exception as e:
+            print(f"Loop Exception caught: {e}")
+
+        # Wait 600 seconds (10 minutes)
+        await asyncio.sleep(600)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(background_scanning_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "Trading bot background scanner is active!"}

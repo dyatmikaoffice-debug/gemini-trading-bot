@@ -27,8 +27,8 @@ async def background_scanning_loop():
         except Exception as e:
             print(f"Loop Exception caught: {e}")
         
-        # Wait 180 seconds (3 minutes)
-        await asyncio.sleep(180)
+        # Wait 600 seconds (10 minutes)
+        await asyncio.sleep(600)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

@@ -39,9 +39,13 @@ def fetch_twelve_data(interval: str, outputsize: int = 50) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
-    for col in ["open", "high", "low", "close"]:
+    # Rename lowercase keys from Twelve Data API to Title Case
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+
+    for col in ["Open", "High", "Low", "Close"]:
         df[col] = df[col].astype(float)
 
+    return df
     # Rename columns to match standard pandas indicators (Capitalized)
     df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
     return df

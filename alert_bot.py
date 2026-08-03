@@ -195,18 +195,34 @@ Take Profit 2 (TP2): $[Price]
 If decision is HOLD, set action to "HOLD" and summary to "HOLD".
 """
 
-    try:
-        config = types.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json",
-            response_schema=SignalOutput,
-        )
-        response = genai_client.models.generate_content(
-    model='gemini-3-flash-preview',  # ✅ Matches your AI Studio setting
-    contents=prompt,
-    config=config,
-)
+    config = types.GenerateContentConfig(
+        temperature=0.1,
+        response_mime_type="application/json",
+        response_schema=SignalOutput,
+    )
 
+    # Models to attempt in sequence if primary hits 503 capacity limit
+    models_to_try = ['gemini-3-flash-preview', 'gemini-2.0-flash']
+    response = None
+
+    for model_name in models_to_try:
+        try:
+            response = genai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+            break  # Success! Exit retry loop
+        except Exception as e:
+            print(f"Model {model_name} failed ({e}). Retrying fallback...")
+            import time
+            time.sleep(2)
+
+    if not response:
+        print("All Gemini model attempts failed this cycle.")
+        return
+
+    try:
         output = SignalOutput.model_validate_json(response.text)
         print(f"Decision: {output.action} ({output.confidence * 100:.0f}%)")
 
@@ -214,20 +230,4 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
             send_telegram_message(output.summary)
 
     except Exception as e:
-        print(f"Error in bot loop: {e}")
-
-async def background_loop():
-    while True:
-        try:
-            analyze_and_alert()
-        except Exception as e:
-            print(f"Loop Exception: {e}")
-        await asyncio.sleep(300)  # Check every 5 minutes
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_loop())
-
-@app.get("/")
-def head_check():
-    return {"status": "ok"}
+        print(f"Error parsing Gemini response: {e}")

@@ -27,8 +27,8 @@ async def background_scanning_loop():
         except Exception as e:
             print(f"Loop Exception caught: {e}")
         
-        # Wait 300 seconds (5 minutes)
-        await asyncio.sleep(300)
+        # Wait 180 seconds (3 minutes)
+        await asyncio.sleep(180)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -108,7 +108,7 @@ def calculate_key_levels():
         "swing_low": round(swing_low, 2)
     }
 
-def calculate_indicators(df: pd.DataFrame, stoch_k=14, stoch_d=3, smooth_k=3, ema_period=50):
+def calculate_indicators(df: pd.DataFrame, stoch_k=8, stoch_d=3, smooth_k=3, ema_period=50):
     if df.empty or len(df) < max(stoch_k + stoch_d + smooth_k, ema_period):
         return None
 
@@ -189,9 +189,9 @@ TECHNICAL METRICS:
 - 5M Timeframe: Above 50 EMA = {mtf['5m']['is_above_ema']}, Stoch %K = {mtf['5m']['stoch_k']:.1f}, Stoch Cross Up = {mtf['5m']['stoch_cross_up']}, Stoch Cross Down = {mtf['5m']['stoch_cross_down']}
 
 Strategy Rules:
-- BUY: 4H & 1H strictly Bullish (Price > 50 EMA), 5M pulls back and crosses up on Stochastic (14,3,3) while reclaiming 5M 50 EMA.
-- SELL: 4H & 1H strictly Bearish (Price < 50 EMA), 5M pulls back and crosses down on Stochastic (14,3,3) while falling below 5M 50 EMA.
-- HOLD: If timeframes conflict or lack 100% alignment.
+- BUY: 1H trend is Bullish (Price > 50 EMA) AND 5M Stochastic (14,3,3) crosses up.
+- SELL: 1H trend is Bearish (Price < 50 EMA) AND 5M Stochastic (14,3,3) crosses down.
+- Ignore 4H trend conflicts if 1H and 5M show clear momentum.
 
 Instructions for "summary" field:
 If decision is BUY or SELL, set action to "BUY" or "SELL" and write the summary EXACTLY in this format:

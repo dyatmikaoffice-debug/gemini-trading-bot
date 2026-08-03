@@ -202,10 +202,10 @@ If decision is HOLD, set action to "HOLD" and summary to "HOLD".
             response_schema=SignalOutput,
         )
         response = genai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=config,
-        )
+    model='gemini-3-flash-preview',  # ✅ Matches your AI Studio setting
+    contents=prompt,
+    config=config,
+)
 
         output = SignalOutput.model_validate_json(response.text)
         print(f"Decision: {output.action} ({output.confidence * 100:.0f}%)")

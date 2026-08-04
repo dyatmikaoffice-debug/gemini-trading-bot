@@ -28,6 +28,10 @@ groq_client = OpenAI(
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"
 
+# Cooldown Tracker to Prevent Signal Spam
+LAST_SIGNAL_ACTION = "HOLD"
+LAST_SIGNAL_PRICE = 0.0
+
 
 class SignalOutput(BaseModel):
     action: str = Field(description="BUY, SELL, or HOLD")
@@ -86,22 +90,26 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
     return df
 
 
-def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
-    """Calculates EMA 50, True Stoch RSI (3,3,14,14), Swing Levels, and ATR(14)."""
+def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50):
+    """Calculates EMA 50, VWAP, Stoch RSI, Swing Levels, and ChoCH conditions."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
     # 1. EMA 50
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
 
-    # 2. RSI Calculation
+    # 2. VWAP (Session Approximation)
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    # Approximating VWAP over rolling window
+    df['VWAP'] = (typical_price * df['Close']).rolling(window=20).sum() / df['Close'].rolling(window=20).sum()
+
+    # 3. RSI & Stochastic RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 3. Stochastic RSI (3,3,14,14)
     rsi_min = df['RSI'].rolling(window=stoch_period).min()
     rsi_max = df['RSI'].rolling(window=stoch_period).max()
     stoch_rsi = (df['RSI'] - rsi_min) / (rsi_max - rsi_min)
@@ -109,98 +117,100 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. True Range (TR) & ATR (14) for Dynamic SL Buffer
-    df['PrevClose'] = df['Close'].shift(1)
-    df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
-        lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
-    )
-    df['ATR'] = df['TR'].rolling(window=atr_period).mean()
-
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    swing_high = float(df['High'].tail(15).max())
-    swing_low = float(df['Low'].tail(15).min())
-    atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 3.50
+    # Swing levels (Tight 10-candle window for 5M/15M)
+    swing_high = float(df['High'].tail(10).max())
+    swing_low = float(df['Low'].tail(10).min())
+
+    # Structural ChoCH condition: Price below BOTH EMA 50 and VWAP
+    is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'])
+    is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'])
 
     return {
         "close": float(latest['Close']),
         "ema_50": float(latest['EMA_50']),
+        "vwap": float(latest['VWAP']),
         "is_above_ema": bool(latest['Close'] > latest['EMA_50']),
+        "is_above_vwap": bool(latest['Close'] > latest['VWAP']),
+        "choch_bearish": is_choch_bearish,
+        "choch_bullish": is_choch_bullish,
         "stoch_k": float(latest['%K']),
         "stoch_d": float(latest['%D']),
         "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
         "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D']),
         "swing_high": swing_high,
         "swing_low": swing_low,
-        "atr": round(atr_val, 2),
-        "atr_buffer": round(1.5 * atr_val, 2)
+        "is_green_candle": bool(latest['Close'] > latest['Open'])
     }
 
 
 def get_mtf_data():
+    df_5m = fetch_twelve_data("5min", outputsize=100)
     df_15m = fetch_twelve_data("15min", outputsize=100)
     df_1h = fetch_twelve_data("1h", outputsize=100)
 
-    if df_15m.empty or df_1h.empty:
+    if df_5m.empty or df_15m.empty or df_1h.empty:
         return None
 
     return {
-        "15m": calculate_stoch_rsi(df_15m),
-        "1h": calculate_stoch_rsi(df_1h)
+        "5m": calculate_metrics(df_5m),
+        "15m": calculate_metrics(df_15m),
+        "1h": calculate_metrics(df_1h)
     }
 
 
 def analyze_and_alert():
+    global LAST_SIGNAL_ACTION, LAST_SIGNAL_PRICE
+
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
     mtf = get_mtf_data()
 
-    if not mtf or not mtf["15m"] or not mtf["1h"]:
+    if not mtf or not mtf["5m"] or not mtf["15m"] or not mtf["1h"]:
         print("Waiting for valid data stream...")
         return
 
-    price = mtf["15m"]["close"]
+    price = mtf["5m"]["close"]
 
     prompt = f"""
-Analyze this 1H / 15M Stochastic RSI & Trend-Following Strategy for Spot Gold (XAU/USD OANDA):
+Analyze this 1H / 15M / 5M Multi-Timeframe Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-1H TIMEFRAME (Higher Timeframe Trend Context):
-- Price: ${mtf['1h']['close']:.2f} | 1H EMA 50: ${mtf['1h']['ema_50']:.2f} (Above EMA: {mtf['1h']['is_above_ema']})
-- 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f} | %D: {mtf['1h']['stoch_d']:.1f}
+5M TIMEFRAME (Primary Execution Timeframe):
+- Price: ${mtf['5m']['close']:.2f} | 5M EMA 50: ${mtf['5m']['ema_50']:.2f} | 5M VWAP: ${mtf['5m']['vwap']:.2f}
+- Above EMA 50: {mtf['5m']['is_above_ema']} | Above VWAP: {mtf['5m']['is_above_vwap']}
+- 5M Bearish ChoCH (Below EMA & VWAP): {mtf['5m']['choch_bearish']}
+- 5M Bullish ChoCH (Above EMA & VWAP): {mtf['5m']['choch_bullish']}
+- 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | %D: {mtf['5m']['stoch_d']:.1f}
+- 5M Stoch Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
+- 5M Candle Green: {mtf['5m']['is_green_candle']}
+- Tight 5M Swing High: ${mtf['5m']['swing_high']:.2f} | Swing Low: ${mtf['5m']['swing_low']:.2f}
 
-15M TIMEFRAME (Execution & Volatility Metrics):
-- Price: ${mtf['15m']['close']:.2f} | 15M EMA 50: ${mtf['15m']['ema_50']:.2f} (Above EMA: {mtf['15m']['is_above_ema']})
-- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | %D: {mtf['15m']['stoch_d']:.1f}
-- 15M Stoch Cross Up: {mtf['15m']['stoch_cross_up']} | Cross Down: {mtf['15m']['stoch_cross_down']}
-- 15M Swing High: ${mtf['15m']['swing_high']:.2f} | Swing Low: ${mtf['15m']['swing_low']:.2f}
-- 15M ATR(14): ${mtf['15m']['atr']:.2f} | Dynamic SL Volatility Buffer: ${mtf['15m']['atr_buffer']:.2f}
+15M & 1H CONTEXT:
+- 15M Above EMA 50: {mtf['15m']['is_above_ema']} | 15M Swing Low: ${mtf['15m']['swing_low']:.2f}
+- 1H Above EMA 50: {mtf['1h']['is_above_ema']}
 
-STRATEGY ENTRY RULES:
+CHANGE OF CHARACTER (ChoCH) & EXECUTION RULES:
+1. STRICT ChoCH RULE:
+   - If 5M Bearish ChoCH is TRUE (Price closed below BOTH 5M EMA 50 & VWAP), DO NOT ISSUE ANY BUY SIGNALS! Force action to HOLD or SELL.
+   - If 5M Bullish ChoCH is TRUE (Price closed above BOTH 5M EMA 50 & VWAP), DO NOT ISSUE ANY SELL SIGNALS! Force action to HOLD or BUY.
 
-1. TREND-FOLLOWING PULLBACK SIGNALS (PRIMARY):
-- BUY ENTRY: Price is ABOVE 15M EMA 50 AND 15M Stoch RSI dips to Oversold (< 20 or < 25) and completes a Cross Up (%K > %D).
-- SELL ENTRY: Price is BELOW 15M EMA 50 AND 15M Stoch RSI rallies to Overbought (> 80 or > 75) and completes a Cross Down (%K < %D).
+2. 5M BUY ENTRY:
+   - 5M Price MUST be ABOVE BOTH 5M EMA 50 AND VWAP.
+   - 5M Stoch RSI crosses UP from Oversold (< 25).
+   - 5M Candle MUST be Green.
 
-2. REVERSAL SIGNALS (SECONDARY):
-- Allowed ONLY if there is clear timeframe alignment or momentum divergence.
+3. 5M SELL ENTRY:
+   - 5M Price MUST be BELOW BOTH 5M EMA 50 AND VWAP.
+   - 5M Stoch RSI crosses DOWN from Overbought (> 75).
+   - 5M Candle MUST be Red.
 
-3. FILTER / HOLD RULES:
-- DO NOT SELL when Price is ABOVE 15M EMA 50 unless clear Bearish Divergence exists.
-- DO NOT BUY when Price is BELOW 15M EMA 50 unless clear Bullish Divergence exists.
-- If Stoch RSI is floating in the neutral middle zone (30 - 70), output "HOLD".
-
-SL/TP CALCULATION RULES (USING DYNAMIC ATR BUFFER):
-- FOR BUY:
-  * Stop Loss (SL) = 15M Swing Low - ${mtf['15m']['atr_buffer']:.2f}
-  * Risk = Entry Price - SL
-  * Take Profit 1 (TP1) = Entry Price + (1.5 * Risk)
-  * Take Profit 2 (TP2) = Entry Price + (2.5 * Risk)
-- FOR SELL:
-  * Stop Loss (SL) = 15M Swing High + ${mtf['15m']['atr_buffer']:.2f}
-  * Risk = SL - Entry Price
-  * Take Profit 1 (TP1) = Entry Price - (1.5 * Risk)
-  * Take Profit 2 (TP2) = Entry Price - (2.5 * Risk)
+4. TIGHT STOP LOSS (SL) CALCULATION:
+   - BUY SL = Minimum of (5M Swing Low, 15M Swing Low) - $1.20 buffer.
+   - SELL SL = Maximum of (5M Swing High, 15M Swing High) + $1.20 buffer.
+   - TP1 = Entry Price +/- (1.5 * Risk)
+   - TP2 = Entry Price +/- (2.5 * Risk)
 
 OUTPUT REQUIREMENTS:
 You MUST respond strictly with valid JSON with these exact key fields:
@@ -209,23 +219,22 @@ You MUST respond strictly with valid JSON with these exact key fields:
 - "summary": string formatted alert or "HOLD"
 
 Format for "summary" when action is BUY or SELL:
-STOCH RSI TRADE SIGNAL
+STOCH RSI & ChoCH SIGNAL (5M EXECUTION)
 
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
-Type: [Trend Pullback / Reversal]
 Entry Price: ${price:.2f}
 
-Stop Loss (SL): $[Calculated SL]
+Stop Loss (SL): $[Calculated Tight SL]
 Take Profit 1 (TP1): $[Calculated TP1] (1:1.5 RRR)
 Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
 
 INDICATOR METRICS:
-- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}
-- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}
-- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
+- 5M EMA 50: ${mtf['5m']['ema_50']:.2f}
+- 5M VWAP: ${mtf['5m']['vwap']:.2f}
+- 5M Stoch RSI: {mtf['5m']['stoch_k']:.1f}
 
-Reasoning: [2-sentence explanation of trend direction and pullback confirmation]
+Reasoning: [2-sentence explanation confirming VWAP/EMA respect and ChoCH status]
 """
 
     output = None
@@ -270,7 +279,14 @@ Reasoning: [2-sentence explanation of trend direction and pullback confirmation]
         print("All AI model attempts failed this cycle.")
         return
 
+    # Spam Prevention Filter
     if output.action in ["BUY", "SELL"]:
+        if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 4.00:
+            print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry (${LAST_SIGNAL_PRICE:.2f}).")
+            return
+
+        LAST_SIGNAL_ACTION = output.action
+        LAST_SIGNAL_PRICE = price
         send_telegram_message(output.summary)
 
 
@@ -281,7 +297,7 @@ async def background_scanning_loop():
         except Exception as e:
             print(f"Loop Exception caught: {e}")
 
-        await asyncio.sleep(600)
+        await asyncio.sleep(300)  # Runs scan every 5 minutes to match M5 candles
 
 
 @asynccontextmanager

@@ -87,8 +87,7 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
     return df
 
 
-def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50):
-    """Calculates EMA 50, True Stoch RSI (3,3,14,14), and Swing Levels."""
+def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
@@ -110,12 +109,20 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
+    # 4. Calculate True Range (TR) & ATR (14) for Dynamic SL Buffer
+    df['PrevClose'] = df['Close'].shift(1)
+    df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
+        lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
+    )
+    df['ATR'] = df['TR'].rolling(window=atr_period).mean()
+
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Calculate recent 15M Swing High/Low for SL calculation
+    # Calculate recent 15M Swing High/Low
     swing_high = float(df['High'].tail(15).max())
     swing_low = float(df['Low'].tail(15).min())
+    atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 3.50
 
     return {
         "close": float(latest['Close']),
@@ -126,22 +133,10 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
         "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
         "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D']),
         "swing_high": swing_high,
-        "swing_low": swing_low
+        "swing_low": swing_low,
+        "atr": round(atr_val, 2),
+        "atr_buffer": round(1.5 * atr_val, 2)  # Dynamic SL buffer based on current market volatility
     }
-
-
-def get_mtf_data():
-    df_15m = fetch_twelve_data("15min", outputsize=100)
-    df_1h = fetch_twelve_data("1h", outputsize=100)
-
-    if df_15m.empty or df_1h.empty:
-        return None
-
-    return {
-        "15m": calculate_stoch_rsi(df_15m),
-        "1h": calculate_stoch_rsi(df_1h)
-    }
-
 
 def analyze_and_alert():
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
@@ -157,36 +152,31 @@ def analyze_and_alert():
 Analyze this 1H / 15M Stochastic RSI Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-1H TIMEFRAME (Higher Timeframe Trend Direction):
+1H TIMEFRAME (Higher Timeframe Trend Context):
 - Price: ${mtf['1h']['close']:.2f} | 1H EMA 50: ${mtf['1h']['ema_50']:.2f} (Above EMA: {mtf['1h']['is_above_ema']})
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f} | %D: {mtf['1h']['stoch_d']:.1f}
 
-15M TIMEFRAME (Execution & Momentum):
+15M TIMEFRAME (Execution & Volatility Metrics):
 - Price: ${mtf['15m']['close']:.2f} | 15M EMA 50: ${mtf['15m']['ema_50']:.2f} (Above EMA: {mtf['15m']['is_above_ema']})
 - 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | %D: {mtf['15m']['stoch_d']:.1f}
 - 15M Stoch Cross Up: {mtf['15m']['stoch_cross_up']} | Cross Down: {mtf['15m']['stoch_cross_down']}
-- 15M Recent Swing High: ${mtf['15m']['swing_high']:.2f}
-- 15M Recent Swing Low: ${mtf['15m']['swing_low']:.2f}
+- 15M Swing High: ${mtf['15m']['swing_high']:.2f} | Swing Low: ${mtf['15m']['swing_low']:.2f}
+- 15M ATR(14): ${mtf['15m']['atr']:.2f} | Dynamic SL Volatility Buffer: ${mtf['15m']['atr_buffer']:.2f}
 
-STRATEGY ENTRY RULES:
-- BUY ENTRY: 
-  * 1H Trend is Bullish (Price > 1H EMA 50 OR 1H Stoch RSI pointing up).
-  * BOTH 1H and 15M Stoch RSI show oversold conditions (< 20 or returning from oversold).
-  * 15M Stoch RSI confirms a Cross Up (%K > %D).
-- SELL ENTRY: 
-  * 1H Trend is Bearish (Price < 1H EMA 50 OR 1H Stoch RSI pointing down).
-  * BOTH 1H and 15M Stoch RSI show overbought conditions (> 80 or returning from overbought).
-  * 15M Stoch RSI confirms a Cross Down (%K < %D).
-- HOLD: If 1H and 15M timeframes conflict or lack clear extreme Stoch RSI conditions.
+STRICT ENTRY RULES (MANDATORY):
+- FOR BUY: Price MUST be ABOVE 15M EMA 50 AND 15M Stoch RSI is in Oversold zone (< 20) with a Cross Up (%K > %D).
+- FOR SELL: Price MUST be BELOW 15M EMA 50 AND 15M Stoch RSI is in Overbought zone (> 80) with a Cross Down (%K < %D).
+- NO COUNTER-TREND TRADES: Do NOT output SELL when price is above EMA 50. Do NOT output BUY when price is below EMA 50.
+- HOLD: If price is above EMA 50 but Stoch RSI is overbought, or if timeframes conflict, output "HOLD".
 
-SL/TP CALCULATIONS (IF BUY OR SELL):
-- BUY:
-  * Stop Loss (SL) = 15M Swing Low - $1.50
+SL/TP CALCULATION RULES (USING DYNAMIC ATR BUFFER):
+- FOR BUY:
+  * Stop Loss (SL) = 15M Swing Low - ${mtf['15m']['atr_buffer']:.2f}
   * Risk = Entry Price - SL
   * Take Profit 1 (TP1) = Entry Price + (1.5 * Risk)
   * Take Profit 2 (TP2) = Entry Price + (2.5 * Risk)
-- SELL:
-  * Stop Loss (SL) = 15M Swing High + $1.50
+- FOR SELL:
+  * Stop Loss (SL) = 15M Swing High + ${mtf['15m']['atr_buffer']:.2f}
   * Risk = SL - Entry Price
   * Take Profit 1 (TP1) = Entry Price - (1.5 * Risk)
   * Take Profit 2 (TP2) = Entry Price - (2.5 * Risk)
@@ -196,6 +186,8 @@ You MUST respond strictly with valid JSON with these exact key fields:
 - "action": "BUY", "SELL", or "HOLD"
 - "confidence": float between 0.0 and 1.0
 - "summary": string formatted alert or "HOLD"
+"""
+
 
 Format for "summary" when action is BUY or SELL:
 🚨 STOCH RSI TRADE SIGNAL

@@ -109,7 +109,7 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. True Range (TR) & ATR (14)
+    # 4. True Range (TR) & ATR (14) for Dynamic SL Buffer
     df['PrevClose'] = df['Close'].shift(1)
     df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
@@ -162,7 +162,7 @@ def analyze_and_alert():
     price = mtf["15m"]["close"]
 
     prompt = f"""
-Analyze this 1H / 15M Stochastic RSI Strategy for Spot Gold (XAU/USD OANDA):
+Analyze this 1H / 15M Stochastic RSI & Trend-Following Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
 1H TIMEFRAME (Higher Timeframe Trend Context):
@@ -176,11 +176,19 @@ Current Price: ${price:.2f}
 - 15M Swing High: ${mtf['15m']['swing_high']:.2f} | Swing Low: ${mtf['15m']['swing_low']:.2f}
 - 15M ATR(14): ${mtf['15m']['atr']:.2f} | Dynamic SL Volatility Buffer: ${mtf['15m']['atr_buffer']:.2f}
 
-STRICT ENTRY RULES (MANDATORY):
-- FOR BUY: Price MUST be ABOVE 15M EMA 50 AND 15M Stoch RSI is in Oversold zone (< 20) with a Cross Up (%K > %D).
-- FOR SELL: Price MUST be BELOW 15M EMA 50 AND 15M Stoch RSI is in Overbought zone (> 80) with a Cross Down (%K < %D).
-- NO COUNTER-TREND TRADES: Do NOT output SELL when price is above EMA 50. Do NOT output BUY when price is below EMA 50.
-- HOLD: If price is above EMA 50 but Stoch RSI is overbought, or if timeframes conflict, output "HOLD".
+STRATEGY ENTRY RULES:
+
+1. TREND-FOLLOWING PULLBACK SIGNALS (PRIMARY):
+- BUY ENTRY: Price is ABOVE 15M EMA 50 AND 15M Stoch RSI dips to Oversold (< 20 or < 25) and completes a Cross Up (%K > %D).
+- SELL ENTRY: Price is BELOW 15M EMA 50 AND 15M Stoch RSI rallies to Overbought (> 80 or > 75) and completes a Cross Down (%K < %D).
+
+2. REVERSAL SIGNALS (SECONDARY):
+- Allowed ONLY if there is clear timeframe alignment or momentum divergence.
+
+3. FILTER / HOLD RULES:
+- DO NOT SELL when Price is ABOVE 15M EMA 50 unless clear Bearish Divergence exists.
+- DO NOT BUY when Price is BELOW 15M EMA 50 unless clear Bullish Divergence exists.
+- If Stoch RSI is floating in the neutral middle zone (30 - 70), output "HOLD".
 
 SL/TP CALCULATION RULES (USING DYNAMIC ATR BUFFER):
 - FOR BUY:
@@ -205,6 +213,7 @@ STOCH RSI TRADE SIGNAL
 
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
+Type: [Trend Pullback / Reversal]
 Entry Price: ${price:.2f}
 
 Stop Loss (SL): $[Calculated SL]
@@ -216,7 +225,7 @@ INDICATOR METRICS:
 - 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}
 - 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
 
-Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
+Reasoning: [2-sentence explanation of trend direction and pullback confirmation]
 """
 
     output = None

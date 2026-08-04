@@ -186,6 +186,24 @@ You MUST respond strictly with valid JSON with these exact key fields:
 - "action": "BUY", "SELL", or "HOLD"
 - "confidence": float between 0.0 and 1.0
 - "summary": string formatted alert or "HOLD"
+
+Format for "summary" when action is BUY or SELL:
+STOCH RSI TRADE SIGNAL
+
+Asset: XAUUSD (Gold Spot)
+Action: [BUY or SELL]
+Entry Price: ${price:.2f}
+
+Stop Loss (SL): $[Calculated SL]
+Take Profit 1 (TP1): $[Calculated TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
+
+INDICATOR METRICS:
+- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}
+- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}
+- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
+
+Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
 """
 
 

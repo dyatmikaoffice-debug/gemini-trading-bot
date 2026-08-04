@@ -7,7 +7,6 @@ import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-# Importing both Google GenAI and OpenAI (for Groq)
 from google import genai
 from google.genai import types
 from openai import OpenAI
@@ -27,7 +26,7 @@ groq_client = OpenAI(
 ) if GROQ_API_KEY else None
 
 SYMBOL = "XAU/USD"
-EXCHANGE = "OANDA"  # Matches TradingView OANDA Gold Spot
+EXCHANGE = "OANDA"
 
 
 class SignalOutput(BaseModel):
@@ -88,6 +87,7 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
 
 
 def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
+    """Calculates EMA 50, True Stoch RSI (3,3,14,14), Swing Levels, and ATR(14)."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
@@ -109,7 +109,7 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. Calculate True Range (TR) & ATR (14) for Dynamic SL Buffer
+    # 4. True Range (TR) & ATR (14)
     df['PrevClose'] = df['Close'].shift(1)
     df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
@@ -119,7 +119,6 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Calculate recent 15M Swing High/Low
     swing_high = float(df['High'].tail(15).max())
     swing_low = float(df['Low'].tail(15).min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 3.50
@@ -135,8 +134,22 @@ def calculate_stoch_rsi(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_peri
         "swing_high": swing_high,
         "swing_low": swing_low,
         "atr": round(atr_val, 2),
-        "atr_buffer": round(1.5 * atr_val, 2)  # Dynamic SL buffer based on current market volatility
+        "atr_buffer": round(1.5 * atr_val, 2)
     }
+
+
+def get_mtf_data():
+    df_15m = fetch_twelve_data("15min", outputsize=100)
+    df_1h = fetch_twelve_data("1h", outputsize=100)
+
+    if df_15m.empty or df_1h.empty:
+        return None
+
+    return {
+        "15m": calculate_stoch_rsi(df_15m),
+        "1h": calculate_stoch_rsi(df_1h)
+    }
+
 
 def analyze_and_alert():
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
@@ -206,29 +219,9 @@ INDICATOR METRICS:
 Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
 """
 
-
-Format for "summary" when action is BUY or SELL:
-🚨 STOCH RSI TRADE SIGNAL
-
-Asset: XAUUSD (Gold Spot)
-Action: [BUY or SELL]
-Entry Price: ${price:.2f}
-
-Stop Loss (SL): $[Calculated SL]
-Take Profit 1 (TP1): $[Calculated TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
-
-📍 INDICATOR METRICS:
-• 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}
-• 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}
-• 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
-
-📊 Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
-"""
-
     output = None
 
-    # Step 1: Try Groq First (Llama 3.3 70B)
+    # Step 1: Groq Primary (Llama 3.3 70B)
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
@@ -246,7 +239,7 @@ Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
         except Exception as e:
             print(f"Groq API call failed: {e}. Falling back to Gemini...")
 
-    # Step 2: Fallback to Gemini 2.5 Flash if Groq fails
+    # Step 2: Gemini Fallback
     if not output and genai_client:
         try:
             config = types.GenerateContentConfig(
@@ -255,12 +248,12 @@ Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
                 response_schema=SignalOutput,
             )
             response = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=prompt,
                 config=config,
             )
             output = SignalOutput.model_validate_json(response.text)
-            print(f"[Gemini 2.5] Decision: {output.action} ({output.confidence * 100:.0f}%)")
+            print(f"[Gemini 2.0] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
             print(f"Gemini API call failed: {e}")
 
@@ -273,7 +266,6 @@ Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
 
 
 async def background_scanning_loop():
-    """Runs the analysis every 10 minutes in a non-blocking background loop."""
     while True:
         try:
             await asyncio.to_thread(analyze_and_alert)

@@ -1,20 +1,31 @@
 import os
+import json
 import asyncio
 from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
 from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+# Importing both Google GenAI and OpenAI (for Groq)
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from openai import OpenAI
 
 # Load API credentials from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize Clients
+genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+) if GROQ_API_KEY else None
+
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"  # Matches TradingView OANDA Gold Spot
 
@@ -180,9 +191,13 @@ SL/TP CALCULATIONS (IF BUY OR SELL):
   * Take Profit 1 (TP1) = Entry Price - (1.5 * Risk)
   * Take Profit 2 (TP2) = Entry Price - (2.5 * Risk)
 
-Instructions for "summary" field:
-If BUY or SELL, output the alert message formatted EXACTLY like this:
+OUTPUT REQUIREMENTS:
+You MUST respond strictly with valid JSON with these exact key fields:
+- "action": "BUY", "SELL", or "HOLD"
+- "confidence": float between 0.0 and 1.0
+- "summary": string formatted alert or "HOLD"
 
+Format for "summary" when action is BUY or SELL:
 🚨 STOCH RSI TRADE SIGNAL
 
 Asset: XAUUSD (Gold Spot)
@@ -199,45 +214,52 @@ Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
 • 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
 
 📊 Reasoning: [2-sentence explanation of 1H alignment and 15M Stoch RSI condition]
-
-If HOLD, set action to "HOLD" and summary to "HOLD".
 """
 
-    config = types.GenerateContentConfig(
-        temperature=0.1,
-        response_mime_type="application/json",
-        response_schema=SignalOutput,
-    )
+    output = None
 
-    models_to_try = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash']
-    response = None
-
-    for model_name in models_to_try:
+    # Step 1: Try Groq First (Llama 3.3 70B)
+    if groq_client:
         try:
+            res = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "You are a quantitative trading model. Output JSON strictly matching the requested keys."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            raw_text = res.choices[0].message.content
+            output = SignalOutput.model_validate_json(raw_text)
+            print(f"[Groq Llama 3.3] Decision: {output.action} ({output.confidence * 100:.0f}%)")
+        except Exception as e:
+            print(f"Groq API call failed: {e}. Falling back to Gemini...")
+
+    # Step 2: Fallback to Gemini 2.5 Flash if Groq fails
+    if not output and genai_client:
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+                response_schema=SignalOutput,
+            )
             response = genai_client.models.generate_content(
-                model=model_name,
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=config,
             )
-            break
+            output = SignalOutput.model_validate_json(response.text)
+            print(f"[Gemini 2.5] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
-            print(f"Model {model_name} failed ({e}). Trying fallback...")
-            import time
-            time.sleep(2)
+            print(f"Gemini API call failed: {e}")
 
-    if not response:
-        print("All Gemini model attempts failed this cycle.")
+    if not output:
+        print("All AI model attempts failed this cycle.")
         return
 
-    try:
-        output = SignalOutput.model_validate_json(response.text)
-        print(f"Decision: {output.action} ({output.confidence * 100:.0f}%)")
-
-        if output.action in ["BUY", "SELL"]:
-            send_telegram_message(output.summary)
-
-    except Exception as e:
-        print(f"Error parsing Gemini response: {e}")
+    if output.action in ["BUY", "SELL"]:
+        send_telegram_message(output.summary)
 
 
 async def background_scanning_loop():
@@ -248,7 +270,6 @@ async def background_scanning_loop():
         except Exception as e:
             print(f"Loop Exception caught: {e}")
 
-        # Wait 600 seconds (10 minutes)
         await asyncio.sleep(600)
 
 

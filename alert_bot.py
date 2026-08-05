@@ -34,9 +34,9 @@ LAST_SIGNAL_PRICE = 0.0
 
 
 class SignalOutput(BaseModel):
-    action: str = Field(description="BUY, SELL, or HOLD")
-    confidence: float
-    summary: str
+    action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
+    confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
+    summary: str = Field(default="HOLD", description="Formatted text summary or HOLD")
 
     @field_validator('summary', mode='before')
     @classmethod
@@ -209,7 +209,7 @@ Current Price: ${price:.2f}
 
 RULES:
 1. OVEREXTENSION RULE:
-   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) is greater than Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "HOLD".
+   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) is greater than Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "action": "HOLD".
 
 2. DYNAMIC ATR STOP LOSS:
    - BUY SL = Minimum(5M Swing Low, 15M Swing Low) - ${mtf['5m']['atr_buffer']:.2f}.
@@ -222,6 +222,14 @@ RULES:
 4. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
+
+OUTPUT REQUIREMENTS:
+Respond strictly with a single JSON object. You MUST include ALL THREE keys ("action", "confidence", "summary"):
+
+Keys required:
+- "action": string ("BUY", "SELL", or "HOLD")
+- "confidence": float (between 0.0 and 1.0)
+- "summary": string message or "HOLD"
 
 CRITICAL OUTPUT REQUIREMENT FOR "summary":
 If action is "HOLD", set "summary": "HOLD".
@@ -251,7 +259,7 @@ Reasoning: [Write 2 sentences explaining the technical setup]
             res = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are a quantitative trading model. Output JSON matching the schema strictly. Ensure 'summary' is a string."},
+                    {"role": "system", "content": "You are a quantitative trading model. Output JSON matching the schema strictly. Always include action, confidence, and summary keys."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,

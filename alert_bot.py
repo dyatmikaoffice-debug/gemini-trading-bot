@@ -297,7 +297,7 @@ async def background_scanning_loop():
         except Exception as e:
             print(f"Loop Exception caught: {e}")
 
-        await asyncio.sleep(300)  # Runs scan every 5 minutes to match M5 candles
+        await asyncio.sleep(360)  # Runs scan every 6 minutes to stay under 800 API calls/day
 
 
 @asynccontextmanager

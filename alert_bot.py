@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from google import genai
 from google.genai import types
@@ -37,6 +37,15 @@ class SignalOutput(BaseModel):
     action: str = Field(description="BUY, SELL, or HOLD")
     confidence: float
     summary: str
+
+    @field_validator('summary', mode='before')
+    @classmethod
+    def stringify_summary(cls, v):
+        """Ensures summary is converted to a plain text string even if LLM returns a dict."""
+        if isinstance(v, dict):
+            lines = [f"{k}: {val}" for k, val in v.items()]
+            return "\n".join(lines)
+        return str(v)
 
 
 def send_telegram_message(message: str):
@@ -116,7 +125,7 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. ATR Calculation for Upgrade B
+    # 4. ATR Calculation
     df['PrevClose'] = df['Close'].shift(1)
     df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
@@ -149,8 +158,8 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
         "swing_high": swing_high,
         "swing_low": swing_low,
         "atr": round(atr_val, 2),
-        "atr_buffer": round(1.2 * atr_val, 2), # Upgrade B: Dynamic ATR SL Buffer
-        "max_vwap_allowed": round(3.0 * atr_val, 2), # Upgrade A: Dynamic VWAP Stretch Limit
+        "atr_buffer": round(1.2 * atr_val, 2),
+        "max_vwap_allowed": round(3.0 * atr_val, 2),
         "is_green_candle": bool(latest['Close'] > latest['Open'])
     }
 
@@ -195,74 +204,32 @@ Current Price: ${price:.2f}
 - 5M Swing High: ${mtf['5m']['swing_high']:.2f} | Swing Low: ${mtf['5m']['swing_low']:.2f}
 - Dynamic ATR SL Buffer: ${mtf['5m']['atr_buffer']:.2f}
 
-15M & 1H STRUCTURAL TARGETS (Upgrade D):
+15M & 1H STRUCTURAL TARGETS:
 - 15M Swing High (Resistance): ${mtf['15m']['swing_high']:.2f} | 15M Swing Low (Support): ${mtf['15m']['swing_low']:.2f}
 
-RULES (UPGRADES A, B, C, D ACTIVE):
-1. OVEREXTENSION RULE (UPGRADE A):
-   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) is greater than Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Force "HOLD" to prevent chasing extended moves.
+RULES:
+1. OVEREXTENSION RULE:
+   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) is greater than Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "HOLD".
 
-2. DYNAMIC ATR STOP LOSS (UPGRADE B):
-   - For BUY: SL = Minimum(5M Swing Low, 15M Swing Low) - ${mtf['5m']['atr_buffer']:.2f}.
-   - For SELL: SL = Maximum(5M Swing High, 15M Swing High) + ${mtf['5m']['atr_buffer']:.2f}.
+2. DYNAMIC ATR STOP LOSS:
+   - BUY SL = Minimum(5M Swing Low, 15M Swing Low) - ${mtf['5m']['atr_buffer']:.2f}.
+   - SELL SL = Maximum(5M Swing High, 15M Swing High) + ${mtf['5m']['atr_buffer']:.2f}.
 
-3. STRUCTURE-BASED TARGETS (UPGRADE D):
+3. STRUCTURE-BASED TARGETS:
    - TP1 = Entry Price +/- (1.5 * Risk)
-   - TP2 = Set at 1:2.5 RRR, BUT cap TP2 at the 15M Swing High (for BUY) or 15M Swing Low (for SELL) if structural levels are closer.
+   - TP2 = Set at 1:2.5 RRR, capped at 15M Swing High/Low if closer.
 
 4. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 
 OUTPUT REQUIREMENTS:
-Output strictly valid JSON with keys: "action" ("BUY", "SELL", "HOLD"), "confidence", "summary".
+Respond strictly with a single JSON object. The "summary" key MUST be a SINGLE PLAIN TEXT STRING (not a nested dict).
 
-"summary" Format based on Signal Type:
-
-1. Trend Pullback:
-STOCH RSI PULLBACK SIGNAL (5M EXECUTION)
-Asset: XAUUSD (Gold Spot)
-Action: [BUY or SELL]
-Signal Type: Trend Pullback
-Entry Price: $[Price]
-Stop Loss (SL): $[Calculated SL with ATR]
-Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[TP2 capped at 15M Structure]
-INDICATOR METRICS:
-- 5M EMA 50: $[EMA]
-- 5M VWAP: $[VWAP]
-- 5M Stoch RSI: [K_val]
-Reasoning: [2-sentence explanation]
-
-2. ChoCH Reversal:
-MARKET STRUCTURE SIGNAL (5M ChoCH REVERSAL)
-Asset: XAUUSD (Gold Spot)
-Action: [BUY or SELL]
-Signal Type: Change of Character (ChoCH)
-Entry Price: $[Price]
-Stop Loss (SL): $[Calculated SL with ATR]
-Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[TP2 capped at 15M Structure]
-INDICATOR METRICS:
-- 5M EMA 50: $[EMA]
-- 5M VWAP: $[VWAP]
-- 5M Stoch RSI: [K_val]
-Reasoning: [2-sentence explanation]
-
-3. Momentum Divergence:
-MOMENTUM DIVERGENCE SIGNAL (5M EXECUTION)
-Asset: XAUUSD (Gold Spot)
-Action: [BUY or SELL]
-Signal Type: Momentum Divergence
-Entry Price: $[Price]
-Stop Loss (SL): $[Calculated SL with ATR]
-Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[TP2 capped at 15M Structure]
-INDICATOR METRICS:
-- 5M EMA 50: $[EMA]
-- 5M VWAP: $[VWAP]
-- 5M Stoch RSI: [K_val]
-Reasoning: [2-sentence explanation]
+Keys required:
+- "action": "BUY", "SELL", or "HOLD"
+- "confidence": float between 0.0 and 1.0
+- "summary": string message or "HOLD"
 """
 
     output = None
@@ -273,7 +240,7 @@ Reasoning: [2-sentence explanation]
             res = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are a quantitative trading model. Output JSON strictly matching the requested keys."},
+                    {"role": "system", "content": "You are a quantitative trading model. Output JSON matching the schema strictly. Ensure 'summary' is a string."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
@@ -283,7 +250,7 @@ Reasoning: [2-sentence explanation]
             output = SignalOutput.model_validate_json(raw_text)
             print(f"[Groq Llama 3.3] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
-            print(f"Groq API call failed: {e}. Falling back to Gemini...")
+            print(f"Groq API call error: {e}. Falling back to Gemini...")
 
     # Step 2: Gemini Fallback
     if not output and genai_client:
@@ -301,13 +268,13 @@ Reasoning: [2-sentence explanation]
             output = SignalOutput.model_validate_json(response.text)
             print(f"[Gemini 2.0] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
-            print(f"Gemini API call failed: {e}")
+            print(f"Gemini API fallback skipped (Rate Limit or API Error).")
 
     if not output:
-        print("All AI model attempts failed this cycle.")
+        print("All AI model attempts failed this cycle. Continuing to next loop...")
         return
 
-    # Cooldown Filter (Upgrade C: $6.00 distance lock)
+    # Cooldown Filter
     if output.action in ["BUY", "SELL"]:
         if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 6.00:
             print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry (${LAST_SIGNAL_PRICE:.2f}).")

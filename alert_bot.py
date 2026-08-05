@@ -49,7 +49,7 @@ class SignalOutput(BaseModel):
 
 
 def send_telegram_message(message: str):
-    """Sends a formatted notification to your Telegram Channel/Chat."""
+    """Sends a notification to your Telegram Channel/Chat cleanly without parsing errors."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials missing. Skipping notification.")
         return
@@ -67,7 +67,6 @@ def send_telegram_message(message: str):
             print(f"Failed to send Telegram alert: {res.text}")
     except Exception as e:
         print(f"Telegram HTTP Error: {e}")
-
 
 
 def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
@@ -190,56 +189,71 @@ def analyze_and_alert():
         return
 
     price = mtf["5m"]["close"]
+    atr_buf = mtf["5m"]["atr_buffer"]
+
+    # --- TIGHT 5M EXECUTION SL & TP MATH ---
+    # BUY SETUP
+    local_buy_sl = round(mtf["5m"]["swing_low"] - atr_buf, 2)
+    buy_sl = round(max(local_buy_sl, price - 12.00), 2)
+    buy_risk = round(price - buy_sl, 2)
+    buy_tp1 = round(price + (1.5 * buy_risk), 2)
+    raw_buy_tp2 = round(price + (2.5 * buy_risk), 2)
+    swing_high_15m = mtf["15m"]["swing_high"]
+    buy_tp2 = round(min(raw_buy_tp2, max(swing_high_15m, buy_tp1 + 2.0)), 2)
+
+    # SELL SETUP
+    local_sell_sl = round(mtf["5m"]["swing_high"] + atr_buf, 2)
+    sell_sl = round(min(local_sell_sl, price + 12.00), 2)
+    sell_risk = round(sell_sl - price, 2)
+    sell_tp1 = round(price - (1.5 * sell_risk), 2)
+    raw_sell_tp2 = round(price - (2.5 * sell_risk), 2)
+    swing_low_15m = mtf["15m"]["swing_low"]
+    sell_tp2 = round(max(raw_sell_tp2, min(swing_low_15m, sell_tp1 - 2.0)), 2)
 
     prompt = f"""
 Analyze this 1H / 15M / 5M Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
+PRE-CALCULATED EXPLICIT LEVELS (USE THESE EXACT NUMBERS):
+BUY SETUP:
+- Entry: ${price:.2f}
+- Stop Loss (SL): ${buy_sl:.2f}
+- Take Profit 1 (TP1): ${buy_tp1:.2f}
+- Take Profit 2 (TP2): ${buy_tp2:.2f}
+
+SELL SETUP:
+- Entry: ${price:.2f}
+- Stop Loss (SL): ${sell_sl:.2f}
+- Take Profit 1 (TP1): ${sell_tp1:.2f}
+- Take Profit 2 (TP2): ${sell_tp2:.2f}
+
 5M METRICS (Execution):
 - Price: ${mtf['5m']['close']:.2f} | 5M EMA 50: ${mtf['5m']['ema_50']:.2f} | 5M VWAP: ${mtf['5m']['vwap']:.2f}
-- VWAP Distance: ${mtf['5m']['vwap_distance']:.2f} (Max Allowed Stretch: ${mtf['5m']['max_vwap_allowed']:.2f})
+- VWAP Distance: ${mtf['5m']['vwap_distance']:.2f} (Max Stretch: ${mtf['5m']['max_vwap_allowed']:.2f})
 - 5M Bearish ChoCH: {mtf['5m']['choch_bearish']} | Bullish ChoCH: {mtf['5m']['choch_bullish']}
 - 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
-- 5M Swing High: ${mtf['5m']['swing_high']:.2f} | Swing Low: ${mtf['5m']['swing_low']:.2f}
-- Dynamic ATR SL Buffer: ${mtf['5m']['atr_buffer']:.2f}
-
-15M & 1H STRUCTURAL TARGETS:
-- 15M Swing High (Resistance): ${mtf['15m']['swing_high']:.2f} | 15M Swing Low (Support): ${mtf['15m']['swing_low']:.2f}
 
 RULES:
 1. OVEREXTENSION RULE:
-   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) is greater than Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "action": "HOLD".
+   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "action": "HOLD".
 
-2. DYNAMIC ATR STOP LOSS:
-   - BUY SL = Minimum(5M Swing Low, 15M Swing Low) - ${mtf['5m']['atr_buffer']:.2f}.
-   - SELL SL = Maximum(5M Swing High, 15M Swing High) + ${mtf['5m']['atr_buffer']:.2f}.
-
-3. STRUCTURE-BASED TARGETS:
-   - TP1 = Entry Price +/- (1.5 * Risk)
-   - TP2 = Set at 1:2.5 RRR, capped at 15M Swing High/Low if closer.
-
-4. ENTRY CONFIRMATION:
+2. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 
 OUTPUT REQUIREMENTS:
-Respond strictly with a single JSON object. You MUST include ALL THREE keys ("action", "confidence", "summary"):
+Output strictly JSON matching schema with keys "action", "confidence", "summary".
 
-Keys required:
-- "action": string ("BUY", "SELL", or "HOLD")
-- "confidence": float (between 0.0 and 1.0)
-- "summary": string message or "HOLD"
-
-CRITICAL OUTPUT REQUIREMENT FOR "summary":
+CRITICAL FOR "summary":
 If action is "HOLD", set "summary": "HOLD".
-If action is "BUY" or "SELL", you MUST generate "summary" strictly using this multi-line template structure (DO NOT send brief text summaries):
+If action is "BUY" or "SELL", output "summary" strictly using this exact template (insert the exact PRE-CALCULATED numbers provided above, DO NOT write math expressions):
 
 STOCH RSI SIGNAL (5M EXECUTION)
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
 Entry Price: $[Price]
-Stop Loss (SL): $[Calculated SL]
+Stop Loss (SL): $[SL]
 Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
 Take Profit 2 (TP2): $[TP2]
 

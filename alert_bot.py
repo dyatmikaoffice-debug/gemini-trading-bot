@@ -305,11 +305,11 @@ Reasoning: [Write 2 clean sentences explaining the trade setup]
 
     output = None
 
-    # Step 1: Groq Primary (Llama 3.3 70B)
+    # Step 1: Groq Primary (Llama 3.1 8B Instant - High Token Limit)
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": "You are a quantitative trading model. Output JSON matching the schema strictly. Always include action, confidence, and summary keys."},
                     {"role": "user", "content": prompt}
@@ -319,7 +319,7 @@ Reasoning: [Write 2 clean sentences explaining the trade setup]
             )
             raw_text = res.choices[0].message.content
             output = SignalOutput.model_validate_json(raw_text)
-            print(f"[Groq Llama 3.3] Decision: {output.action} ({output.confidence * 100:.0f}%)")
+            print(f"[Groq Llama 3.1 8B] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
             print(f"Groq API call error: {e}. Falling back to Gemini...")
 

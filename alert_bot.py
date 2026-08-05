@@ -191,6 +191,18 @@ def analyze_and_alert():
     price = mtf["5m"]["close"]
     atr_buf = mtf["5m"]["atr_buffer"]
 
+    # --- DYNAMIC TRIGGER TYPE DEFINITION ---
+    stoch_k_5m = mtf["5m"]["stoch_k"]
+    is_choch_bull = mtf["5m"]["choch_bullish"]
+    is_choch_bear = mtf["5m"]["choch_bearish"]
+
+    if stoch_k_5m < 25 or stoch_k_5m > 75:
+        trigger_type = "Trend Pullback"
+    elif is_choch_bull or is_choch_bear:
+        trigger_type = "Counter-Trend Reversal"
+    else:
+        trigger_type = "Breakout Continuation"
+
     # --- TIGHT 5M EXECUTION SL & TP MATH ---
     # BUY SETUP
     local_buy_sl = round(mtf["5m"]["swing_low"] - atr_buf, 2)
@@ -227,10 +239,13 @@ SELL SETUP:
 - Take Profit 1 (TP1): ${sell_tp1:.2f}
 - Take Profit 2 (TP2): ${sell_tp2:.2f}
 
-5M METRICS (Execution):
-- Price: ${mtf['5m']['close']:.2f} | 5M EMA 50: ${mtf['5m']['ema_50']:.2f} | 5M VWAP: ${mtf['5m']['vwap']:.2f}
-- VWAP Distance: ${mtf['5m']['vwap_distance']:.2f} (Max Stretch: ${mtf['5m']['max_vwap_allowed']:.2f})
-- 5M Bearish ChoCH: {mtf['5m']['choch_bearish']} | Bullish ChoCH: {mtf['5m']['choch_bullish']}
+TRIGGER TYPE DETECTED: {trigger_type}
+
+MULTI-TIMEFRAME METRICS:
+- 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
+- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f}
+- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
+- 5M VWAP Distance: ${mtf['5m']['vwap_distance']:.2f} (Max Stretch: ${mtf['5m']['max_vwap_allowed']:.2f})
 - 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
 
@@ -247,22 +262,25 @@ Output strictly JSON matching schema with keys "action", "confidence", "summary"
 
 CRITICAL FOR "summary":
 If action is "HOLD", set "summary": "HOLD".
-If action is "BUY" or "SELL", output "summary" strictly using this exact template (insert the exact PRE-CALCULATED numbers provided above, DO NOT write math expressions):
+If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure (insert exact PRE-CALCULATED numbers provided above):
 
-STOCH RSI SIGNAL (5M EXECUTION)
+STOCH RSI TRADE SIGNAL
+
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
+Type: {trigger_type}
 Entry Price: $[Price]
+
 Stop Loss (SL): $[SL]
 Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[TP2]
+Take Profit 2 (TP2): $[TP2] (1:2.5 RRR)
 
 INDICATOR METRICS:
-- 5M EMA 50: $[EMA]
-- 5M VWAP: $[VWAP]
-- 5M Stoch RSI: [K_val]
+- 1H Stoch RSI: [1H_K_val]
+- 15M Stoch RSI: [15M_K_val]
+- 15M EMA 50: $[15M_EMA]
 
-Reasoning: [Write 2 sentences explaining the technical setup]
+Reasoning: [Write 2 clean sentences explaining the trade setup]
 """
 
     output = None

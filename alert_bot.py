@@ -203,7 +203,7 @@ def analyze_and_alert():
     else:
         trigger_type = "Breakout Continuation"
 
-    # --- TIGHT 5M EXECUTION SL & TP MATH ---
+    # --- TIGHT 5M EXECUTION SL & TP MATH WITH SIDE-NOTE ---
     # BUY SETUP
     local_buy_sl = round(mtf["5m"]["swing_low"] - atr_buf, 2)
     buy_sl = round(max(local_buy_sl, price - 12.00), 2)
@@ -212,6 +212,11 @@ def analyze_and_alert():
     raw_buy_tp2 = round(price + (2.5 * buy_risk), 2)
     swing_high_15m = mtf["15m"]["swing_high"]
     buy_tp2 = round(min(raw_buy_tp2, max(swing_high_15m, buy_tp1 + 2.0)), 2)
+
+    if buy_tp2 < raw_buy_tp2:
+        buy_tp2_str = f"${buy_tp2:.2f} (Capped at 15M Swing High; Raw 1:2.5 RRR ${raw_buy_tp2:.2f})"
+    else:
+        buy_tp2_str = f"${buy_tp2:.2f} (1:2.5 RRR)"
 
     # SELL SETUP
     local_sell_sl = round(mtf["5m"]["swing_high"] + atr_buf, 2)
@@ -222,22 +227,27 @@ def analyze_and_alert():
     swing_low_15m = mtf["15m"]["swing_low"]
     sell_tp2 = round(max(raw_sell_tp2, min(swing_low_15m, sell_tp1 - 2.0)), 2)
 
+    if sell_tp2 > raw_sell_tp2:
+        sell_tp2_str = f"${sell_tp2:.2f} (Capped at 15M Swing Low; Raw 1:2.5 RRR ${raw_sell_tp2:.2f})"
+    else:
+        sell_tp2_str = f"${sell_tp2:.2f} (1:2.5 RRR)"
+
     prompt = f"""
 Analyze this 1H / 15M / 5M Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-PRE-CALCULATED EXPLICIT LEVELS (USE THESE EXACT NUMBERS):
+PRE-CALCULATED EXPLICIT LEVELS (USE THESE EXACT NUMBERS AND STRINGS):
 BUY SETUP:
 - Entry: ${price:.2f}
 - Stop Loss (SL): ${buy_sl:.2f}
-- Take Profit 1 (TP1): ${buy_tp1:.2f}
-- Take Profit 2 (TP2): ${buy_tp2:.2f}
+- Take Profit 1 (TP1): ${buy_tp1:.2f} (1:1.5 RRR)
+- Take Profit 2 (TP2): {buy_tp2_str}
 
 SELL SETUP:
 - Entry: ${price:.2f}
 - Stop Loss (SL): ${sell_sl:.2f}
-- Take Profit 1 (TP1): ${sell_tp1:.2f}
-- Take Profit 2 (TP2): ${sell_tp2:.2f}
+- Take Profit 1 (TP1): ${sell_tp1:.2f} (1:1.5 RRR)
+- Take Profit 2 (TP2): {sell_tp2_str}
 
 TRIGGER TYPE DETECTED: {trigger_type}
 
@@ -262,7 +272,7 @@ Output strictly JSON matching schema with keys "action", "confidence", "summary"
 
 CRITICAL FOR "summary":
 If action is "HOLD", set "summary": "HOLD".
-If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure (insert exact PRE-CALCULATED numbers provided above):
+If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure (insert exact PRE-CALCULATED numbers and strings provided above):
 
 STOCH RSI TRADE SIGNAL
 
@@ -273,7 +283,7 @@ Entry Price: $[Price]
 
 Stop Loss (SL): $[SL]
 Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[TP2] (1:2.5 RRR)
+Take Profit 2 (TP2): [Insert exact TP2 pre-calculated string here]
 
 INDICATOR METRICS:
 - 1H Stoch RSI: [1H_K_val]
@@ -348,7 +358,7 @@ async def background_scanning_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(background_scanning_loop())
+    task = asyncio.task = asyncio.create_task(background_scanning_loop())
     yield
     task.cancel()
 

@@ -212,30 +212,61 @@ CHANGE OF CHARACTER (ChoCH) & EXECUTION RULES:
    - TP1 = Entry Price +/- (1.5 * Risk)
    - TP2 = Entry Price +/- (2.5 * Risk)
 
+"""
 OUTPUT REQUIREMENTS:
 You MUST respond strictly with valid JSON with these exact key fields:
 - "action": "BUY", "SELL", or "HOLD"
 - "confidence": float between 0.0 and 1.0
 - "summary": string formatted alert or "HOLD"
 
-Format for "summary" when action is BUY or SELL:
-STOCH RSI & ChoCH SIGNAL (5M EXECUTION)
+Format for "summary" based on Signal Type:
 
+1. For Pullbacks:
+STOCH RSI PULLBACK SIGNAL (5M EXECUTION)
 Asset: XAUUSD (Gold Spot)
 Action: [BUY or SELL]
-Entry Price: ${price:.2f}
-
-Stop Loss (SL): $[Calculated Tight SL]
-Take Profit 1 (TP1): $[Calculated TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): $[Calculated TP2] (1:2.5 RRR)
-
+Signal Type: Trend Pullback
+Entry Price: $[Price]
+Stop Loss (SL): $[SL]
+Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[TP2] (1:2.5 RRR)
 INDICATOR METRICS:
-- 5M EMA 50: ${mtf['5m']['ema_50']:.2f}
-- 5M VWAP: ${mtf['5m']['vwap']:.2f}
-- 5M Stoch RSI: {mtf['5m']['stoch_k']:.1f}
+- 5M EMA 50: $[EMA]
+- 5M VWAP: $[VWAP]
+- 5M Stoch RSI: [K_val]
+Reasoning: [Explanation]
 
-Reasoning: [2-sentence explanation confirming VWAP/EMA respect and ChoCH status]
+2. For ChoCH Reversals:
+MARKET STRUCTURE SIGNAL (5M ChoCH REVERSAL)
+Asset: XAUUSD (Gold Spot)
+Action: [BUY or SELL]
+Signal Type: Change of Character (ChoCH)
+Entry Price: $[Price]
+Stop Loss (SL): $[SL]
+Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[TP2] (1:2.5 RRR)
+INDICATOR METRICS:
+- 5M EMA 50: $[EMA]
+- 5M VWAP: $[VWAP]
+- 5M Stoch RSI: [K_val]
+Reasoning: [Explanation]
+
+3. For Divergence:
+MOMENTUM DIVERGENCE SIGNAL (5M EXECUTION)
+Asset: XAUUSD (Gold Spot)
+Action: [BUY or SELL]
+Signal Type: Momentum Divergence
+Entry Price: $[Price]
+Stop Loss (SL): $[SL]
+Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[TP2] (1:2.5 RRR)
+INDICATOR METRICS:
+- 5M EMA 50: $[EMA]
+- 5M VWAP: $[VWAP]
+- 5M Stoch RSI: [K_val]
+Reasoning: [Explanation]
 """
+
 
     output = None
 

@@ -223,14 +223,25 @@ RULES:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 
-OUTPUT REQUIREMENTS:
-Respond strictly with a single JSON object. The "summary" key MUST be a SINGLE PLAIN TEXT STRING (not a nested dict).
+CRITICAL OUTPUT REQUIREMENT FOR "summary":
+If action is "HOLD", set "summary": "HOLD".
+If action is "BUY" or "SELL", you MUST generate "summary" strictly using this multi-line template structure (DO NOT send brief text summaries):
 
-Keys required:
-- "action": "BUY", "SELL", or "HOLD"
-- "confidence": float between 0.0 and 1.0
-- "summary": string message or "HOLD"
-"""
+STOCH RSI SIGNAL (5M EXECUTION)
+Asset: XAUUSD (Gold Spot)
+Action: [BUY or SELL]
+Entry Price: $[Price]
+Stop Loss (SL): $[Calculated SL]
+Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
+Take Profit 2 (TP2): $[TP2]
+
+INDICATOR METRICS:
+- 5M EMA 50: $[EMA]
+- 5M VWAP: $[VWAP]
+- 5M Stoch RSI: [K_val]
+
+Reasoning: [Write 2 sentences explaining the technical setup]
+
 
     output = None
 

@@ -211,8 +211,7 @@ CHANGE OF CHARACTER (ChoCH) & EXECUTION RULES:
    - SELL SL = Maximum of (5M Swing High, 15M Swing High) + $1.20 buffer.
    - TP1 = Entry Price +/- (1.5 * Risk)
    - TP2 = Entry Price +/- (2.5 * Risk)
-
-"""
+   
 OUTPUT REQUIREMENTS:
 You MUST respond strictly with valid JSON with these exact key fields:
 - "action": "BUY", "SELL", or "HOLD"

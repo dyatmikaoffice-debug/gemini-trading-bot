@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from google import genai
 from google.genai import types
@@ -36,16 +36,7 @@ LAST_SIGNAL_PRICE = 0.0
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
-    summary: str = Field(default="HOLD", description="Formatted text summary or HOLD")
-
-    @field_validator('summary', mode='before')
-    @classmethod
-    def stringify_summary(cls, v):
-        """Ensures summary is converted to a plain text string even if LLM returns a dict."""
-        if isinstance(v, dict):
-            lines = [f"{k}: {val}" for k, val in v.items()]
-            return "\n".join(lines)
-        return str(v)
+    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the market analysis.")
 
 
 def send_telegram_message(message: str):
@@ -242,20 +233,9 @@ def analyze_and_alert():
 Analyze this 1H / 15M / 5M Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-PRE-CALCULATED EXPLICIT LEVELS (USE THESE EXACT NUMBERS AND STRINGS):
-BUY SETUP:
-- Entry: ${price:.2f}
-- Stop Loss (SL): ${buy_sl:.2f}
-- Take Profit 1 (TP1): ${buy_tp1:.2f} (1:1.5 RRR)
-- Take Profit 2 (TP2): {buy_tp2_str}
-
-SELL SETUP:
-- Entry: ${price:.2f}
-- Stop Loss (SL): ${sell_sl:.2f}
-- Take Profit 1 (TP1): ${sell_tp1:.2f} (1:1.5 RRR)
-- Take Profit 2 (TP2): {sell_tp2_str}
-
-TRIGGER TYPE DETECTED: {trigger_type}
+PRE-CALCULATED EXPLICIT LEVELS:
+BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} | TP2 {buy_tp2_str}
+SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} | TP2 {sell_tp2_str}
 
 MULTI-TIMEFRAME METRICS:
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
@@ -266,52 +246,30 @@ MULTI-TIMEFRAME METRICS:
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
 
 RULES:
-1. OVEREXTENSION RULE:
-   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "action": "HOLD".
-
+1. OVEREXTENSION RULE: If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), output "action": "HOLD".
 2. TIMEFRAME ALIGNMENT FILTER:
    - DO NOT BUY if 15M Trend is Bearish ({is_15m_bearish}). Output "action": "HOLD".
    - DO NOT SELL if 15M Trend is Bullish ({is_15m_bullish}). Output "action": "HOLD".
-
 3. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 
 OUTPUT REQUIREMENTS:
-Output strictly JSON matching schema with keys "action", "confidence", "summary".
-
-CRITICAL FOR "summary":
-If action is "HOLD", set "summary": "HOLD".
-If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure:
-
-STOCH RSI TRADE SIGNAL
-
-Asset: XAUUSD (Gold Spot)
-Action: [BUY or SELL]
-Type: {trigger_type}
-Entry Price: $[Price]
-
-Stop Loss (SL): $[SL]
-Take Profit 1 (TP1): $[TP1] (1:1.5 RRR)
-Take Profit 2 (TP2): [Insert exact TP2 pre-calculated string here]
-
-INDICATOR METRICS:
-- 1H Stoch RSI: [1H_K_val]
-- 15M Stoch RSI: [15M_K_val]
-- 15M EMA 50: $[15M_EMA]
-
-Reasoning: [Write 2 clean sentences explaining the trade setup]
+Output JSON with schema keys:
+- "action": "BUY", "SELL", or "HOLD"
+- "confidence": float between 0.0 and 1.0
+- "reasoning": "Write 2 clean sentences explaining the setup decision."
 """
 
     output = None
 
-    # Step 1: Groq Primary (Llama 3.1 8B Instant - High Token Limit)
+    # Step 1: Groq Primary (Llama 3.1 8B Instant)
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": "You are a quantitative trading model. Output JSON matching the schema strictly. Always include action, confidence, and summary keys."},
+                    {"role": "system", "content": "You are a quantitative trading model. Output strictly JSON matching schema with action, confidence, and reasoning."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
@@ -345,7 +303,7 @@ Reasoning: [Write 2 clean sentences explaining the trade setup]
         print("All AI model attempts failed this cycle. Continuing to next loop...")
         return
 
-    # Cooldown Filter
+    # Cooldown & Notification Formatting in Python
     if output.action in ["BUY", "SELL"]:
         if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 6.00:
             print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry (${LAST_SIGNAL_PRICE:.2f}).")
@@ -353,7 +311,29 @@ Reasoning: [Write 2 clean sentences explaining the trade setup]
 
         LAST_SIGNAL_ACTION = output.action
         LAST_SIGNAL_PRICE = price
-        send_telegram_message(output.summary)
+
+        sl_val = buy_sl if output.action == "BUY" else sell_sl
+        tp1_val = buy_tp1 if output.action == "BUY" else sell_tp1
+        tp2_str = buy_tp2_str if output.action == "BUY" else sell_tp2_str
+
+        # Clean Programmatic Telegram Output
+        telegram_text = (
+            f"STOCH RSI TRADE SIGNAL\n\n"
+            f"Asset: XAUUSD (Gold Spot)\n"
+            f"Action: {output.action}\n"
+            f"Type: {trigger_type}\n"
+            f"Entry Price: ${price:.2f}\n\n"
+            f"Stop Loss (SL): ${sl_val:.2f}\n"
+            f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:1.5 RRR)\n"
+            f"Take Profit 2 (TP2): {tp2_str}\n\n"
+            f"INDICATOR METRICS:\n"
+            f"- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}\n"
+            f"- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}\n"
+            f"- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}\n\n"
+            f"Reasoning: {output.reasoning}"
+        )
+
+        send_telegram_message(telegram_text)
 
 
 async def background_scanning_loop():

@@ -241,7 +241,7 @@ INDICATOR METRICS:
 - 5M Stoch RSI: [K_val]
 
 Reasoning: [Write 2 sentences explaining the technical setup]
-
+"""
 
     output = None
 

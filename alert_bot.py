@@ -57,8 +57,7 @@ def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
+        "text": message
     }
     try:
         res = httpx.post(url, json=payload, timeout=10.0)
@@ -68,6 +67,7 @@ def send_telegram_message(message: str):
             print(f"Failed to send Telegram alert: {res.text}")
     except Exception as e:
         print(f"Telegram HTTP Error: {e}")
+
 
 
 def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:

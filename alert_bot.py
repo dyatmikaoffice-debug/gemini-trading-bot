@@ -134,12 +134,14 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    swing_high = float(df['High'].tail(10).max())
-    swing_low = float(df['Low'].tail(10).min())
+    # Structural Swing Points (Excludes current forming candle)
+    swing_high = float(df['High'].iloc[-11:-1].max())
+    swing_low = float(df['Low'].iloc[-11:-1].min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 2.50
 
-    is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'])
-    is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'])
+    # UPGRADED CHOCH LOGIC: Requires breaking true structural Swing High/Low
+    is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'] and latest['Close'] < swing_low)
+    is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'] and latest['Close'] > swing_high)
 
     return {
         "close": float(latest['Close']),
@@ -190,6 +192,10 @@ def analyze_and_alert():
 
     price = mtf["5m"]["close"]
     atr_buf = mtf["5m"]["atr_buffer"]
+
+    # --- HIGHER TIMEFRAME TREND ALIGNMENT CHECK ---
+    is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
+    is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
 
     # --- DYNAMIC TRIGGER TYPE DEFINITION ---
     stoch_k_5m = mtf["5m"]["stoch_k"]
@@ -253,7 +259,7 @@ TRIGGER TYPE DETECTED: {trigger_type}
 
 MULTI-TIMEFRAME METRICS:
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
-- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f}
+- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | 15M Bullish: {is_15m_bullish} | 15M Bearish: {is_15m_bearish}
 - 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
 - 5M VWAP Distance: ${mtf['5m']['vwap_distance']:.2f} (Max Stretch: ${mtf['5m']['max_vwap_allowed']:.2f})
 - 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
@@ -263,7 +269,11 @@ RULES:
 1. OVEREXTENSION RULE:
    - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), DO NOT BUY/SELL. Output "action": "HOLD".
 
-2. ENTRY CONFIRMATION:
+2. TIMEFRAME ALIGNMENT FILTER:
+   - DO NOT BUY if 15M Trend is Bearish ({is_15m_bearish}). Output "action": "HOLD".
+   - DO NOT SELL if 15M Trend is Bullish ({is_15m_bullish}). Output "action": "HOLD".
+
+3. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 
@@ -272,7 +282,7 @@ Output strictly JSON matching schema with keys "action", "confidence", "summary"
 
 CRITICAL FOR "summary":
 If action is "HOLD", set "summary": "HOLD".
-If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure (insert exact PRE-CALCULATED numbers and strings provided above):
+If action is "BUY" or "SELL", output "summary" strictly using this exact layout structure:
 
 STOCH RSI TRADE SIGNAL
 
@@ -358,7 +368,7 @@ async def background_scanning_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.task = asyncio.create_task(background_scanning_loop())
+    task = asyncio.create_task(background_scanning_loop())
     yield
     task.cancel()
 

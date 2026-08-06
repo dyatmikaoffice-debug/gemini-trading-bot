@@ -125,12 +125,13 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
-    """Calculates EMA 50, VWAP, Stoch RSI, ATR, ADX, Swing Levels, ChoCH conditions, and Dynamic Squeeze Bounds."""
+    """Calculates EMA 50, VWAP, Stoch RSI, ATR, ADX, Slope, Swing Levels, ChoCH conditions, and Dynamic Squeeze Bounds."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
-    # 1. EMA 50
+    # 1. EMA 50 & Slope
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
+    ema_50_rising = bool(df['EMA_50'].iloc[-1] > df['EMA_50'].iloc[-2])
 
     # 2. VWAP Approximation
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
@@ -163,6 +164,18 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
+    # Two-Candle Confirmation Filter (Requires current and previous candle above/below baseline)
+    is_confirmed_bullish = bool(
+        latest['Close'] > latest['EMA_50'] and prev['Close'] > prev['EMA_50'] and
+        latest['Close'] > latest['VWAP'] and prev['Close'] > prev['VWAP'] and
+        latest['Close'] > latest['Open']
+    )
+    is_confirmed_bearish = bool(
+        latest['Close'] < latest['EMA_50'] and prev['Close'] < prev['EMA_50'] and
+        latest['Close'] < latest['VWAP'] and prev['Close'] < prev['VWAP'] and
+        latest['Close'] < latest['Open']
+    )
+
     # Structural Swing Points
     swing_high = float(df['High'].iloc[-11:-1].max())
     swing_low = float(df['Low'].iloc[-11:-1].min())
@@ -185,9 +198,12 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     return {
         "close": float(latest['Close']),
         "ema_50": float(latest['EMA_50']),
+        "ema_50_rising": ema_50_rising,
         "vwap": float(latest['VWAP']),
         "is_above_ema": bool(latest['Close'] > latest['EMA_50']),
         "is_above_vwap": bool(latest['Close'] > latest['VWAP']),
+        "is_confirmed_bullish": is_confirmed_bullish,
+        "is_confirmed_bearish": is_confirmed_bearish,
         "vwap_distance": round(abs(float(latest['Close']) - float(latest['VWAP'])), 2),
         "choch_bearish": is_choch_bearish,
         "choch_bullish": is_choch_bullish,
@@ -238,23 +254,23 @@ def analyze_and_alert():
     atr_buf = mtf["5m"]["atr_buffer"]
     adx_15m = mtf["15m"]["adx"]
 
-    # --- HIGHER TIMEFRAME TREND ALIGNMENT CHECK ---
+    # --- HIGHER TIMEFRAME TREND & SLOPE CHECK ---
     is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
     is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
+    is_15m_ema_rising = mtf["15m"]["ema_50_rising"]
 
-    # --- HARD PYTHON-LEVEL HARD FILTERS ---
-    is_5m_above_ema = mtf["5m"]["is_above_ema"]
-    is_5m_above_vwap = mtf["5m"]["is_above_vwap"]
+    # --- HARD PYTHON-LEVEL CONFIRMATION FILTERS ---
+    is_5m_confirmed_bull = mtf["5m"]["is_confirmed_bullish"]
+    is_5m_confirmed_bear = mtf["5m"]["is_confirmed_bearish"]
     vwap_dist = mtf["5m"]["vwap_distance"]
     max_vwap = mtf["5m"]["max_vwap_allowed"]
     is_squeeze = mtf["15m"]["is_tight_squeeze"]
     is_break_up = mtf["5m"]["is_breakout_up"]
     is_break_dn = mtf["5m"]["is_breakout_down"]
 
-    # Strictly require Price > EMA 50 AND Price > VWAP for BUY
-    valid_buy_structure = is_5m_above_ema and is_5m_above_vwap and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0
-    # Strictly require Price < EMA 50 AND Price < VWAP for SELL
-    valid_sell_structure = not is_5m_above_ema and not is_5m_above_vwap and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0
+    # Strictly require 2-Candle Confirmation AND 15M EMA Slope Alignment
+    valid_buy_structure = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0
+    valid_sell_structure = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0
 
     # Overextension Guard & Consolidation Squeeze Guard
     if vwap_dist > max_vwap:
@@ -266,7 +282,7 @@ def analyze_and_alert():
         return
 
     if not valid_buy_structure and not valid_sell_structure:
-        print("Skipping: Price structure violates baseline alignment rules.")
+        print("Skipping: Price structure violates baseline alignment or 2-candle confirmation rules.")
         return
 
     # --- DYNAMIC ADX RISK-TO-REWARD RATIO (RRR) SCALING ---
@@ -333,8 +349,9 @@ SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} (1:{tp1
 
 MULTI-TIMEFRAME METRICS:
 - 15M ADX Trend Strength: {adx_15m:.1f}
-- 5M Price Above EMA 50: {is_5m_above_ema} (${mtf['5m']['ema_50']:.2f})
-- 5M Price Above VWAP: {is_5m_above_vwap} (${mtf['5m']['vwap']:.2f})
+- 15M EMA 50 Slope Rising: {is_15m_ema_rising}
+- 5M Two-Candle Bullish Confirmation: {is_5m_confirmed_bull}
+- 5M Two-Candle Bearish Confirmation: {is_5m_confirmed_bear}
 - 15M Range Width: ${mtf['15m']['range_width']:.2f} | 15M Tight Squeeze: {mtf['15m']['is_tight_squeeze']}
 - 5M Breakout Up: {is_break_up} | 5M Breakout Down: {is_break_dn}
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
@@ -354,7 +371,7 @@ OUTPUT REQUIREMENTS:
 Output JSON with schema keys:
 - "action": "BUY", "SELL", or "HOLD"
 - "confidence": float between 0.0 and 1.0
-- "reasoning": "Write 2 clean sentences explaining the setup decision and ADX momentum context."
+- "reasoning": "Write 2 clean sentences explaining the setup decision and 2-candle confirmation context."
 """
 
     output = None
@@ -424,6 +441,7 @@ Output JSON with schema keys:
             f"Take Profit 2 (TP2): {tp2_str}\n\n"
             f"INDICATOR METRICS:\n"
             f"- 15M ADX Strength: {adx_15m:.1f}\n"
+            f"- 15M EMA 50 Slope: {'Rising' if is_15m_ema_rising else 'Falling'}\n"
             f"- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}\n"
             f"- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}\n"
             f"- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}\n\n"

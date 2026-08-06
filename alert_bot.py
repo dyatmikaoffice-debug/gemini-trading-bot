@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -89,8 +90,42 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
     return df
 
 
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """Calculates the Average Directional Index (ADX) to measure trend strength."""
+    if df.empty or len(df) < (period * 2):
+        return 20.0
+
+    temp_df = df.copy()
+    temp_df['prev_close'] = temp_df['Close'].shift(1)
+    
+    # True Range
+    temp_df['tr'] = temp_df[['High', 'Low', 'prev_close']].apply(
+        lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['prev_close']), abs(x['Low'] - x['prev_close'])), axis=1
+    )
+    
+    # Directional Movement
+    temp_df['up_move'] = temp_df['High'] - temp_df['High'].shift(1)
+    temp_df['down_move'] = temp_df['Low'].shift(1) - temp_df['Low']
+
+    temp_df['plus_dm'] = temp_df.apply(lambda x: x['up_move'] if (x['up_move'] > x['down_move'] and x['up_move'] > 0) else 0.0, axis=1)
+    temp_df['minus_dm'] = temp_df.apply(lambda x: x['down_move'] if (x['down_move'] > x['up_move'] and x['down_move'] > 0) else 0.0, axis=1)
+
+    alpha = 1.0 / period
+    temp_df['tr_smoothed'] = temp_df['tr'].ewm(alpha=alpha, adjust=False).mean()
+    temp_df['plus_di'] = 100 * (temp_df['plus_dm'].ewm(alpha=alpha, adjust=False).mean() / temp_df['tr_smoothed'].replace(0, 1))
+    temp_df['minus_di'] = 100 * (temp_df['minus_dm'].ewm(alpha=alpha, adjust=False).mean() / temp_df['tr_smoothed'].replace(0, 1))
+
+    di_sum = temp_df['plus_di'] + temp_df['minus_di']
+    di_diff = (temp_df['plus_di'] - temp_df['minus_di']).abs()
+    
+    temp_df['dx'] = 100 * (di_diff / di_sum.replace(0, 1))
+    temp_df['adx'] = temp_df['dx'].ewm(alpha=alpha, adjust=False).mean()
+    
+    return float(temp_df['adx'].iloc[-1])
+
+
 def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
-    """Calculates EMA 50, VWAP, Stoch RSI, ATR, Swing Levels, ChoCH conditions, and Dynamic Squeeze Bounds."""
+    """Calculates EMA 50, VWAP, Stoch RSI, ATR, ADX, Swing Levels, ChoCH conditions, and Dynamic Squeeze Bounds."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
@@ -122,10 +157,13 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     )
     df['ATR'] = df['TR'].rolling(window=atr_period).mean()
 
+    # 5. ADX Calculation
+    adx_val = calculate_adx(df, period=14)
+
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Structural Swing Points (Excludes current forming candle)
+    # Structural Swing Points
     swing_high = float(df['High'].iloc[-11:-1].max())
     swing_low = float(df['Low'].iloc[-11:-1].min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 2.50
@@ -140,7 +178,7 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     is_breakout_up = bool(latest['Close'] > range_high and latest['Close'] > latest['Open'])
     is_breakout_down = bool(latest['Close'] < range_low and latest['Close'] < latest['Open'])
 
-    # UPGRADED CHOCH LOGIC: Requires breaking true structural Swing High/Low
+    # UPGRADED CHOCH LOGIC
     is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'] and latest['Close'] < swing_low)
     is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'] and latest['Close'] > swing_high)
 
@@ -166,7 +204,8 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
         "range_width": range_width,
         "is_tight_squeeze": is_tight_squeeze,
         "is_breakout_up": is_breakout_up,
-        "is_breakout_down": is_breakout_down
+        "is_breakout_down": is_breakout_down,
+        "adx": round(adx_val, 1)
     }
 
 
@@ -197,12 +236,13 @@ def analyze_and_alert():
 
     price = mtf["5m"]["close"]
     atr_buf = mtf["5m"]["atr_buffer"]
+    adx_15m = mtf["15m"]["adx"]
 
     # --- HIGHER TIMEFRAME TREND ALIGNMENT CHECK ---
     is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
     is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
 
-    # --- HARD PYTHON-LEVEL HARD FILTERS (Zero LLM Hallucination) ---
+    # --- HARD PYTHON-LEVEL HARD FILTERS ---
     is_5m_above_ema = mtf["5m"]["is_above_ema"]
     is_5m_above_vwap = mtf["5m"]["is_above_vwap"]
     vwap_dist = mtf["5m"]["vwap_distance"]
@@ -226,8 +266,19 @@ def analyze_and_alert():
         return
 
     if not valid_buy_structure and not valid_sell_structure:
-        print("Skipping: Price structure violates baseline alignment rules (e.g., BUY below EMA 50/VWAP).")
+        print("Skipping: Price structure violates baseline alignment rules.")
         return
+
+    # --- DYNAMIC ADX RISK-TO-REWARD RATIO (RRR) SCALING ---
+    if adx_15m < 20.0:
+        tp1_mult, tp2_mult = 1.0, 1.5
+        adx_desc = f"15M ADX ({adx_15m:.1f}) Weak Trend"
+    elif adx_15m >= 35.0:
+        tp1_mult, tp2_mult = 2.0, 4.0
+        adx_desc = f"15M ADX ({adx_15m:.1f}) Explosive Momentum"
+    else:
+        tp1_mult, tp2_mult = 1.5, 2.5
+        adx_desc = f"15M ADX ({adx_15m:.1f}) Moderate Trend"
 
     # --- DYNAMIC TRIGGER TYPE DEFINITION ---
     stoch_k_5m = mtf["5m"]["stoch_k"]
@@ -243,44 +294,45 @@ def analyze_and_alert():
     else:
         trigger_type = "Breakout Continuation"
 
-    # --- TIGHT 5M EXECUTION SL & TP MATH WITH SIDE-NOTE ---
+    # --- DYNAMIC SL & TP MULTI-LEVEL MATH ---
     # BUY SETUP
     local_buy_sl = round(mtf["5m"]["swing_low"] - atr_buf, 2)
     buy_sl = round(max(local_buy_sl, price - 12.00), 2)
     buy_risk = round(price - buy_sl, 2)
-    buy_tp1 = round(price + (1.5 * buy_risk), 2)
-    raw_buy_tp2 = round(price + (2.5 * buy_risk), 2)
+    buy_tp1 = round(price + (tp1_mult * buy_risk), 2)
+    raw_buy_tp2 = round(price + (tp2_mult * buy_risk), 2)
     swing_high_15m = mtf["15m"]["swing_high"]
     buy_tp2 = round(min(raw_buy_tp2, max(swing_high_15m, buy_tp1 + 2.0)), 2)
 
     if buy_tp2 < raw_buy_tp2:
-        buy_tp2_str = f"${buy_tp2:.2f} (Capped at 15M Swing High; Raw 1:2.5 RRR ${raw_buy_tp2:.2f})"
+        buy_tp2_str = f"${buy_tp2:.2f} (Capped at 15M Swing High; Raw 1:{tp2_mult:.1f} RRR ${raw_buy_tp2:.2f})"
     else:
-        buy_tp2_str = f"${buy_tp2:.2f} (1:2.5 RRR)"
+        buy_tp2_str = f"${buy_tp2:.2f} (1:{tp2_mult:.1f} RRR)"
 
     # SELL SETUP
     local_sell_sl = round(mtf["5m"]["swing_high"] + atr_buf, 2)
     sell_sl = round(min(local_sell_sl, price + 12.00), 2)
     sell_risk = round(sell_sl - price, 2)
-    sell_tp1 = round(price - (1.5 * sell_risk), 2)
-    raw_sell_tp2 = round(price - (2.5 * sell_risk), 2)
+    sell_tp1 = round(price - (tp1_mult * sell_risk), 2)
+    raw_sell_tp2 = round(price - (tp2_mult * sell_risk), 2)
     swing_low_15m = mtf["15m"]["swing_low"]
     sell_tp2 = round(max(raw_sell_tp2, min(swing_low_15m, sell_tp1 - 2.0)), 2)
 
     if sell_tp2 > raw_sell_tp2:
-        sell_tp2_str = f"${sell_tp2:.2f} (Capped at 15M Swing Low; Raw 1:2.5 RRR ${raw_sell_tp2:.2f})"
+        sell_tp2_str = f"${sell_tp2:.2f} (Capped at 15M Swing Low; Raw 1:{tp2_mult:.1f} RRR ${raw_sell_tp2:.2f})"
     else:
-        sell_tp2_str = f"${sell_tp2:.2f} (1:2.5 RRR)"
+        sell_tp2_str = f"${sell_tp2:.2f} (1:{tp2_mult:.1f} RRR)"
 
     prompt = f"""
 Analyze this 1H / 15M / 5M Strategy for Spot Gold (XAU/USD OANDA):
 Current Price: ${price:.2f}
 
-PRE-CALCULATED EXPLICIT LEVELS:
-BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} | TP2 {buy_tp2_str}
-SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} | TP2 {sell_tp2_str}
+PRE-CALCULATED EXPLICIT LEVELS ({adx_desc}):
+BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {buy_tp2_str}
+SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {sell_tp2_str}
 
 MULTI-TIMEFRAME METRICS:
+- 15M ADX Trend Strength: {adx_15m:.1f}
 - 5M Price Above EMA 50: {is_5m_above_ema} (${mtf['5m']['ema_50']:.2f})
 - 5M Price Above VWAP: {is_5m_above_vwap} (${mtf['5m']['vwap']:.2f})
 - 15M Range Width: ${mtf['15m']['range_width']:.2f} | 15M Tight Squeeze: {mtf['15m']['is_tight_squeeze']}
@@ -302,7 +354,7 @@ OUTPUT REQUIREMENTS:
 Output JSON with schema keys:
 - "action": "BUY", "SELL", or "HOLD"
 - "confidence": float between 0.0 and 1.0
-- "reasoning": "Write 2 clean sentences explaining the setup decision."
+- "reasoning": "Write 2 clean sentences explaining the setup decision and ADX momentum context."
 """
 
     output = None
@@ -368,9 +420,10 @@ Output JSON with schema keys:
             f"Type: {trigger_type}\n"
             f"Entry Price: ${price:.2f}\n\n"
             f"Stop Loss (SL): ${sl_val:.2f}\n"
-            f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:1.5 RRR)\n"
+            f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:{tp1_mult:.1f} RRR)\n"
             f"Take Profit 2 (TP2): {tp2_str}\n\n"
             f"INDICATOR METRICS:\n"
+            f"- 15M ADX Strength: {adx_15m:.1f}\n"
             f"- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}\n"
             f"- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}\n"
             f"- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}\n\n"

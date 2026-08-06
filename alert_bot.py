@@ -209,6 +209,117 @@ def send_telegram_message(message: str):
         print(f"Telegram HTTP Error: {e}")
 
 
+def format_stats_message() -> str:
+    """Formats system statistics for Telegram direct response."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'EXECUTED'")
+    total_executed = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'VETOED'")
+    total_vetoed = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome IN ('HIT_TP1', 'HIT_TP2')")
+    wins = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_SL'")
+    losses = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_TP1'")
+    tp1_hits = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_TP2'")
+    tp2_hits = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'PENDING'")
+    pending = cursor.fetchone()[0]
+    
+    conn.close()
+
+    closed_trades = wins + losses
+    win_rate = round((wins / closed_trades * 100), 1) if closed_trades > 0 else 0.0
+
+    return (
+        f"📊 SYSTEM PERFORMANCE STATS\n\n"
+        f"• Executed Signals: {total_executed}\n"
+        f"• AI Vetoes: {total_vetoed}\n"
+        f"• Pending Trades: {pending}\n"
+        f"• Closed Trades: {closed_trades}\n"
+        f"• Total Wins: {wins} (TP1: {tp1_hits} | TP2: {tp2_hits})\n"
+        f"• Total Losses: {losses}\n"
+        f"• Win Rate: {win_rate}%\n"
+    )
+
+
+def format_recent_logs_message(limit: int = 5) -> str:
+    """Formats the latest logged signals for Telegram direct response."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return "No trade logs recorded yet."
+
+    msg = f"📜 RECENT {len(rows)} SIGNAL LOGS:\n\n"
+    for r in rows:
+        status_icon = "✅" if r["status"] == "EXECUTED" else "🛑"
+        outcome_str = f" | Outcome: {r['outcome']}" if r["status"] == "EXECUTED" else ""
+        msg += f"{status_icon} #{r['id']} {r['action']} @ ${r['price']:.2f}\n"
+        msg += f"Status: {r['status']}{outcome_str}\n"
+        msg += f"Type: {r['trigger_type']}\n"
+        msg += f"Reasoning: {r['reasoning']}\n"
+        msg += "-" * 25 + "\n"
+    return msg
+
+
+async def telegram_polling_loop():
+    """Asynchronously polls Telegram for commands like /stats, /logs, or /help."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("Telegram token missing. Polling listener disabled.")
+        return
+
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(url, params={"offset": offset, "timeout": 10}, timeout=15.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        message = update.get("message", {})
+                        text = message.get("text", "").strip()
+
+                        # Strip command handles if present (e.g., /stats@botname)
+                        cmd = text.split("@")[0].lower()
+
+                        if cmd == "/stats":
+                            stats_msg = format_stats_message()
+                            send_telegram_message(stats_msg)
+                        elif cmd == "/logs":
+                            logs_msg = format_recent_logs_message(limit=5)
+                            send_telegram_message(logs_msg)
+                        elif cmd == "/help":
+                            help_msg = (
+                                "🤖 TRADING BOT COMMANDS:\n\n"
+                                "/stats - View live win rate, TP/SL hits, and veto counts\n"
+                                "/logs - View details of the last 5 signals\n"
+                                "/help - Display command menu"
+                            )
+                            send_telegram_message(help_msg)
+
+        except Exception as e:
+            print(f"Telegram Polling Exception: {e}")
+
+        await asyncio.sleep(3)
+
+
 def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
     """Fetches real-time OHLC candles for Spot Gold from Twelve Data."""
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&exchange={EXCHANGE}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
@@ -605,9 +716,11 @@ async def background_scanning_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    task = asyncio.create_task(background_scanning_loop())
+    scan_task = asyncio.create_task(background_scanning_loop())
+    poll_task = asyncio.create_task(telegram_polling_loop())
     yield
-    task.cancel()
+    scan_task.cancel()
+    poll_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -615,7 +728,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Trading bot background scanner and outcome tracker are active!"}
+    return {"status": "ok", "message": "Trading bot background scanner, outcome tracker, and Telegram listener are active!"}
 
 
 @app.get("/logs")

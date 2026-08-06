@@ -1,6 +1,8 @@
 import os
 import json
 import asyncio
+import sqlite3
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
@@ -28,6 +30,7 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"
+DB_FILE = "trade_logs.db"
 
 # Cooldown Tracker
 LAST_SIGNAL_ACTION = "HOLD"
@@ -38,6 +41,151 @@ class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
     reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the setup decision or veto reason.")
+
+
+# --- SQLITE PAPER-TRADING LOGGING & TRACKING SYSTEM ---
+def init_db():
+    """Initializes SQLite database table with trade outcome tracking columns."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            status TEXT NOT NULL,
+            action TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            price REAL NOT NULL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            confidence REAL,
+            adx_15m REAL,
+            stoch_rsi_15m REAL,
+            divergence_type TEXT,
+            reasoning TEXT,
+            outcome TEXT DEFAULT 'PENDING',
+            exit_price REAL,
+            outcome_timestamp TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def log_trade_signal(status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float, confidence: float, adx_15m: float, stoch_15m: float, divergence: str, reasoning: str):
+    """Logs executed trades and AI veto decisions to SQLite database."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        initial_outcome = "PENDING" if status == "EXECUTED" else "N/A"
+        cursor.execute("""
+            INSERT INTO signals (timestamp, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            status,
+            action,
+            trigger_type,
+            price,
+            sl,
+            tp1,
+            tp2,
+            confidence,
+            adx_15m,
+            stoch_15m,
+            divergence,
+            reasoning,
+            initial_outcome
+        ))
+        conn.commit()
+        conn.close()
+        print(f"[PAPER TRADER LOG] Signal recorded successfully with status: {status}")
+    except Exception as e:
+        print(f"Failed to log trade to SQLite: {e}")
+
+
+def update_trade_outcomes():
+    """Evaluates pending trades against recent candle Highs/Lows to mark TP1, TP2, or SL hits."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+    pending_signals = cursor.fetchall()
+
+    if not pending_signals:
+        conn.close()
+        return
+
+    # Fetch recent 5M candles for verification
+    df_5m = fetch_twelve_data("5min", outputsize=100)
+    if df_5m.empty:
+        conn.close()
+        return
+
+    now_utc = datetime.now(timezone.utc)
+
+    for sig in pending_signals:
+        sig_id = sig["id"]
+        sig_time = datetime.fromisoformat(sig["timestamp"])
+        action = sig["action"]
+        sl = sig["sl"]
+        tp1 = sig["tp1"]
+        tp2 = sig["tp2"]
+
+        # Filter candles occurring AFTER signal generation
+        candles_after = df_5m[df_5m["datetime"] >= sig_time]
+        if candles_after.empty:
+            continue
+
+        outcome = "PENDING"
+        exit_price = None
+
+        for _, candle in candles_after.iterrows():
+            high = candle["High"]
+            low = candle["Low"]
+
+            if action == "BUY":
+                if low <= sl:
+                    outcome = "HIT_SL"
+                    exit_price = sl
+                    break
+                elif high >= tp2:
+                    outcome = "HIT_TP2"
+                    exit_price = tp2
+                    break
+                elif high >= tp1 and outcome != "HIT_TP1":
+                    outcome = "HIT_TP1"
+                    exit_price = tp1
+
+            elif action == "SELL":
+                if high >= sl:
+                    outcome = "HIT_SL"
+                    exit_price = sl
+                    break
+                elif low <= tp2:
+                    outcome = "HIT_TP2"
+                    exit_price = tp2
+                    break
+                elif low <= tp1 and outcome != "HIT_TP1":
+                    outcome = "HIT_TP1"
+                    exit_price = tp1
+
+        # Timeout trade if unfulfilled after 24 hours
+        if outcome == "PENDING" and (now_utc - sig_time) > timedelta(hours=24):
+            outcome = "EXPIRED"
+            exit_price = candles_after.iloc[-1]["Close"]
+
+        if outcome != "PENDING":
+            cursor.execute("""
+                UPDATE signals 
+                SET outcome = ?, exit_price = ?, outcome_timestamp = ? 
+                WHERE id = ?
+            """, (outcome, exit_price, datetime.now(timezone.utc).isoformat(), sig_id))
+            conn.commit()
+            print(f"[OUTCOME TRACKER] Signal #{sig_id} ({action}) updated to: {outcome} at ${exit_price}")
+
+    conn.close()
 
 
 def send_telegram_message(message: str):
@@ -78,7 +226,7 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(timezone.utc)
     df = df.sort_values("datetime").reset_index(drop=True)
 
     df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
@@ -136,14 +284,12 @@ def detect_divergence(df: pd.DataFrame):
     cross_up = bool(prev_k < recent_df['%D'].iloc[-2] and latest_k > recent_df['%D'].iloc[-1])
     cross_dn = bool(prev_k > recent_df['%D'].iloc[-2] and latest_k < recent_df['%D'].iloc[-1])
 
-    # Trough detection
     p_low_curr = lows[-1]
     p_low_prev = np.min(lows[:-5])
     p_low_prev_idx = np.argmin(lows[:-5])
     k_low_curr = latest_k
     k_low_prev = stoch_k[p_low_prev_idx]
 
-    # Peak detection
     highs = recent_df['High'].values
     p_high_curr = highs[-1]
     p_high_prev = np.max(highs[:-5])
@@ -168,14 +314,11 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
-    # 1. EMA 50
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
 
-    # 2. VWAP
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
     df['VWAP'] = (typical_price * df['Close']).rolling(window=20).sum() / df['Close'].rolling(window=20).sum()
 
-    # 3. RSI & Stochastic RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
@@ -189,21 +332,18 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. ATR
     df['PrevClose'] = df['Close'].shift(1)
     df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
     )
     df['ATR'] = df['TR'].rolling(window=atr_period).mean()
 
-    # 5. ADX & Divergence
     adx_val = calculate_adx(df, period=14)
     is_bull_div, is_bear_div, div_desc = detect_divergence(df)
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Two-Candle Confirmation Filter
     is_confirmed_bullish = bool(
         latest['Close'] > latest['EMA_50'] and prev['Close'] > prev['EMA_50'] and
         latest['Close'] > latest['VWAP'] and prev['Close'] > prev['VWAP'] and
@@ -255,6 +395,9 @@ def get_mtf_data():
 def analyze_and_alert():
     global LAST_SIGNAL_ACTION, LAST_SIGNAL_PRICE
 
+    # Update outcomes of existing open trades
+    update_trade_outcomes()
+
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
     mtf = get_mtf_data()
 
@@ -265,7 +408,7 @@ def analyze_and_alert():
     price = mtf["5m"]["close"]
     adx_15m = mtf["15m"]["adx"]
 
-    # --- PILLAR 1: SINGLE CHOP GUARD (15M ADX > 18.0) ---
+    # --- PILLAR 1: ADX CHOP GUARD (15M ADX > 18.0) ---
     is_bull_div = mtf["5m"]["is_bull_div"] or mtf["15m"]["is_bull_div"]
     is_bear_div = mtf["5m"]["is_bear_div"] or mtf["15m"]["is_bear_div"]
 
@@ -277,7 +420,6 @@ def analyze_and_alert():
     is_5m_bull = mtf["5m"]["is_confirmed_bullish"]
     is_5m_bear = mtf["5m"]["is_confirmed_bearish"]
 
-    # Valid if standard 2-candle confirmation passes OR a divergence forms
     valid_buy_structure = is_5m_bull or is_bull_div
     valid_sell_structure = is_5m_bear or is_bear_div
 
@@ -287,7 +429,6 @@ def analyze_and_alert():
 
     candidate_action = "BUY" if valid_buy_structure else "SELL"
 
-    # Dynamic RRR based on ADX
     if adx_15m >= 35.0:
         tp1_mult, tp2_mult = 2.0, 4.0
         adx_desc = f"15M ADX ({adx_15m:.1f}) Explosive Momentum"
@@ -297,19 +438,23 @@ def analyze_and_alert():
 
     trigger_type = "Divergence Reversal" if (is_bull_div or is_bear_div) else "Trend Setup"
 
-    # SL / TP Math
+    # --- CAPPED RISK SL & TP MATH ---
     active_atr = mtf["5m"]["atr"]
+    max_allowed_risk = round(2.0 * active_atr, 2)  # Caps SL distance to max 2x ATR
+
     if candidate_action == "BUY":
-        buy_sl = round(price - max(1.2 * active_atr, price - mtf["5m"]["swing_low"]), 2)
-        buy_risk = round(price - buy_sl, 2)
-        buy_tp1 = round(price + (tp1_mult * buy_risk), 2)
-        buy_tp2 = round(price + (tp2_mult * buy_risk), 2)
+        raw_risk = price - mtf["5m"]["swing_low"]
+        actual_risk = min(max(1.2 * active_atr, raw_risk), max_allowed_risk)
+        buy_sl = round(price - actual_risk, 2)
+        buy_tp1 = round(price + (tp1_mult * actual_risk), 2)
+        buy_tp2 = round(price + (tp2_mult * actual_risk), 2)
         sl_val, tp1_val, tp2_val = buy_sl, buy_tp1, buy_tp2
     else:
-        sell_sl = round(price + max(1.2 * active_atr, mtf["5m"]["swing_high"] - price), 2)
-        sell_risk = round(sell_sl - price, 2)
-        sell_tp1 = round(price - (tp1_mult * sell_risk), 2)
-        sell_tp2 = round(price - (tp2_mult * sell_risk), 2)
+        raw_risk = mtf["5m"]["swing_high"] - price
+        actual_risk = min(max(1.2 * active_atr, raw_risk), max_allowed_risk)
+        sell_sl = round(price + actual_risk, 2)
+        sell_tp1 = round(price - (tp1_mult * actual_risk), 2)
+        sell_tp2 = round(price - (tp2_mult * actual_risk), 2)
         sl_val, tp1_val, tp2_val = sell_sl, sell_tp1, sell_tp2
 
     # --- PILLAR 3: HYBRID AI VETO MODEL PROMPT ---
@@ -348,7 +493,6 @@ Output JSON with schema keys:
 
     output = None
 
-    # Groq Primary (Llama 3.1 8B Instant)
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
@@ -366,7 +510,6 @@ Output JSON with schema keys:
         except Exception as e:
             print(f"Groq API call error: {e}. Falling back to Gemini...")
 
-    # Gemini Fallback
     if not output and genai_client:
         try:
             config = types.GenerateContentConfig(
@@ -390,9 +533,22 @@ Output JSON with schema keys:
 
     if output.action == "HOLD":
         print(f"[AI VETO EXERCISED] Analyst rejected setup '{candidate_action}'. Reason: {output.reasoning}")
+        log_trade_signal(
+            status="VETOED",
+            action=candidate_action,
+            trigger_type=trigger_type,
+            price=price,
+            sl=sl_val,
+            tp1=tp1_val,
+            tp2=tp2_val,
+            confidence=output.confidence,
+            adx_15m=adx_15m,
+            stoch_15m=mtf["15m"]["stoch_k"],
+            divergence=div_note,
+            reasoning=output.reasoning
+        )
         return
 
-    # Cooldown & Notification
     if output.action in ["BUY", "SELL"]:
         if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 6.00:
             print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry.")
@@ -400,6 +556,21 @@ Output JSON with schema keys:
 
         LAST_SIGNAL_ACTION = output.action
         LAST_SIGNAL_PRICE = price
+
+        log_trade_signal(
+            status="EXECUTED",
+            action=output.action,
+            trigger_type=trigger_type,
+            price=price,
+            sl=sl_val,
+            tp1=tp1_val,
+            tp2=tp2_val,
+            confidence=output.confidence,
+            adx_15m=adx_15m,
+            stoch_15m=mtf["15m"]["stoch_k"],
+            divergence=div_note,
+            reasoning=output.reasoning
+        )
 
         telegram_text = (
             f"STOCH RSI TRADE SIGNAL\n\n"
@@ -433,6 +604,7 @@ async def background_scanning_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
     task = asyncio.create_task(background_scanning_loop())
     yield
     task.cancel()
@@ -443,4 +615,61 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Trading bot background scanner is active!"}
+    return {"status": "ok", "message": "Trading bot background scanner and outcome tracker are active!"}
+
+
+@app.get("/logs")
+def get_trade_logs(limit: int = 50):
+    """Retrieves paper trading signal history and live outcome statuses."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return {"count": len(rows), "logs": [dict(row) for row in rows]}
+
+
+@app.get("/stats")
+def get_trade_stats():
+    """Retrieves live win/loss performance, win rate %, and AI veto counts."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'EXECUTED'")
+    total_executed = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'VETOED'")
+    total_vetoed = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome IN ('HIT_TP1', 'HIT_TP2')")
+    wins = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_SL'")
+    losses = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_TP1'")
+    tp1_hits = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'HIT_TP2'")
+    tp2_hits = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'PENDING'")
+    pending = cursor.fetchone()[0]
+    
+    conn.close()
+
+    closed_trades = wins + losses
+    win_rate = round((wins / closed_trades * 100), 1) if closed_trades > 0 else 0.0
+    
+    return {
+        "executed_signals": total_executed,
+        "ai_vetoes": total_vetoed,
+        "pending_signals": pending,
+        "closed_trades": closed_trades,
+        "wins": wins,
+        "tp1_hits": tp1_hits,
+        "tp2_hits": tp2_hits,
+        "losses": losses,
+        "win_rate_percentage": f"{win_rate}%"
+    }

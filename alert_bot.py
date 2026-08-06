@@ -37,7 +37,7 @@ LAST_SIGNAL_PRICE = 0.0
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
-    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the setup decision.")
+    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the setup decision or veto reason.")
 
 
 def send_telegram_message(message: str):
@@ -254,6 +254,19 @@ def analyze_and_alert():
     atr_buf = mtf["5m"]["atr_buffer"]
     adx_15m = mtf["15m"]["adx"]
 
+    # --- 1H RANGE BOUNDARY FILTER ---
+    swing_high_1h = mtf["1h"]["swing_high"]
+    swing_low_1h = mtf["1h"]["swing_low"]
+    range_1h = swing_high_1h - swing_low_1h
+    range_pos_1h = (price - swing_low_1h) / range_1h if range_1h > 0 else 0.5
+
+    is_break_up = mtf["5m"]["is_breakout_up"]
+    is_break_dn = mtf["5m"]["is_breakout_down"]
+
+    # Prevent buying into 1H Resistance (> 85% range) or selling into 1H Support (< 15% range) without breakout
+    at_1h_resistance = bool(range_pos_1h > 0.85 and not is_break_up)
+    at_1h_support = bool(range_pos_1h < 0.15 and not is_break_dn)
+
     # --- HIGHER TIMEFRAME TREND & SLOPE CHECK ---
     is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
     is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
@@ -265,12 +278,10 @@ def analyze_and_alert():
     vwap_dist = mtf["5m"]["vwap_distance"]
     max_vwap = mtf["5m"]["max_vwap_allowed"]
     is_squeeze = mtf["15m"]["is_tight_squeeze"]
-    is_break_up = mtf["5m"]["is_breakout_up"]
-    is_break_dn = mtf["5m"]["is_breakout_down"]
 
-    # Strictly require 2-Candle Confirmation AND 15M EMA Slope Alignment
-    valid_buy_structure = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0
-    valid_sell_structure = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0
+    # Strictly require 2-Candle Confirmation, 15M Slope Alignment, AND 1H Range Boundary Compliance
+    valid_buy_structure = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0 and not at_1h_resistance
+    valid_sell_structure = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0 and not at_1h_support
 
     # Overextension Guard & Consolidation Squeeze Guard
     if vwap_dist > max_vwap:
@@ -281,9 +292,19 @@ def analyze_and_alert():
         print("Skipping: Market trapped in tight consolidation squeeze.")
         return
 
-    if not valid_buy_structure and not valid_sell_structure:
-        print("Skipping: Price structure violates baseline alignment or 2-candle confirmation rules.")
+    if at_1h_resistance and is_5m_confirmed_bull:
+        print(f"Skipping BUY: Price (${price:.2f}) at 1H Resistance Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
         return
+
+    if at_1h_support and is_5m_confirmed_bear:
+        print(f"Skipping SELL: Price (${price:.2f}) at 1H Support Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
+        return
+
+    if not valid_buy_structure and not valid_sell_structure:
+        print("Skipping: Price structure violates baseline alignment, 2-candle confirmation, or 1H boundary rules.")
+        return
+
+    candidate_action = "BUY" if valid_buy_structure else "SELL"
 
     # --- DYNAMIC ADX RISK-TO-REWARD RATIO (RRR) SCALING ---
     if adx_15m < 20.0:
@@ -339,15 +360,21 @@ def analyze_and_alert():
     else:
         sell_tp2_str = f"${sell_tp2:.2f} (1:{tp2_mult:.1f} RRR)"
 
+    # --- HYBRID VETO MODEL PROMPT ---
     prompt = f"""
-Analyze this 1H / 15M / 5M Strategy for Spot Gold (XAU/USD OANDA):
+You are a Senior Quantitative Trading Analyst with VETO POWER.
+
+Python Risk Manager has passed a candidate setup:
+PROPOSED CANDIDATE ACTION: {candidate_action}
 Current Price: ${price:.2f}
 
 PRE-CALCULATED EXPLICIT LEVELS ({adx_desc}):
 BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {buy_tp2_str}
 SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {sell_tp2_str}
 
-MULTI-TIMEFRAME METRICS:
+MULTI-TIMEFRAME & BOUNDARY METRICS:
+- 1H Swing High: ${swing_high_1h:.2f} | 1H Swing Low: ${swing_low_1h:.2f}
+- Price Position in 1H Range: {range_pos_1h * 100:.1f}%
 - 15M ADX Trend Strength: {adx_15m:.1f}
 - 15M EMA 50 Slope Rising: {is_15m_ema_rising}
 - 5M Two-Candle Bullish Confirmation: {is_5m_confirmed_bull}
@@ -361,17 +388,17 @@ MULTI-TIMEFRAME METRICS:
 - 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
 
-RULES:
-1. ENTRY DIRECTION:
-   - If valid_buy_structure is True ({valid_buy_structure}), output "action": "BUY".
-   - If valid_sell_structure is True ({valid_sell_structure}), output "action": "SELL".
-   - Otherwise, output "action": "HOLD".
+ANALYST VETO DIRECTIVE:
+Review the market context for the proposed setup ({candidate_action}).
+Look for structural red flags such as lower-high traps, relief bounces into resistance, fading momentum, or horizontal range chop.
+- If you detect chop or trap risk, EXERCISE YOUR VETO POWER and return "action": "HOLD".
+- If the trend structure is clean and momentum is genuine, CONFIRM by returning "action": "{candidate_action}".
 
 OUTPUT REQUIREMENTS:
 Output JSON with schema keys:
-- "action": "BUY", "SELL", or "HOLD"
+- "action": "{candidate_action}" or "HOLD"
 - "confidence": float between 0.0 and 1.0
-- "reasoning": "Write 2 clean sentences explaining the setup decision and 2-candle confirmation context."
+- "reasoning": "Write 2 clean sentences explaining your decision (confirming entry or exercising veto)."
 """
 
     output = None
@@ -382,7 +409,7 @@ Output JSON with schema keys:
             res = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": "You are a quantitative trading model. Output strictly JSON matching schema with action, confidence, and reasoning."},
+                    {"role": "system", "content": "You are a quantitative trading model with veto power. Output strictly JSON matching schema with action, confidence, and reasoning."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
@@ -416,6 +443,11 @@ Output JSON with schema keys:
         print("All AI model attempts failed this cycle. Continuing to next loop...")
         return
 
+    # Handle AI Veto Execution
+    if output.action == "HOLD":
+        print(f"[AI VETO EXERCISED] Analyst rejected candidate setup '{candidate_action}'. Reason: {output.reasoning}")
+        return
+
     # Cooldown & Notification Formatting in Python
     if output.action in ["BUY", "SELL"]:
         if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 6.00:
@@ -440,6 +472,7 @@ Output JSON with schema keys:
             f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:{tp1_mult:.1f} RRR)\n"
             f"Take Profit 2 (TP2): {tp2_str}\n\n"
             f"INDICATOR METRICS:\n"
+            f"- 1H Range Position: {range_pos_1h * 100:.1f}%\n"
             f"- 15M ADX Strength: {adx_15m:.1f}\n"
             f"- 15M EMA 50 Slope: {'Rising' if is_15m_ema_rising else 'Falling'}\n"
             f"- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}\n"

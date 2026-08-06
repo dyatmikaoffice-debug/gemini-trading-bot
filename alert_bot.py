@@ -91,19 +91,17 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
 
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
-    """Calculates the Average Directional Index (ADX) to measure trend strength."""
+    """Calculates ADX to measure overall trend strength."""
     if df.empty or len(df) < (period * 2):
         return 20.0
 
     temp_df = df.copy()
     temp_df['prev_close'] = temp_df['Close'].shift(1)
     
-    # True Range
     temp_df['tr'] = temp_df[['High', 'Low', 'prev_close']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['prev_close']), abs(x['Low'] - x['prev_close'])), axis=1
     )
     
-    # Directional Movement
     temp_df['up_move'] = temp_df['High'] - temp_df['High'].shift(1)
     temp_df['down_move'] = temp_df['Low'].shift(1) - temp_df['Low']
 
@@ -125,12 +123,11 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def detect_divergence(df: pd.DataFrame):
-    """Detects Bullish or Bearish Divergence on Stochastic and Stoch RSI."""
+    """Detects Bullish or Bearish Divergence on Stochastic RSI."""
     if df.empty or len(df) < 25:
         return False, False, ""
 
     recent_df = df.iloc[-20:].copy().reset_index(drop=True)
-    
     lows = recent_df['Low'].values
     stoch_k = recent_df['%K'].values
     
@@ -143,7 +140,6 @@ def detect_divergence(df: pd.DataFrame):
     p_low_curr = lows[-1]
     p_low_prev = np.min(lows[:-5])
     p_low_prev_idx = np.argmin(lows[:-5])
-    
     k_low_curr = latest_k
     k_low_prev = stoch_k[p_low_prev_idx]
 
@@ -152,7 +148,6 @@ def detect_divergence(df: pd.DataFrame):
     p_high_curr = highs[-1]
     p_high_prev = np.max(highs[:-5])
     p_high_prev_idx = np.argmax(highs[:-5])
-
     k_high_curr = latest_k
     k_high_prev = stoch_k[p_high_prev_idx]
 
@@ -169,15 +164,14 @@ def detect_divergence(df: pd.DataFrame):
 
 
 def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
-    """Calculates EMA 50, VWAP, Stoch RSI, ATR, ADX, Divergence, Slope, Swing Levels, ChoCH, and Squeeze Bounds."""
+    """Calculates core indicators: EMA 50, VWAP, Stoch RSI, ATR, ADX, and Divergence."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
-    # 1. EMA 50 & Slope
+    # 1. EMA 50
     df['EMA_50'] = df['Close'].ewm(span=ema_period, adjust=False).mean()
-    ema_50_rising = bool(df['EMA_50'].iloc[-1] > df['EMA_50'].iloc[-2])
 
-    # 2. VWAP Approximation
+    # 2. VWAP
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
     df['VWAP'] = (typical_price * df['Close']).rolling(window=20).sum() / df['Close'].rolling(window=20).sum()
 
@@ -195,17 +189,15 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     df['%K'] = stoch_rsi.rolling(window=k_period).mean() * 100
     df['%D'] = df['%K'].rolling(window=d_period).mean()
 
-    # 4. ATR Calculation
+    # 4. ATR
     df['PrevClose'] = df['Close'].shift(1)
     df['TR'] = df[['High', 'Low', 'PrevClose']].apply(
         lambda x: max(x['High'] - x['Low'], abs(x['High'] - x['PrevClose']), abs(x['Low'] - x['PrevClose'])), axis=1
     )
     df['ATR'] = df['TR'].rolling(window=atr_period).mean()
 
-    # 5. ADX Calculation
+    # 5. ADX & Divergence
     adx_val = calculate_adx(df, period=14)
-
-    # 6. Divergence Detection
     is_bull_div, is_bear_div, div_desc = detect_divergence(df)
 
     latest = df.iloc[-1]
@@ -223,54 +215,24 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
         latest['Close'] < latest['Open']
     )
 
-    # Structural Swing Points
     swing_high = float(df['High'].iloc[-11:-1].max())
     swing_low = float(df['Low'].iloc[-11:-1].min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 2.50
 
-    # DYNAMIC ATR CONSOLIDATION GUARD
-    range_high = float(df['High'].iloc[-16:-1].max())
-    range_low = float(df['Low'].iloc[-16:-1].min())
-    range_width = round(range_high - range_low, 2)
-    is_tight_squeeze = bool(range_width < (2.0 * atr_val))
-
-    # Dynamic Breakout Detections
-    is_breakout_up = bool(latest['Close'] > range_high and latest['Close'] > latest['Open'])
-    is_breakout_down = bool(latest['Close'] < range_low and latest['Close'] < latest['Open'])
-
-    # CHOCH LOGIC
-    is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'] and latest['Close'] < swing_low)
-    is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'] and latest['Close'] > swing_high)
-
     return {
         "close": float(latest['Close']),
         "ema_50": float(latest['EMA_50']),
-        "ema_50_rising": ema_50_rising,
         "vwap": float(latest['VWAP']),
-        "is_above_ema": bool(latest['Close'] > latest['EMA_50']),
-        "is_above_vwap": bool(latest['Close'] > latest['VWAP']),
         "is_confirmed_bullish": is_confirmed_bullish,
         "is_confirmed_bearish": is_confirmed_bearish,
         "is_bull_div": is_bull_div,
         "is_bear_div": is_bear_div,
         "div_desc": div_desc,
-        "vwap_distance": round(abs(float(latest['Close']) - float(latest['VWAP'])), 2),
-        "choch_bearish": is_choch_bearish,
-        "choch_bullish": is_choch_bullish,
         "stoch_k": float(latest['%K']),
         "stoch_d": float(latest['%D']),
-        "stoch_cross_up": bool(prev['%K'] < prev['%D'] and latest['%K'] > latest['%D']),
-        "stoch_cross_down": bool(prev['%K'] > prev['%D'] and latest['%K'] < latest['%D']),
         "swing_high": swing_high,
         "swing_low": swing_low,
         "atr": round(atr_val, 2),
-        "atr_buffer": round(1.2 * atr_val, 2),
-        "max_vwap_allowed": round(3.0 * atr_val, 2),
-        "is_green_candle": bool(latest['Close'] > latest['Open']),
-        "range_width": range_width,
-        "is_tight_squeeze": is_tight_squeeze,
-        "is_breakout_up": is_breakout_up,
-        "is_breakout_down": is_breakout_down,
         "adx": round(adx_val, 1)
     }
 
@@ -301,125 +263,56 @@ def analyze_and_alert():
         return
 
     price = mtf["5m"]["close"]
-    atr_buf = mtf["5m"]["atr_buffer"]
     adx_15m = mtf["15m"]["adx"]
 
-    # --- KEY GUARD 1: ADX CONSOLIDATION CHOP GUARD ---
-    # Stops range chop losses by halting signal evaluation when ADX < 18.0 (unless a divergence occurs)
+    # --- PILLAR 1: SINGLE CHOP GUARD (15M ADX > 18.0) ---
     is_bull_div = mtf["5m"]["is_bull_div"] or mtf["15m"]["is_bull_div"]
     is_bear_div = mtf["5m"]["is_bear_div"] or mtf["15m"]["is_bear_div"]
 
     if adx_15m < 18.0 and not (is_bull_div or is_bear_div):
-        print(f"Skipping: Low ADX ({adx_15m:.1f}) indicates consolidation chop.")
+        print(f"Skipping: Low ADX ({adx_15m:.1f}) indicates horizontal chop.")
         return
 
-    # --- KEY GUARD 2: RECALIBRATED 1H RANGE BOUNDARY FILTER (92% / 8%) ---
-    swing_high_1h = mtf["1h"]["swing_high"]
-    swing_low_1h = mtf["1h"]["swing_low"]
-    range_1h = swing_high_1h - swing_low_1h
-    range_pos_1h = (price - swing_low_1h) / range_1h if range_1h > 0 else 0.5
+    # --- PILLAR 2: STREAMLINED ENTRY EVALUATION ---
+    is_5m_bull = mtf["5m"]["is_confirmed_bullish"]
+    is_5m_bear = mtf["5m"]["is_confirmed_bearish"]
 
-    is_break_up = mtf["5m"]["is_breakout_up"]
-    is_break_dn = mtf["5m"]["is_breakout_down"]
-
-    at_1h_resistance = bool(range_pos_1h > 0.92 and not is_break_up)
-    at_1h_support = bool(range_pos_1h < 0.08 and not is_break_dn)
-
-    # --- HIGHER TIMEFRAME TREND & SLOPE CHECK ---
-    is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
-    is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
-    is_15m_ema_rising = mtf["15m"]["ema_50_rising"]
-
-    # --- KEY GUARD 3: RECALIBRATED 15M STOCH RSI (75 / 25) ---
-    is_5m_confirmed_bull = mtf["5m"]["is_confirmed_bullish"]
-    is_5m_confirmed_bear = mtf["5m"]["is_confirmed_bearish"]
-
-    vwap_dist = mtf["5m"]["vwap_distance"]
-    max_vwap = mtf["5m"]["max_vwap_allowed"]
-    is_squeeze = mtf["15m"]["is_tight_squeeze"]
-
-    # Trend Continuation Conditions (Expanded 15M limit to 75.0 / 25.0)
-    standard_buy = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 75.0
-    standard_sell = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 25.0
-
-    # Divergence Reversal Exceptions
-    divergence_buy = is_bull_div and not at_1h_resistance
-    divergence_sell = is_bear_div and not at_1h_support
-
-    valid_buy_structure = (standard_buy or divergence_buy) and not at_1h_resistance
-    valid_sell_structure = (standard_sell or divergence_sell) and not at_1h_support
-
-    # Overextension Guard & Consolidation Squeeze Guard
-    if vwap_dist > max_vwap and not (is_bull_div or is_bear_div):
-        print(f"Skipping: Price overextended from VWAP (${vwap_dist:.2f} > ${max_vwap:.2f}).")
-        return
-
-    if is_squeeze and not is_break_up and not is_break_dn and not (is_bull_div or is_bear_div):
-        print("Skipping: Market trapped in tight consolidation squeeze.")
-        return
-
-    if at_1h_resistance and valid_buy_structure:
-        print(f"Skipping BUY: Price (${price:.2f}) at 1H Extreme Resistance Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
-        return
-
-    if at_1h_support and valid_sell_structure:
-        print(f"Skipping SELL: Price (${price:.2f}) at 1H Extreme Support Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
-        return
+    # Valid if standard 2-candle confirmation passes OR a divergence forms
+    valid_buy_structure = is_5m_bull or is_bull_div
+    valid_sell_structure = is_5m_bear or is_bear_div
 
     if not valid_buy_structure and not valid_sell_structure:
-        print("Skipping: Price structure violates baseline alignment, divergence, or 1H boundary rules.")
+        print("Skipping: Price structure does not meet trend confirmation or divergence setup.")
         return
 
     candidate_action = "BUY" if valid_buy_structure else "SELL"
 
-    # --- DYNAMIC ADX RISK-TO-REWARD RATIO (RRR) SCALING ---
-    if adx_15m < 20.0:
-        tp1_mult, tp2_mult = 1.0, 1.5
-        adx_desc = f"15M ADX ({adx_15m:.1f}) Weak Trend"
-    elif adx_15m >= 35.0:
+    # Dynamic RRR based on ADX
+    if adx_15m >= 35.0:
         tp1_mult, tp2_mult = 2.0, 4.0
         adx_desc = f"15M ADX ({adx_15m:.1f}) Explosive Momentum"
     else:
         tp1_mult, tp2_mult = 1.5, 2.5
-        adx_desc = f"15M ADX ({adx_15m:.1f}) Moderate Trend"
+        adx_desc = f"15M ADX ({adx_15m:.1f}) Active Trend"
 
-    # --- DYNAMIC TRIGGER TYPE DEFINITION ---
-    if is_bull_div or is_bear_div:
-        trigger_type = "Divergence Reversal"
-    elif is_break_up or is_break_dn:
-        trigger_type = "Breakout Continuation"
-    elif mtf["5m"]["choch_bullish"] or mtf["5m"]["choch_bearish"]:
-        trigger_type = "Counter-Trend Reversal"
+    trigger_type = "Divergence Reversal" if (is_bull_div or is_bear_div) else "Trend Setup"
+
+    # SL / TP Math
+    active_atr = mtf["5m"]["atr"]
+    if candidate_action == "BUY":
+        buy_sl = round(price - max(1.2 * active_atr, price - mtf["5m"]["swing_low"]), 2)
+        buy_risk = round(price - buy_sl, 2)
+        buy_tp1 = round(price + (tp1_mult * buy_risk), 2)
+        buy_tp2 = round(price + (tp2_mult * buy_risk), 2)
+        sl_val, tp1_val, tp2_val = buy_sl, buy_tp1, buy_tp2
     else:
-        trigger_type = "Trend Pullback"
+        sell_sl = round(price + max(1.2 * active_atr, mtf["5m"]["swing_high"] - price), 2)
+        sell_risk = round(sell_sl - price, 2)
+        sell_tp1 = round(price - (tp1_mult * sell_risk), 2)
+        sell_tp2 = round(price - (tp2_mult * sell_risk), 2)
+        sl_val, tp1_val, tp2_val = sell_sl, sell_tp1, sell_tp2
 
-    # --- DYNAMIC SL & TP MULTI-LEVEL MATH ---
-    sl_atr_factor = 1.0 if (is_bull_div or is_bear_div) else 1.2
-    active_atr_buf = round(sl_atr_factor * mtf["5m"]["atr"], 2)
-
-    # BUY SETUP
-    local_buy_sl = round(mtf["5m"]["swing_low"] - active_atr_buf, 2)
-    buy_sl = round(max(local_buy_sl, price - 12.00), 2)
-    buy_risk = round(price - buy_sl, 2)
-    buy_tp1 = round(price + (tp1_mult * buy_risk), 2)
-    raw_buy_tp2 = round(price + (tp2_mult * buy_risk), 2)
-    swing_high_15m = mtf["15m"]["swing_high"]
-    buy_tp2 = round(min(raw_buy_tp2, max(swing_high_15m, buy_tp1 + 2.0)), 2)
-
-    buy_tp2_str = f"${buy_tp2:.2f} (1:{tp2_mult:.1f} RRR)" if buy_tp2 == raw_buy_tp2 else f"${buy_tp2:.2f} (Capped at 15M Swing High)"
-
-    # SELL SETUP
-    local_sell_sl = round(mtf["5m"]["swing_high"] + active_atr_buf, 2)
-    sell_sl = round(min(local_sell_sl, price + 12.00), 2)
-    sell_risk = round(sell_sl - price, 2)
-    sell_tp1 = round(price - (tp1_mult * sell_risk), 2)
-    raw_sell_tp2 = round(price - (tp2_mult * sell_risk), 2)
-    swing_low_15m = mtf["15m"]["swing_low"]
-    sell_tp2 = round(max(raw_sell_tp2, min(swing_low_15m, sell_tp1 - 2.0)), 2)
-
-    sell_tp2_str = f"${sell_tp2:.2f} (1:{tp2_mult:.1f} RRR)" if sell_tp2 == raw_sell_tp2 else f"${sell_tp2:.2f} (Capped at 15M Swing Low)"
-
-    # --- HYBRID VETO MODEL PROMPT ---
+    # --- PILLAR 3: HYBRID AI VETO MODEL PROMPT ---
     div_note = mtf["5m"]["div_desc"] or mtf["15m"]["div_desc"] or "None"
     prompt = f"""
 You are a Senior Quantitative Trading Analyst with VETO POWER.
@@ -430,39 +323,32 @@ TRIGGER TYPE: {trigger_type}
 DETECTED DIVERGENCE: {div_note}
 Current Price: ${price:.2f}
 
-PRE-CALCULATED EXPLICIT LEVELS ({adx_desc}):
-BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {buy_tp2_str}
-SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} (1:{tp1_mult:.1f} RRR) | TP2 {sell_tp2_str}
+PRE-CALCULATED LEVELS ({adx_desc}):
+Entry: ${price:.2f} | SL: ${sl_val:.2f} | TP1: ${tp1_val:.2f} | TP2: ${tp2_val:.2f}
 
-MULTI-TIMEFRAME & BOUNDARY METRICS:
-- 1H Swing High: ${swing_high_1h:.2f} | 1H Swing Low: ${swing_low_1h:.2f}
-- Price Position in 1H Range: {range_pos_1h * 100:.1f}%
+MULTI-TIMEFRAME METRICS:
+- 1H Range: High ${mtf['1h']['swing_high']:.2f} | Low ${mtf['1h']['swing_low']:.2f}
 - 15M ADX Trend Strength: {adx_15m:.1f}
-- 15M EMA 50 Slope Rising: {is_15m_ema_rising}
-- 5M Bullish Divergence: {mtf['5m']['is_bull_div']} | 15M Bullish Divergence: {mtf['15m']['is_bull_div']}
-- 5M Bearish Divergence: {mtf['5m']['is_bear_div']} | 15M Bearish Divergence: {mtf['15m']['is_bear_div']}
-- 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
-- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | 15M Bullish: {is_15m_bullish} | 15M Bearish: {is_15m_bearish}
-- 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
-- 5M VWAP Distance: ${mtf['5m']['vwap_distance']:.2f}
-- 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f} | Cross Up: {mtf['5m']['stoch_cross_up']} | Cross Down: {mtf['5m']['stoch_cross_down']}
+- 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f}
+- 5M Stoch RSI %K: {mtf['5m']['stoch_k']:.1f}
+- 5M EMA 50: ${mtf['5m']['ema_50']:.2f} | 5M VWAP: ${mtf['5m']['vwap']:.2f}
 
 ANALYST VETO DIRECTIVE:
-Review the proposed setup ({candidate_action}).
-If this is a Divergence Reversal, confirm whether the Stoch RSI cross and price structure support a sharp reversal.
-If you detect major horizontal range chop or high trap risk, EXERCISE YOUR VETO POWER and return "action": "HOLD".
-Otherwise, return "action": "{candidate_action}".
+Review the proposed {candidate_action} setup against higher timeframe context.
+- Check if price is buying directly into 1H resistance or shorting into 1H support.
+- If you detect chop, trap risk, or exhausted momentum, EXERCISE YOUR VETO POWER and return "action": "HOLD".
+- Otherwise, return "action": "{candidate_action}".
 
 OUTPUT REQUIREMENTS:
 Output JSON with schema keys:
 - "action": "{candidate_action}" or "HOLD"
 - "confidence": float between 0.0 and 1.0
-- "reasoning": "Write 2 clean sentences explaining your decision (confirming entry or exercising veto)."
+- "reasoning": "Write 2 clean sentences explaining your decision."
 """
 
     output = None
 
-    # Step 1: Groq Primary (Llama 3.1 8B Instant)
+    # Groq Primary (Llama 3.1 8B Instant)
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
@@ -480,7 +366,7 @@ Output JSON with schema keys:
         except Exception as e:
             print(f"Groq API call error: {e}. Falling back to Gemini...")
 
-    # Step 2: Gemini Fallback
+    # Gemini Fallback
     if not output and genai_client:
         try:
             config = types.GenerateContentConfig(
@@ -496,31 +382,25 @@ Output JSON with schema keys:
             output = SignalOutput.model_validate_json(response.text)
             print(f"[Gemini 2.0] Decision: {output.action} ({output.confidence * 100:.0f}%)")
         except Exception as e:
-            print(f"Gemini API fallback skipped (Rate Limit or API Error).")
+            print(f"Gemini API fallback error: {e}")
 
     if not output:
-        print("All AI model attempts failed this cycle. Continuing to next loop...")
+        print("All AI model attempts failed this cycle. Continuing...")
         return
 
-    # Handle AI Veto Execution
     if output.action == "HOLD":
-        print(f"[AI VETO EXERCISED] Analyst rejected candidate setup '{candidate_action}'. Reason: {output.reasoning}")
+        print(f"[AI VETO EXERCISED] Analyst rejected setup '{candidate_action}'. Reason: {output.reasoning}")
         return
 
-    # Cooldown & Notification Formatting in Python
+    # Cooldown & Notification
     if output.action in ["BUY", "SELL"]:
         if output.action == LAST_SIGNAL_ACTION and abs(price - LAST_SIGNAL_PRICE) < 6.00:
-            print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry (${LAST_SIGNAL_PRICE:.2f}).")
+            print(f"Skipping duplicate {output.action} alert. Price (${price:.2f}) too close to last entry.")
             return
 
         LAST_SIGNAL_ACTION = output.action
         LAST_SIGNAL_PRICE = price
 
-        sl_val = buy_sl if output.action == "BUY" else sell_sl
-        tp1_val = buy_tp1 if output.action == "BUY" else sell_tp1
-        tp2_str = buy_tp2_str if output.action == "BUY" else sell_tp2_str
-
-        # Clean Programmatic Telegram Output
         telegram_text = (
             f"STOCH RSI TRADE SIGNAL\n\n"
             f"Asset: XAUUSD (Gold Spot)\n"
@@ -529,14 +409,11 @@ Output JSON with schema keys:
             f"Entry Price: ${price:.2f}\n\n"
             f"Stop Loss (SL): ${sl_val:.2f}\n"
             f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:{tp1_mult:.1f} RRR)\n"
-            f"Take Profit 2 (TP2): {tp2_str}\n\n"
+            f"Take Profit 2 (TP2): ${tp2_val:.2f}\n\n"
             f"INDICATOR METRICS:\n"
             f"- Setup Type: {trigger_type}\n"
             f"- Divergence Context: {div_note}\n"
-            f"- 1H Range Position: {range_pos_1h * 100:.1f}%\n"
             f"- 15M ADX Strength: {adx_15m:.1f}\n"
-            f"- 15M EMA 50 Slope: {'Rising' if is_15m_ema_rising else 'Falling'}\n"
-            f"- 1H Stoch RSI: {mtf['1h']['stoch_k']:.1f}\n"
             f"- 15M Stoch RSI: {mtf['15m']['stoch_k']:.1f}\n\n"
             f"Reasoning: {output.reasoning}"
         )

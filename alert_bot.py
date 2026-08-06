@@ -131,7 +131,6 @@ def detect_divergence(df: pd.DataFrame):
 
     recent_df = df.iloc[-20:].copy().reset_index(drop=True)
     
-    # Find two lowest price troughs
     lows = recent_df['Low'].values
     stoch_k = recent_df['%K'].values
     
@@ -140,7 +139,7 @@ def detect_divergence(df: pd.DataFrame):
     cross_up = bool(prev_k < recent_df['%D'].iloc[-2] and latest_k > recent_df['%D'].iloc[-1])
     cross_dn = bool(prev_k > recent_df['%D'].iloc[-2] and latest_k < recent_df['%D'].iloc[-1])
 
-    # Trough detection (Local Minima)
+    # Trough detection
     p_low_curr = lows[-1]
     p_low_prev = np.min(lows[:-5])
     p_low_prev_idx = np.argmin(lows[:-5])
@@ -148,7 +147,7 @@ def detect_divergence(df: pd.DataFrame):
     k_low_curr = latest_k
     k_low_prev = stoch_k[p_low_prev_idx]
 
-    # Peak detection (Local Maxima)
+    # Peak detection
     highs = recent_df['High'].values
     p_high_curr = highs[-1]
     p_high_prev = np.max(highs[:-5])
@@ -239,7 +238,7 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     is_breakout_up = bool(latest['Close'] > range_high and latest['Close'] > latest['Open'])
     is_breakout_down = bool(latest['Close'] < range_low and latest['Close'] < latest['Open'])
 
-    # UPGRADED CHOCH LOGIC
+    # CHOCH LOGIC
     is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'] and latest['Close'] < swing_low)
     is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'] and latest['Close'] > swing_high)
 
@@ -305,7 +304,16 @@ def analyze_and_alert():
     atr_buf = mtf["5m"]["atr_buffer"]
     adx_15m = mtf["15m"]["adx"]
 
-    # --- 1H RANGE BOUNDARY FILTER ---
+    # --- KEY GUARD 1: ADX CONSOLIDATION CHOP GUARD ---
+    # Stops range chop losses by halting signal evaluation when ADX < 18.0 (unless a divergence occurs)
+    is_bull_div = mtf["5m"]["is_bull_div"] or mtf["15m"]["is_bull_div"]
+    is_bear_div = mtf["5m"]["is_bear_div"] or mtf["15m"]["is_bear_div"]
+
+    if adx_15m < 18.0 and not (is_bull_div or is_bear_div):
+        print(f"Skipping: Low ADX ({adx_15m:.1f}) indicates consolidation chop.")
+        return
+
+    # --- KEY GUARD 2: RECALIBRATED 1H RANGE BOUNDARY FILTER (92% / 8%) ---
     swing_high_1h = mtf["1h"]["swing_high"]
     swing_low_1h = mtf["1h"]["swing_low"]
     range_1h = swing_high_1h - swing_low_1h
@@ -314,29 +322,27 @@ def analyze_and_alert():
     is_break_up = mtf["5m"]["is_breakout_up"]
     is_break_dn = mtf["5m"]["is_breakout_down"]
 
-    at_1h_resistance = bool(range_pos_1h > 0.85 and not is_break_up)
-    at_1h_support = bool(range_pos_1h < 0.15 and not is_break_dn)
+    at_1h_resistance = bool(range_pos_1h > 0.92 and not is_break_up)
+    at_1h_support = bool(range_pos_1h < 0.08 and not is_break_dn)
 
     # --- HIGHER TIMEFRAME TREND & SLOPE CHECK ---
     is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
     is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
     is_15m_ema_rising = mtf["15m"]["ema_50_rising"]
 
-    # --- HARD PYTHON-LEVEL CONFIRMATION & DIVERGENCE FILTERS ---
+    # --- KEY GUARD 3: RECALIBRATED 15M STOCH RSI (75 / 25) ---
     is_5m_confirmed_bull = mtf["5m"]["is_confirmed_bullish"]
     is_5m_confirmed_bear = mtf["5m"]["is_confirmed_bearish"]
-    is_bull_div = mtf["5m"]["is_bull_div"] or mtf["15m"]["is_bull_div"]
-    is_bear_div = mtf["5m"]["is_bear_div"] or mtf["15m"]["is_bear_div"]
 
     vwap_dist = mtf["5m"]["vwap_distance"]
     max_vwap = mtf["5m"]["max_vwap_allowed"]
     is_squeeze = mtf["15m"]["is_tight_squeeze"]
 
-    # Trend Continuation Conditions
-    standard_buy = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0
-    standard_sell = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0
+    # Trend Continuation Conditions (Expanded 15M limit to 75.0 / 25.0)
+    standard_buy = is_5m_confirmed_bull and is_15m_ema_rising and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 75.0
+    standard_sell = is_5m_confirmed_bear and not is_15m_ema_rising and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 25.0
 
-    # Divergence Reversal Exceptions (Bypasses EMA/VWAP baseline check)
+    # Divergence Reversal Exceptions
     divergence_buy = is_bull_div and not at_1h_resistance
     divergence_sell = is_bear_div and not at_1h_support
 
@@ -353,11 +359,11 @@ def analyze_and_alert():
         return
 
     if at_1h_resistance and valid_buy_structure:
-        print(f"Skipping BUY: Price (${price:.2f}) at 1H Resistance Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
+        print(f"Skipping BUY: Price (${price:.2f}) at 1H Extreme Resistance Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
         return
 
     if at_1h_support and valid_sell_structure:
-        print(f"Skipping SELL: Price (${price:.2f}) at 1H Support Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
+        print(f"Skipping SELL: Price (${price:.2f}) at 1H Extreme Support Boundary ({range_pos_1h*100:.1f}% of 1H Range) without breakout.")
         return
 
     if not valid_buy_structure and not valid_sell_structure:
@@ -388,7 +394,6 @@ def analyze_and_alert():
         trigger_type = "Trend Pullback"
 
     # --- DYNAMIC SL & TP MULTI-LEVEL MATH ---
-    # Tighten ATR multiplier for divergence catching
     sl_atr_factor = 1.0 if (is_bull_div or is_bear_div) else 1.2
     active_atr_buf = round(sl_atr_factor * mtf["5m"]["atr"], 2)
 

@@ -36,7 +36,7 @@ LAST_SIGNAL_PRICE = 0.0
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
-    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the market analysis.")
+    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the setup decision.")
 
 
 def send_telegram_message(message: str):
@@ -90,7 +90,7 @@ def fetch_twelve_data(interval: str, outputsize: int = 100) -> pd.DataFrame:
 
 
 def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period=3, d_period=3, ema_period=50, atr_period=14):
-    """Calculates EMA 50, VWAP, Stoch RSI, ATR, Swing Levels, and ChoCH conditions."""
+    """Calculates EMA 50, VWAP, Stoch RSI, ATR, Swing Levels, ChoCH conditions, and Dynamic Squeeze Bounds."""
     if df.empty or len(df) < (rsi_period + stoch_period + ema_period):
         return None
 
@@ -130,6 +130,16 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     swing_low = float(df['Low'].iloc[-11:-1].min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 2.50
 
+    # DYNAMIC ATR CONSOLIDATION GUARD (Replaces fixed $14.00 dollar threshold)
+    range_high = float(df['High'].iloc[-16:-1].max())
+    range_low = float(df['Low'].iloc[-16:-1].min())
+    range_width = round(range_high - range_low, 2)
+    is_tight_squeeze = bool(range_width < (2.0 * atr_val))
+
+    # Dynamic Breakout Detections
+    is_breakout_up = bool(latest['Close'] > range_high and latest['Close'] > latest['Open'])
+    is_breakout_down = bool(latest['Close'] < range_low and latest['Close'] < latest['Open'])
+
     # UPGRADED CHOCH LOGIC: Requires breaking true structural Swing High/Low
     is_choch_bearish = bool(latest['Close'] < latest['EMA_50'] and latest['Close'] < latest['VWAP'] and latest['Close'] < swing_low)
     is_choch_bullish = bool(latest['Close'] > latest['EMA_50'] and latest['Close'] > latest['VWAP'] and latest['Close'] > swing_high)
@@ -152,7 +162,11 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
         "atr": round(atr_val, 2),
         "atr_buffer": round(1.2 * atr_val, 2),
         "max_vwap_allowed": round(3.0 * atr_val, 2),
-        "is_green_candle": bool(latest['Close'] > latest['Open'])
+        "is_green_candle": bool(latest['Close'] > latest['Open']),
+        "range_width": range_width,
+        "is_tight_squeeze": is_tight_squeeze,
+        "is_breakout_up": is_breakout_up,
+        "is_breakout_down": is_breakout_down
     }
 
 
@@ -192,11 +206,15 @@ def analyze_and_alert():
     stoch_k_5m = mtf["5m"]["stoch_k"]
     is_choch_bull = mtf["5m"]["choch_bullish"]
     is_choch_bear = mtf["5m"]["choch_bearish"]
+    is_break_up = mtf["5m"]["is_breakout_up"]
+    is_break_dn = mtf["5m"]["is_breakout_down"]
 
-    if stoch_k_5m < 25 or stoch_k_5m > 75:
-        trigger_type = "Trend Pullback"
+    if is_break_up or is_break_dn:
+        trigger_type = "Breakout Continuation"
     elif is_choch_bull or is_choch_bear:
         trigger_type = "Counter-Trend Reversal"
+    elif stoch_k_5m < 25 or stoch_k_5m > 75:
+        trigger_type = "Trend Pullback"
     else:
         trigger_type = "Breakout Continuation"
 
@@ -238,6 +256,8 @@ BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} | TP2 {buy
 SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} | TP2 {sell_tp2_str}
 
 MULTI-TIMEFRAME METRICS:
+- 15M Range Width: ${mtf['15m']['range_width']:.2f} | 15M Tight Squeeze: {mtf['15m']['is_tight_squeeze']}
+- 5M Breakout Up: {is_break_up} | 5M Breakout Down: {is_break_dn}
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
 - 15M Stoch RSI %K: {mtf['15m']['stoch_k']:.1f} | 15M Bullish: {is_15m_bullish} | 15M Bearish: {is_15m_bearish}
 - 15M EMA 50: ${mtf['15m']['ema_50']:.2f}
@@ -246,11 +266,20 @@ MULTI-TIMEFRAME METRICS:
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
 
 RULES:
-1. OVEREXTENSION RULE: If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), output "action": "HOLD".
-2. TIMEFRAME ALIGNMENT FILTER:
+1. DYNAMIC CONSOLIDATION & BREAKOUT FILTER (CRITICAL):
+   - If 15M Tight Squeeze is True ({mtf['15m']['is_tight_squeeze']}) AND no breakout occurs (Breakout Up={is_break_up}, Breakout Down={is_break_dn} are both False), output "action": "HOLD" (Prevents chop trading).
+   - If Price breaks OUT of the squeeze range (Breakout Up or Breakout Down is True), ALLOW ENTRY with Type "Breakout Continuation".
+
+2. OVEREXTENSION RULE:
+   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), output "action": "HOLD".
+
+3. TIMEFRAME ALIGNMENT & EXHAUSTION FILTERS:
    - DO NOT BUY if 15M Trend is Bearish ({is_15m_bearish}). Output "action": "HOLD".
    - DO NOT SELL if 15M Trend is Bullish ({is_15m_bullish}). Output "action": "HOLD".
-3. ENTRY CONFIRMATION:
+   - DO NOT BUY if 15M Stoch RSI ({mtf['15m']['stoch_k']:.1f}) > 65.0 (Market overbought/exhausting). Output "action": "HOLD".
+   - DO NOT SELL if 15M Stoch RSI ({mtf['15m']['stoch_k']:.1f}) < 35.0 (Market oversold/exhausting). Output "action": "HOLD".
+
+4. ENTRY CONFIRMATION:
    - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
    - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
 

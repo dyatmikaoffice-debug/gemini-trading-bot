@@ -130,7 +130,7 @@ def calculate_metrics(df: pd.DataFrame, rsi_period=14, stoch_period=14, k_period
     swing_low = float(df['Low'].iloc[-11:-1].min())
     atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else 2.50
 
-    # DYNAMIC ATR CONSOLIDATION GUARD (Replaces fixed $14.00 dollar threshold)
+    # DYNAMIC ATR CONSOLIDATION GUARD
     range_high = float(df['High'].iloc[-16:-1].max())
     range_low = float(df['Low'].iloc[-16:-1].min())
     range_width = round(range_high - range_low, 2)
@@ -202,12 +202,37 @@ def analyze_and_alert():
     is_15m_bullish = mtf["15m"]["close"] > mtf["15m"]["ema_50"]
     is_15m_bearish = mtf["15m"]["close"] < mtf["15m"]["ema_50"]
 
+    # --- HARD PYTHON-LEVEL HARD FILTERS (Zero LLM Hallucination) ---
+    is_5m_above_ema = mtf["5m"]["is_above_ema"]
+    is_5m_above_vwap = mtf["5m"]["is_above_vwap"]
+    vwap_dist = mtf["5m"]["vwap_distance"]
+    max_vwap = mtf["5m"]["max_vwap_allowed"]
+    is_squeeze = mtf["15m"]["is_tight_squeeze"]
+    is_break_up = mtf["5m"]["is_breakout_up"]
+    is_break_dn = mtf["5m"]["is_breakout_down"]
+
+    # Strictly require Price > EMA 50 AND Price > VWAP for BUY
+    valid_buy_structure = is_5m_above_ema and is_5m_above_vwap and not is_15m_bearish and mtf["15m"]["stoch_k"] <= 65.0
+    # Strictly require Price < EMA 50 AND Price < VWAP for SELL
+    valid_sell_structure = not is_5m_above_ema and not is_5m_above_vwap and not is_15m_bullish and mtf["15m"]["stoch_k"] >= 35.0
+
+    # Overextension Guard & Consolidation Squeeze Guard
+    if vwap_dist > max_vwap:
+        print(f"Skipping: Price overextended from VWAP (${vwap_dist:.2f} > ${max_vwap:.2f}).")
+        return
+
+    if is_squeeze and not is_break_up and not is_break_dn:
+        print("Skipping: Market trapped in tight consolidation squeeze.")
+        return
+
+    if not valid_buy_structure and not valid_sell_structure:
+        print("Skipping: Price structure violates baseline alignment rules (e.g., BUY below EMA 50/VWAP).")
+        return
+
     # --- DYNAMIC TRIGGER TYPE DEFINITION ---
     stoch_k_5m = mtf["5m"]["stoch_k"]
     is_choch_bull = mtf["5m"]["choch_bullish"]
     is_choch_bear = mtf["5m"]["choch_bearish"]
-    is_break_up = mtf["5m"]["is_breakout_up"]
-    is_break_dn = mtf["5m"]["is_breakout_down"]
 
     if is_break_up or is_break_dn:
         trigger_type = "Breakout Continuation"
@@ -256,6 +281,8 @@ BUY SETUP: Entry ${price:.2f} | SL ${buy_sl:.2f} | TP1 ${buy_tp1:.2f} | TP2 {buy
 SELL SETUP: Entry ${price:.2f} | SL ${sell_sl:.2f} | TP1 ${sell_tp1:.2f} | TP2 {sell_tp2_str}
 
 MULTI-TIMEFRAME METRICS:
+- 5M Price Above EMA 50: {is_5m_above_ema} (${mtf['5m']['ema_50']:.2f})
+- 5M Price Above VWAP: {is_5m_above_vwap} (${mtf['5m']['vwap']:.2f})
 - 15M Range Width: ${mtf['15m']['range_width']:.2f} | 15M Tight Squeeze: {mtf['15m']['is_tight_squeeze']}
 - 5M Breakout Up: {is_break_up} | 5M Breakout Down: {is_break_dn}
 - 1H Stoch RSI %K: {mtf['1h']['stoch_k']:.1f}
@@ -266,22 +293,10 @@ MULTI-TIMEFRAME METRICS:
 - 5M Green Candle: {mtf['5m']['is_green_candle']}
 
 RULES:
-1. DYNAMIC CONSOLIDATION & BREAKOUT FILTER (CRITICAL):
-   - If 15M Tight Squeeze is True ({mtf['15m']['is_tight_squeeze']}) AND no breakout occurs (Breakout Up={is_break_up}, Breakout Down={is_break_dn} are both False), output "action": "HOLD" (Prevents chop trading).
-   - If Price breaks OUT of the squeeze range (Breakout Up or Breakout Down is True), ALLOW ENTRY with Type "Breakout Continuation".
-
-2. OVEREXTENSION RULE:
-   - If 5M VWAP Distance (${mtf['5m']['vwap_distance']:.2f}) > Max Stretch (${mtf['5m']['max_vwap_allowed']:.2f}), output "action": "HOLD".
-
-3. TIMEFRAME ALIGNMENT & EXHAUSTION FILTERS:
-   - DO NOT BUY if 15M Trend is Bearish ({is_15m_bearish}). Output "action": "HOLD".
-   - DO NOT SELL if 15M Trend is Bullish ({is_15m_bullish}). Output "action": "HOLD".
-   - DO NOT BUY if 15M Stoch RSI ({mtf['15m']['stoch_k']:.1f}) > 65.0 (Market overbought/exhausting). Output "action": "HOLD".
-   - DO NOT SELL if 15M Stoch RSI ({mtf['15m']['stoch_k']:.1f}) < 35.0 (Market oversold/exhausting). Output "action": "HOLD".
-
-4. ENTRY CONFIRMATION:
-   - BUY: Above EMA 50 & VWAP, Stoch RSI Cross Up (< 25), Green 5M Candle close.
-   - SELL: Below EMA 50 & VWAP, Stoch RSI Cross Down (> 75), Red 5M Candle close.
+1. ENTRY DIRECTION:
+   - If valid_buy_structure is True ({valid_buy_structure}), output "action": "BUY".
+   - If valid_sell_structure is True ({valid_sell_structure}), output "action": "SELL".
+   - Otherwise, output "action": "HOLD".
 
 OUTPUT REQUIREMENTS:
 Output JSON with schema keys:

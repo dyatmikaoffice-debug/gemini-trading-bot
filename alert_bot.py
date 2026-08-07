@@ -563,10 +563,54 @@ async def telegram_webhook(request: Request):
                 help_msg = (
                     "🤖 *TRADING BOT COMMANDS:*\n\n"
                     "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
+                    "• `/pips` - View overall net pips and trade-by-trade breakdown\n"
                     "• `/logs` - View details of the last 10 signals\n"
                     "• `/help` - Display command menu"
                 )
                 await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
+
+            elif raw_text.startswith("/pips"):
+                try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                    cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome != 'PENDING' ORDER BY id DESC LIMIT 10")
+                    closed_trades = cursor.fetchall()
+                    
+                    cursor.execute("""
+                        SELECT SUM(
+                            CASE 
+                                WHEN action = 'BUY' THEN (exit_price - price) * 10
+                                WHEN action = 'SELL' THEN (price - exit_price) * 10
+                            END
+                        ) AS net_pips FROM signals WHERE status = 'EXECUTED' AND outcome != 'PENDING'
+                    """)
+                    total_row = cursor.fetchone()
+                    total_net_pips = float(total_row['net_pips']) if total_row and total_row['net_pips'] is not None else 0.0
+
+                    cursor.close()
+                    conn.close()
+
+                    if not closed_trades:
+                        await send_telegram_alert(client, "No closed trades available to calculate pips yet.", target_chat_id=sender_chat_id)
+                    else:
+                        pips_breakdown = ""
+                        for t in closed_trades:
+                            entry = float(t['price'])
+                            exit_p = float(t['exit_price']) if t['exit_price'] is not None else entry
+                            action = t['action']
+                            
+                            pips = (exit_p - entry) * 10.0 if action == "BUY" else (entry - exit_p) * 10.0
+                            sign = "+" if pips > 0 else ""
+                            pips_breakdown += f"• *ID {t['id']}* ({action}): {sign}{pips:.1f} pips ({t['outcome']})\n"
+
+                        pips_msg = (
+                            f"📈 *PIPS PERFORMANCE REPORT*\n\n"
+                            f"{pips_breakdown}\n"
+                            f"🎯 *Total Net Pips (All Time):* *{'+' if total_net_pips > 0 else ''}{total_net_pips:.1f} Pips*"
+                        )
+                        await send_telegram_alert(client, pips_msg, target_chat_id=sender_chat_id)
+                except Exception as err:
+                    await send_telegram_alert(client, f"⚠️ Error calculating pips: {err}", target_chat_id=sender_chat_id)
 
             elif raw_text.startswith("/logs"):
                 try:

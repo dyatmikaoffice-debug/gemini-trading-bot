@@ -122,13 +122,15 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
     except Exception as e:
         print(f"[NEON DB ERROR] Failed to log signal: {e}")
 
+# --- TWO-STAGE TP TRACKING FUNCTION ---
 def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+        # Query both PENDING trades and trades that hit TP1 but are actively tracking toward TP2
+        cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')")
         open_trades = cursor.fetchall()
 
         if not open_trades:
@@ -143,42 +145,62 @@ def update_open_trades(current_high: float, current_low: float):
         for trade in open_trades:
             trade_id = trade['id']
             action = trade['action']
+            entry_price = float(trade['price'])
             sl = float(trade['sl']) if trade['sl'] is not None else None
             tp1 = float(trade['tp1']) if trade['tp1'] is not None else None
             tp2 = float(trade['tp2']) if trade['tp2'] is not None else None
+            current_outcome = trade['outcome']
 
-            outcome = None
+            new_outcome = None
             exit_price = None
 
             if action == "BUY":
-                if sl is not None and c_low <= sl:
-                    outcome = "LOSS (SL HIT)"
-                    exit_price = sl
-                elif tp2 is not None and c_high >= tp2:
-                    outcome = "WIN (TP2 HIT)"
+                # Check TP2 hit first
+                if tp2 is not None and c_high >= tp2:
+                    new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
+                # If TP1 was previously hit, check Break-Even (Entry Price) stop
+                elif current_outcome == "WIN (TP1 HIT)":
+                    if c_low <= entry_price:
+                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
+                        exit_price = entry_price
+                # First time touching TP1
                 elif tp1 is not None and c_high >= tp1:
-                    outcome = "WIN (TP1 HIT)"
+                    new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
-            elif action == "SELL":
-                if sl is not None and c_high >= sl:
-                    outcome = "LOSS (SL HIT)"
+                # Initial Stop Loss hit before TP1
+                elif sl is not None and c_low <= sl:
+                    new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-                elif tp2 is not None and c_low <= tp2:
-                    outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
-                elif tp1 is not None and c_low <= tp1:
-                    outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
 
-            if outcome:
+            elif action == "SELL":
+                # Check TP2 hit first
+                if tp2 is not None and c_low <= tp2:
+                    new_outcome = "WIN (TP2 HIT)"
+                    exit_price = tp2
+                # If TP1 was previously hit, check Break-Even (Entry Price) stop
+                elif current_outcome == "WIN (TP1 HIT)":
+                    if c_high >= entry_price:
+                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
+                        exit_price = entry_price
+                # First time touching TP1
+                elif tp1 is not None and c_low <= tp1:
+                    new_outcome = "WIN (TP1 HIT)"
+                    exit_price = tp1
+                # Initial Stop Loss hit before TP1
+                elif sl is not None and c_high >= sl:
+                    new_outcome = "LOSS (SL HIT)"
+                    exit_price = sl
+
+            # Only commit update if progress was made
+            if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
                     UPDATE signals 
                     SET outcome = %s, exit_price = %s, outcome_timestamp = %s
                     WHERE id = %s
-                """, (outcome, float(exit_price), wib_now, trade_id))
+                """, (new_outcome, float(exit_price), wib_now, trade_id))
                 conn.commit()
-                print(f"[TRADE CLOSED] Signal ID {trade_id} -> {outcome} at ${exit_price:.2f}")
+                print(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f}")
 
         cursor.close()
         conn.close()
@@ -530,7 +552,7 @@ def get_trade_stats():
         conn.close()
 
         closed = [r for r in rows if r['outcome'] != 'PENDING']
-        wins = [r for r in closed if 'WIN' in str(r['outcome'])]
+        wins = [r for r in closed if 'WIN' in str(r['outcome']) or 'CLOSED (TP1 HIT' in str(r['outcome'])]
         losses = [r for r in closed if 'LOSS' in str(r['outcome'])]
 
         return {

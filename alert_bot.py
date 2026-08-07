@@ -569,23 +569,23 @@ async def telegram_webhook(request: Request):
                 await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
 
             elif raw_text.startswith("/logs"):
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor(cursor_factory=RealDictCursor)
-                    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
-                    rows = cursor.fetchall()
-                    cursor.close()
-                    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 10") # Updated to 10
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-                    if not rows:
-                        await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
-                    else:
-                        log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
-                        for r in rows:
-                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
-                        await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
-                except Exception as log_err:
-                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
+        if not rows:
+            await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
+        else:
+            log_text = "📜 *LAST 10 TRADE LOGS:*\n\n" # Updated header
+            for r in rows:
+                log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
+            await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
+    except Exception as log_err:
+        await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
 
             elif raw_text.startswith("/stats"):
                 try:

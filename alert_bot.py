@@ -385,8 +385,9 @@ async def background_scanning_loop():
                 df_15m = calculate_metrics(df_15m)
                 df_1h = calculate_metrics(df_1h)
 
-                curr_high = float(df_5m["high"].iloc[-1])
-                curr_low = float(df_5m["low"].iloc[-1])
+                # Look across the last 3 candles to cover the 6-minute sleep window
+                curr_high = float(df_5m["high"].tail(3).max())
+                curr_low = float(df_5m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
                 curr_price = float(df_5m["close"].iloc[-1])

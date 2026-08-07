@@ -118,7 +118,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
     except Exception as e:
         print(f"[NEON DB ERROR] Failed to log signal: {e}")
 
-# --- TWO-STAGE TP TRACKING FUNCTION ---
+# --- TWO-STAGE TP TRACKING FUNCTION (SL CHECK PRIORITIZED) ---
 def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
         return
@@ -150,34 +150,44 @@ def update_open_trades(current_high: float, current_low: float):
             exit_price = None
 
             if action == "BUY":
-                if tp2 is not None and c_high >= tp2:
-                    new_outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
-                elif current_outcome == "WIN (TP1 HIT)":
-                    if c_low <= entry_price:
+                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
+                if current_outcome == "WIN (TP1 HIT)":
+                    if tp2 is not None and c_high >= tp2:
+                        new_outcome = "WIN (TP2 HIT)"
+                        exit_price = tp2
+                    elif c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price for calculations
-                elif tp1 is not None and c_high >= tp1:
-                    new_outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
+                        exit_price = tp1  # Retain TP1 price for accurate pip tracking
+                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss before TP targets
                 elif sl is not None and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-
-            elif action == "SELL":
-                if tp2 is not None and c_low <= tp2:
+                elif tp2 is not None and c_high >= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                elif current_outcome == "WIN (TP1 HIT)":
-                    if c_high >= entry_price:
-                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price for calculations
-                elif tp1 is not None and c_low <= tp1:
+                elif tp1 is not None and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
+
+            elif action == "SELL":
+                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
+                if current_outcome == "WIN (TP1 HIT)":
+                    if tp2 is not None and c_low <= tp2:
+                        new_outcome = "WIN (TP2 HIT)"
+                        exit_price = tp2
+                    elif c_high >= entry_price:
+                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
+                        exit_price = tp1  # Retain TP1 price for accurate pip tracking
+                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss before TP targets
                 elif sl is not None and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
+                elif tp2 is not None and c_low <= tp2:
+                    new_outcome = "WIN (TP2 HIT)"
+                    exit_price = tp2
+                elif tp1 is not None and c_low <= tp1:
+                    new_outcome = "WIN (TP1 HIT)"
+                    exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
@@ -378,7 +388,7 @@ async def background_scanning_loop():
                 adx_15m = float(df_15m["adx"].iloc[-1])
                 stoch_15m = float(df_15m["stoch_k"].iloc[-1])
                 
-                # ADX Filter
+                # ADX Chop Filter
                 if adx_15m < 18.0:
                     print(f"[MARKET SCAN] Price: ${curr_price:.2f} | ADX: {adx_15m:.1f} < 18.0 (Chop Filter Active)")
                     del df_5m, df_15m, df_1h
@@ -426,7 +436,7 @@ async def background_scanning_loop():
                     proposed_action = "SELL"
                     trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
 
-                # --- OPTION 2: STATE-AWARE COOLDOWN & DISTANCE GUARD ---
+                # --- STATE-AWARE COOLDOWN & DISTANCE GUARD ---
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()

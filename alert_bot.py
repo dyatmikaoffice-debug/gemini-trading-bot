@@ -1,713 +1,409 @@
 import os
-import json
 import asyncio
-import psycopg2
+import logging
 import gc
-from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
+
 import httpx
 import pandas as pd
 import numpy as np
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request
-from pydantic import BaseModel, Field
+import uvicorn
 
-from google import genai
-from google.genai import types
-from openai import OpenAI
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# --- ENVIRONMENT VARIABLES & SANITIZATION ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-RAW_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Environment Variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+APP_URL = os.getenv("APP_URL", "").strip()
 
-# Clean hidden newlines and spaces aggressively
-CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
-TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
+# Clean Bot Token
+BOT_TOKEN = "".join(TELEGRAM_BOT_TOKEN.split())
 
-if CLEAN_BOT_TOKEN.startswith("bot"):
-    TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN[3:]
-else:
-    TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN
-
-# Initialize AI Clients
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-groq_client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-) if GROQ_API_KEY else None
-
-SYMBOL = "XAU/USD"
-EXCHANGE = "TDEX"
-
-class SignalOutput(BaseModel):
-    action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
-    confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
-    reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the decision")
-
-# --- DATABASE CONNECTION & INITIALIZATION ---
+# Database Connection Helper
 def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is missing.")
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-def init_db():
-    if not DATABASE_URL:
-        print("[WARNING] DATABASE_URL not set. Database logging disabled.")
-        return
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id SERIAL PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                status TEXT NOT NULL,
-                action TEXT NOT NULL,
-                trigger_type TEXT NOT NULL,
-                price REAL NOT NULL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                confidence REAL,
-                adx_15m REAL,
-                stoch_rsi_15m REAL,
-                divergence_type TEXT,
-                reasoning TEXT,
-                outcome TEXT DEFAULT 'PENDING',
-                exit_price REAL,
-                outcome_timestamp TEXT
-            );
-        """)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print("[NEON DATABASE] Table structure verified successfully.")
-    except Exception as e:
-        print(f"[NEON DB ERROR] Failed to initialize database: {e}")
-
-def log_trade_signal(status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float, confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str):
-    if not DATABASE_URL:
-        return
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
-        
-        price_val = float(price) if price is not None else 0.0
-        sl_val = float(sl) if sl is not None else 0.0
-        tp1_val = float(tp1) if tp1 is not None else 0.0
-        tp2_val = float(tp2) if tp2 is not None else 0.0
-        conf_val = float(confidence) if confidence is not None else 0.0
-        adx_val = float(adx_15m) if adx_15m is not None else 0.0
-        stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
-
-        cursor.execute("""
-            INSERT INTO signals 
-            (timestamp, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (wib_time, status, action, trigger_type, price_val, sl_val, tp1_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print(f"[NEON DB LOGGED] Status: {status} | Action: {action} | Price: ${price_val:.2f}")
-    except Exception as e:
-        print(f"[NEON DB ERROR] Failed to log signal: {e}")
-
-# --- TWO-STAGE TP TRACKING FUNCTION (SL CHECK PRIORITIZED) ---
-def update_open_trades(current_high: float, current_low: float):
-    if not DATABASE_URL:
-        return
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')")
-        open_trades = cursor.fetchall()
-
-        if not open_trades:
-            cursor.close()
-            conn.close()
-            return
-
-        wib_now = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
-        c_high = float(current_high)
-        c_low = float(current_low)
-
-        for trade in open_trades:
-            trade_id = trade['id']
-            action = trade['action']
-            entry_price = float(trade['price'])
-            sl = float(trade['sl']) if trade['sl'] is not None else None
-            tp1 = float(trade['tp1']) if trade['tp1'] is not None else None
-            tp2 = float(trade['tp2']) if trade['tp2'] is not None else None
-            current_outcome = trade['outcome']
-
-            new_outcome = None
-            exit_price = None
-
-            if action == "BUY":
-                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
-                if current_outcome == "WIN (TP1 HIT)":
-                    if tp2 is not None and c_high >= tp2:
-                        new_outcome = "WIN (TP2 HIT)"
-                        exit_price = tp2
-                    elif c_low <= entry_price:
-                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price for accurate pip tracking
-                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss before TP targets
-                elif sl is not None and c_low <= sl:
-                    new_outcome = "LOSS (SL HIT)"
-                    exit_price = sl
-                elif tp2 is not None and c_high >= tp2:
-                    new_outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
-                elif tp1 is not None and c_high >= tp1:
-                    new_outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
-
-            elif action == "SELL":
-                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
-                if current_outcome == "WIN (TP1 HIT)":
-                    if tp2 is not None and c_low <= tp2:
-                        new_outcome = "WIN (TP2 HIT)"
-                        exit_price = tp2
-                    elif c_high >= entry_price:
-                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price for accurate pip tracking
-                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss before TP targets
-                elif sl is not None and c_high >= sl:
-                    new_outcome = "LOSS (SL HIT)"
-                    exit_price = sl
-                elif tp2 is not None and c_low <= tp2:
-                    new_outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
-                elif tp1 is not None and c_low <= tp1:
-                    new_outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
-
-            if new_outcome and new_outcome != current_outcome:
-                cursor.execute("""
-                    UPDATE signals 
-                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s
-                    WHERE id = %s
-                """, (new_outcome, float(exit_price), wib_now, trade_id))
-                conn.commit()
-                print(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f}")
-
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"[NEON DB ERROR] Failed to update trade outcomes: {e}")
-
-# --- MARKET DATA FETCHING ---
-async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100):
-    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={timeframe}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
-    res = await client.get(url)
-    if res.status_code != 200 or not res.text:
-        return None
-    try:
-        data = res.json()
-    except Exception:
-        return None
-
-    if "values" not in data:
-        return None
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
+# ---------------------------------------------------------
+# TECHNICAL INDICATORS & TREND LOGIC
+# ---------------------------------------------------------
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     
-    for col in ["open", "high", "low", "close"]:
-        if col in df.columns:
-            df[col] = df[col].astype(float)
-    return df
-
-# --- INDICATORS CALCULATIONS ---
-def calculate_metrics(df: pd.DataFrame):
-    df = df.tail(100).copy()
+    # EMAs
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
-    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (typical_price * df["close"]).rolling(window=20).sum() / df["close"].rolling(window=20).sum()
+    # ATR (14)
+    df['high_low'] = df['high'] - df['low']
+    df['high_cp'] = (df['high'] - df['close'].shift(1)).abs()
+    df['low_cp'] = (df['low'] - df['close'].shift(1)).abs()
+    df['tr'] = df[['high_low', 'high_cp', 'low_cp']].max(axis=1)
+    df['atr'] = df['tr'].rolling(14).mean()
 
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, 1)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    rsi_min = df["rsi"].rolling(window=14).min()
-    rsi_max = df["rsi"].rolling(window=14).max()
-    stoch_rsi = (df["rsi"] - rsi_min) / (rsi_max - rsi_min)
-    df["stoch_k"] = stoch_rsi.rolling(window=3).mean() * 100
-    df["stoch_d"] = df["stoch_k"].rolling(window=3).mean()
-
-    # ADX Calculation
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
-    )
-    df["up_move"] = df["high"] - df["high"].shift(1)
-    df["down_move"] = df["low"].shift(1) - df["low"]
+    # Stochastic RSI (14, 3, 3)
+    rsi_period = 14
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(rsi_period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(rsi_period).mean()
+    rs = gain / (loss + 1e-10)
+    df['rsi'] = 100 - (100 / (1 + rs))
     
-    df["plus_dm"] = np.where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), df["up_move"], 0)
-    df["minus_dm"] = np.where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), df["down_move"], 0)
+    min_rsi = df['rsi'].rolling(rsi_period).min()
+    max_rsi = df['rsi'].rolling(rsi_period).max()
+    stoch_rsi = (df['rsi'] - min_rsi) / (max_rsi - min_rsi + 1e-10)
+    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
+    df['stoch_d'] = df['stoch_k'].rolling(3).mean()
 
-    tr14 = df["tr"].rolling(14).sum()
-    plus_di = 100 * (df["plus_dm"].rolling(14).sum() / tr14)
-    minus_di = 100 * (df["minus_dm"].rolling(14).sum() / tr14)
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1))
-    df["adx"] = dx.rolling(14).mean()
-
-    # ATR Calculation
-    df["atr"] = df["tr"].rolling(window=14).mean()
+    # ADX (14)
+    up = df['high'].diff()
+    down = -df['low'].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    
+    tr_smooth = df['tr'].rolling(14).sum()
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / (tr_smooth + 1e-10))
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / (tr_smooth + 1e-10))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    df['adx'] = dx.rolling(14).mean()
 
     return df
 
-def check_divergence(df: pd.DataFrame):
-    if len(df) < 15:
-        return "None"
-    
-    p_now = float(df["close"].iloc[-1])
-    p_prev = float(df["close"].iloc[-5:-1].min())
-    s_now = float(df["stoch_k"].iloc[-1])
-    s_prev = float(df["stoch_k"].iloc[-5:-1].min())
-
-    if p_now < p_prev and s_now > s_prev and s_now < 30:
-        return "Bullish Divergence (Lower Price Low + Higher Stoch Low)"
-
-    p_prev_max = float(df["close"].iloc[-5:-1].max())
-    s_prev_max = float(df["stoch_k"].iloc[-5:-1].max())
-    if p_now > p_prev_max and s_now < s_prev_max and s_now > 70:
-        return "Bearish Divergence (Higher Price High + Lower Stoch High)"
-
-    return "None"
-
-# --- TELEGRAM NOTIFICATIONS ---
-async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
-    chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
-    if not TELEGRAM_BOT_TOKEN or not chat_id:
-        print("[TELEGRAM ERROR] Missing token or chat_id")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    
-    try:
-        res = await client.post(url, json=payload)
-        if res.status_code != 200:
-            payload_plain = {"chat_id": chat_id, "text": text}
-            res_plain = await client.post(url, json=payload_plain)
-            if res_plain.status_code == 200:
-                print(f"[TELEGRAM SENT] Delivered plain text to Chat ID {chat_id}")
-            else:
-                print(f"[TELEGRAM ERROR] Failed sending message: {res_plain.text}")
-        else:
-            print(f"[TELEGRAM SENT] Delivered Markdown to Chat ID {chat_id}")
-    except Exception as e:
-        print(f"[TELEGRAM EXCEPTION] {e}")
-
-# --- AI ANALYST EVALUATION ---
-async def analyze_signal_with_ai(proposed_action: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, divergence: str):
+# ---------------------------------------------------------
+# AI ANALYST FILTER (STRICT WIN-RATE FOCUSED)
+# ---------------------------------------------------------
+async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k: float, ema50: float, ema200: float) -> str:
+    if not GROQ_API_KEY:
+        return "APPROVE"
+        
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
-A technical trigger suggests a {proposed_action} entry at ${current_price:.2f}.
+    You are an institutional Gold Risk Analyst. Evaluate this trade setup:
+    - Pair: Spot Gold (XAU/USD)
+    - Action Proposed: {action}
+    - Current Price: ${price:.2f}
+    - 5M EMA 50: ${ema50:.2f} | 5M EMA 200: ${ema200:.2f}
+    - 15M ADX Trend Strength: {adx:.1f}
+    - 5M Stoch RSI %K: {stoch_k:.1f}
 
-TECHNICAL CONTEXT:
-1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
-2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
-3. 1-Hour: Close=${float(df_1h['close'].iloc[-1]):.2f}, EMA 50=${float(df_1h['ema_50'].iloc[-1]):.2f}, VWAP=${float(df_1h['vwap'].iloc[-1]):.2f}.
-4. Divergence State: {divergence}.
+    STRICT RULES:
+    1. VETO if proposed BUY is taking place above recent parabolic spike without pullbacks.
+    2. VETO if proposed BUY is below EMA 200 (counter-trend).
+    3. VETO if proposed SELL is above EMA 200 (counter-trend).
+    4. VETO if ADX < 20 (choppy market condition).
 
-CRITICAL VETO RULES:
-- VETO if price is directly buying into 1H resistance or selling into 1H support.
-- VETO if 15M ADX is below 18.0 indicating horizontal chop.
-- VETO if 5M Stoch RSI is exhausted (>85 for BUY, <15 for SELL) without bullish/bearish divergence.
+    Respond strictly with APPROVE or VETO followed by a 1-sentence explanation.
+    """
 
-Respond strictly in valid JSON matching schema:
-{{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
-"""
-
-    if GROQ_API_KEY:
-        try:
-            res = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                response_format={"type": "json_object"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1
+                }
             )
-            data = json.loads(res.choices[0].message.content)
-            return SignalOutput(**data)
-        except Exception as e:
-            print(f"[AI WARNING] Groq call failed: {e}. Falling back to Gemini.")
+            data = res.json()
+            content = data['choices'][0]['message']['content'].strip()
+            return "VETO" if "VETO" in content.upper() else "APPROVE"
+    except Exception as e:
+        logging.error(f"AI Analyst Exception: {e}")
+        return "APPROVE"
 
-    if GEMINI_API_KEY:
-        try:
-            res = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SignalOutput,
-                    temperature=0.1,
-                )
-            )
-            return SignalOutput.model_validate_json(res.text)
-        except Exception as e:
-            print(f"[AI ERROR] Gemini call failed: {e}")
+# ---------------------------------------------------------
+# TELEGRAM MESSAGING & WEBHOOK AUTOMATION
+# ---------------------------------------------------------
+async def send_telegram_alert(message: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            res = await client.post(url, json=payload)
+            if res.status_code == 200:
+                logging.info(f"[TELEGRAM SENT] Delivered to Chat ID {TELEGRAM_CHAT_ID}")
+            else:
+                logging.error(f"[TELEGRAM ERROR] Status: {res.status_code} | Body: {res.text}")
+    except Exception as e:
+        logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
+async def setup_auto_webhook():
+    if not APP_URL or not BOT_TOKEN:
+        return
+    webhook_url = f"{APP_URL.rstrip('/')}/telegram-webhook"
+    target_api = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            res = await client.get(target_api)
+            data = res.json()
+            if data.get("ok"):
+                logging.info(f"[WEBHOOK SETUP SUCCESS] Telegram Webhook registered to: {webhook_url}")
+            else:
+                logging.error(f"[WEBHOOK SETUP FAILED] Response: {data}")
+    except Exception as e:
+        logging.error(f"[WEBHOOK SETUP EXCEPTION] {e}")
 
-# --- BACKGROUND SCANNING LOOP ---
-async def background_scanning_loop():
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        while True:
-            try:
-                print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
-                df_5m = await fetch_timeframe_data(client, "5min")
-                df_15m = await fetch_timeframe_data(client, "15min")
-                df_1h = await fetch_timeframe_data(client, "1h")
+# ---------------------------------------------------------
+# TRADE TRACKER & DATABASE UPDATES
+# ---------------------------------------------------------
+def update_open_trades(current_price: float, high_3c: float, low_3c: float):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome NOT LIKE 'WIN (TP2%' AND outcome NOT LIKE 'LOSS%' AND outcome NOT LIKE 'CLOSED%'")
+    open_trades = cur.fetchall()
 
-                if df_5m is None or df_15m is None or df_1h is None:
-                    print("Failed to fetch complete timeframe candles. Retrying next cycle.")
-                    await asyncio.sleep(360)
-                    continue
+    for trade in open_trades:
+        trade_id = trade['id']
+        action = trade['action']
+        entry = float(trade['entry_price'])
+        sl = float(trade['sl_price'])
+        tp1 = float(trade['tp1_price'])
+        tp2 = float(trade['tp2_price'])
+        outcome = trade['outcome']
 
-                df_5m = calculate_metrics(df_5m)
-                df_15m = calculate_metrics(df_15m)
-                df_1h = calculate_metrics(df_1h)
+        new_outcome = None
+        exit_price = None
 
-                # Look across the last 3 candles to cover the 6-minute sleep window
-                curr_high = float(df_5m["high"].tail(3).max())
-                curr_low = float(df_5m["low"].tail(3).min())
-                update_open_trades(curr_high, curr_low)
-
-                curr_price = float(df_5m["close"].iloc[-1])
-                adx_15m = float(df_15m["adx"].iloc[-1])
-                stoch_15m = float(df_15m["stoch_k"].iloc[-1])
-                
-                # ADX Chop Filter
-                if adx_15m < 18.0:
-                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | ADX: {adx_15m:.1f} < 18.0 (Chop Filter Active)")
-                    del df_5m, df_15m, df_1h
-                    gc.collect()
-                    await asyncio.sleep(360)
-                    continue
-
-                # Signal Logic Setup
-                c_5m, ema_5m, vwap_5m = float(df_5m["close"].iloc[-1]), float(df_5m["ema_50"].iloc[-1]), float(df_5m["vwap"].iloc[-1])
-                c_5m_prev, o_5m = float(df_5m["close"].iloc[-2]), float(df_5m["open"].iloc[-1])
-                
-                is_5m_bull = (c_5m > ema_5m) and (c_5m > vwap_5m) and (c_5m > o_5m)
-                is_5m_bear = (c_5m < ema_5m) and (c_5m < vwap_5m) and (c_5m < o_5m)
-
-                divergence = check_divergence(df_5m)
-
-                stoch_k_curr = float(df_5m["stoch_k"].iloc[-1])
-                stoch_k_prev = float(df_5m["stoch_k"].iloc[-2])
-
-                # Adaptive Stoch RSI Threshold based on ADX Trend Strength
-                stoch_buy_limit = 50.0 if adx_15m > 35.0 else 20.0
-                stoch_sell_limit = 50.0 if adx_15m > 35.0 else 80.0
-
-                stoch_buy_cross = (stoch_k_prev < stoch_buy_limit) and (stoch_k_curr >= stoch_buy_limit)
-                stoch_sell_cross = (stoch_k_prev > stoch_sell_limit) and (stoch_k_curr <= stoch_sell_limit)
-
-                proposed_action = "HOLD"
-                trigger_type = "None"
-
-                # --- TREND-FILTERED SIGNAL EVALUATION ---
-                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)":
-                    if c_5m > ema_5m or c_5m > vwap_5m:
-                        proposed_action = "BUY"
-                        trigger_type = "Divergence Reversal"
-
-                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)":
-                    if c_5m < ema_5m or c_5m < vwap_5m:
-                        proposed_action = "SELL"
-                        trigger_type = "Divergence Reversal"
-
-                elif is_5m_bull and stoch_buy_cross:
-                    proposed_action = "BUY"
-                    trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
-                elif is_5m_bear and stoch_sell_cross:
-                    proposed_action = "SELL"
-                    trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
-
-                # --- STATE-AWARE COOLDOWN & DISTANCE GUARD ---
-                if proposed_action != "HOLD":
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor(cursor_factory=RealDictCursor)
-                        cursor.execute("""
-                            SELECT price, outcome FROM signals 
-                            WHERE status = 'EXECUTED' AND action = %s 
-                            ORDER BY id DESC LIMIT 1
-                        """, (proposed_action,))
-                        last_trade = cursor.fetchone()
-                        cursor.close()
-                        conn.close()
-
-                        if last_trade:
-                            last_entry_price = float(last_trade['price'])
-                            last_outcome = str(last_trade['outcome'])
-                            
-                            # If previous trade is active & PENDING, require full $6.00 distance to prevent double exposure
-                            # If previous trade hit TP1/BE/SL, reduce required distance to $3.00 to allow fast re-entries
-                            required_distance = 6.0 if last_outcome == "PENDING" else 3.0
-
-                            if abs(curr_price - last_entry_price) < required_distance:
-                                print(f"[STATE-AWARE COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f} (Status: {last_outcome}).")
-                                proposed_action = "HOLD"
-                    except Exception as cd_err:
-                        print(f"[STATE-AWARE COOLDOWN ERROR] {cd_err}")
-
-                # --- VISIBLE SCAN STATUS LOGS ---
-                if proposed_action == "HOLD":
-                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
+        if action == "BUY":
+            # Priority Check 1: Stop Loss Hit First
+            if low_3c <= sl:
+                if "TP1 HIT" in outcome:
+                    new_outcome = "CLOSED (TP1 HIT / SL BE)"
+                    exit_price = tp1  # Lock in TP1 pips gain
                 else:
-                    print(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, df_1h, divergence)
+                    new_outcome = "LOSS (SL HIT)"
+                    exit_price = sl
+            # Priority Check 2: Take Profit Targets
+            elif high_3c >= tp2:
+                new_outcome = "WIN (TP2 HIT)"
+                exit_price = tp2
+            elif high_3c >= tp1 and "TP1 HIT" not in outcome:
+                new_outcome = "WIN (TP1 HIT)"
+                exit_price = tp1
 
-                    atr_5m = float(df_5m["atr"].iloc[-1])
-                    sl_dist = min(atr_5m * 1.5, 6.0)
-                    tp1_mult = 1.5
-                    tp2_mult = 4.0 if adx_15m > 35.0 else 2.5
+        elif action == "SELL":
+            # Priority Check 1: Stop Loss Hit First
+            if high_3c >= sl:
+                if "TP1 HIT" in outcome:
+                    new_outcome = "CLOSED (TP1 HIT / SL BE)"
+                    exit_price = tp1  # Lock in TP1 pips gain
+                else:
+                    new_outcome = "LOSS (SL HIT)"
+                    exit_price = sl
+            # Priority Check 2: Take Profit Targets
+            elif low_3c <= tp2:
+                new_outcome = "WIN (TP2 HIT)"
+                exit_price = tp2
+            elif low_3c <= tp1 and "TP1 HIT" not in outcome:
+                new_outcome = "WIN (TP1 HIT)"
+                exit_price = tp1
+
+        if new_outcome:
+            cur.execute("""
+                UPDATE signals 
+                SET outcome = %s, exit_price = %s, closed_at = NOW() 
+                WHERE id = %s
+            """, (new_outcome, exit_price, trade_id))
+            conn.commit()
+            logging.info(f"[TRADE TRACKER] Signal ID {trade_id} updated -> {new_outcome}")
+
+    cur.close()
+    conn.close()
+
+# ---------------------------------------------------------
+# BACKGROUND MARKET SCANNER
+# ---------------------------------------------------------
+async def background_scanning_loop():
+    while True:
+        try:
+            url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=100&apikey={TWELVE_DATA_API_KEY}"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(url)
+                data = res.json()
+
+            if "values" in data:
+                df = pd.DataFrame(data['values'])
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = df[col].astype(float)
+                df = df.sort_values('datetime').reset_index(drop=True)
+
+                df = calculate_indicators(df)
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+
+                price = float(latest['close'])
+                ema50 = float(latest['ema50'])
+                ema200 = float(latest['ema200'])
+                adx = float(latest['adx'])
+                stoch_k = float(latest['stoch_k'])
+                stoch_d = float(latest['stoch_d'])
+                atr = float(latest['atr'])
+
+                # 3-Candle High and Low for Order Tracking
+                high_3c = float(df['high'].tail(3).max())
+                low_3c = float(df['low'].tail(3).min())
+
+                # Step 1: Update Active Trades
+                update_open_trades(price, high_3c, low_3c)
+
+                # Step 2: Check Trend Alignment
+                proposed_action = "HOLD"
+
+                # Filter 1: Strict Multi-Timeframe Trend Lock (EMA 200)
+                is_uptrend = (price > ema200) and (ema50 > ema200)
+                is_downtrend = (price < ema200) and (ema50 < ema200)
+
+                # Filter 2: ADX Volatility & Stoch RSI Entries
+                if adx >= 20.0:  # Skip chop zone
+                    if is_uptrend:
+                        # Normal Trend Entry vs. Strong Trend Entry
+                        if (adx >= 35.0 and stoch_k < 50 and prev['stoch_k'] <= prev['stoch_d'] and stoch_k > stoch_d) or \
+                           (stoch_k < 20 and prev['stoch_k'] <= prev['stoch_d'] and stoch_k > stoch_d):
+                            proposed_action = "BUY"
+
+                    elif is_downtrend:
+                        if (adx >= 35.0 and stoch_k > 50 and prev['stoch_k'] >= prev['stoch_d'] and stoch_k < stoch_d) or \
+                           (stoch_k > 80 and prev['stoch_k'] >= prev['stoch_d'] and stoch_k < stoch_d):
+                            proposed_action = "SELL"
+
+                # Step 3: Check Distance / Cooldown with Previous Signal
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT entry_price, outcome FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1")
+                last_trade = cur.fetchone()
+                
+                min_distance = 6.0
+                if last_trade and last_trade['outcome'] in ['WIN (TP1 HIT)', 'WIN (TP2 HIT)', 'CLOSED (TP1 HIT / SL BE)']:
+                    min_distance = 3.0  # State-Aware Cooldown
+
+                if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
+                    proposed_action = "HOLD"
+
+                # Log Status
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | EMA200: ${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+
+                # Step 4: AI Evaluation & Signal Dispatch
+                if proposed_action != "HOLD":
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, stoch_k, ema50, ema200)
+                    
+                    sl_dist = max(4.5, min(8.0, atr * 2.0))  # Structural Buffer
+                    tp1_dist = sl_dist * 1.5
+                    tp2_dist = sl_dist * 3.0
 
                     if proposed_action == "BUY":
-                        sl_price = curr_price - sl_dist
-                        tp1_price = curr_price + (sl_dist * tp1_mult)
-                        tp2_price = curr_price + (sl_dist * tp2_mult)
+                        sl = price - sl_dist
+                        tp1 = price + tp1_dist
+                        tp2 = price + tp2_dist
                     else:
-                        sl_price = curr_price + sl_dist
-                        tp1_price = curr_price - (sl_dist * tp1_mult)
-                        tp2_price = curr_price - (sl_dist * tp2_mult)
+                        sl = price + sl_dist
+                        tp1 = price - tp1_dist
+                        tp2 = price - tp2_dist
 
-                    if ai_decision.action == proposed_action:
-                        log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                    status_str = "EXECUTED" if ai_decision == "APPROVE" else "VETOED"
+                    
+                    cur.execute("""
+                        INSERT INTO signals (action, entry_price, sl_price, tp1_price, tp2_price, status, outcome, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', NOW())
+                        RETURNING id;
+                    """, (proposed_action, float(price), float(sl), float(tp1), float(tp2), status_str))
+                    conn.commit()
+                    new_id = cur.fetchone()['id']
 
-                        msg = (
-                            f"⚡ *STOCH RSI TRADE SIGNAL*\n\n"
-                            f"Asset: *XAUUSD (Gold Spot)*\n"
-                            f"Action: *{proposed_action}*\n"
-                            f"Type: *{trigger_type}*\n"
-                            f"Entry Price: *${curr_price:.2f}*\n\n"
-                            f"Stop Loss (SL): *${sl_price:.2f}*\n"
-                            f"Take Profit 1 (TP1): *${tp1_price:.2f}* (1:{tp1_mult:.1f} RRR)\n"
-                            f"Take Profit 2 (TP2): *${tp2_price:.2f}* (1:{tp2_mult:.1f} RRR)\n\n"
-                            f"INDICATOR METRICS:\n"
-                            f"- Setup Type: {trigger_type}\n"
-                            f"- Divergence Context: {divergence}\n"
-                            f"- 15M ADX Strength: {adx_15m:.1f}\n"
-                            f"- 15M Stoch RSI: {stoch_15m:.1f}\n\n"
-                            f"Reasoning: {ai_decision.reasoning}"
-                        )
-                        await send_telegram_alert(client, msg)
-                    else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                    if ai_decision == "APPROVE":
+                        msg = f"⚡ *HIGH WIN-RATE SIGNAL #{new_id}*\n\n" \
+                              f"Action: *{proposed_action} XAU/USD*\n" \
+                              f"Entry Price: *${price:.2f}*\n" \
+                              f"Stop Loss: *${sl:.2f}*\n" \
+                              f"Take Profit 1: *${tp1:.2f}*\n" \
+                              f"Take Profit 2: *${tp2:.2f}*\n" \
+                              f"Trend ADX: *{adx:.1f}*"
+                        await send_telegram_alert(msg)
 
-                del df_5m, df_15m, df_1h
-                gc.collect()
+                cur.close()
+                conn.close()
 
-            except Exception as e:
-                print(f"[SCAN LOOP ERROR] {e}")
+            del df
+            gc.collect()
 
-            await asyncio.sleep(360)
+        except Exception as e:
+            logging.error(f"[SCANNER EXCEPTION] {e}")
 
-# --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
+        await asyncio.sleep(360)  # 6-minute sleep interval
+
+# ---------------------------------------------------------
+# FASTAPI APP & TELEGRAM WEBHOOK HANDLER
+# ---------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-
-    if TELEGRAM_BOT_TOKEN:
-        try:
-            webhook_endpoint = "https://divergent-confluence-trading-bot.onrender.com/telegram-webhook"
-            set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
-            
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(set_url)
-                print(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
-        except Exception as e:
-            print(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
-
-    scan_task = asyncio.create_task(background_scanning_loop())
+    asyncio.create_task(background_scanning_loop())
+    await setup_auto_webhook()
     yield
-    scan_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-def home():
-    return {"status": "ok", "message": "Trading bot scanner and webhook server active."}
+def root():
+    return {"status": "Live", "bot": "Gold Auto Signal Bot V2 High Win-Rate"}
 
-@app.get("/logs")
-def get_trade_logs(limit: int = 50):
-    if not DATABASE_URL:
-        return {"error": "DATABASE_URL environment variable is missing."}
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT %s", (limit,))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return {"count": len(rows), "logs": rows}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/stats")
-def get_trade_stats():
-    if not DATABASE_URL:
-        return {"error": "DATABASE_URL environment variable is missing."}
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED'")
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-
-        closed = [r for r in rows if r['outcome'] != 'PENDING']
-        wins = [r for r in closed if 'WIN' in str(r['outcome']) or 'CLOSED (TP1 HIT' in str(r['outcome'])]
-        losses = [r for r in closed if 'LOSS' in str(r['outcome'])]
-
-        return {
-            "total_executed": len(rows),
-            "pending_trades": len(rows) - len(closed),
-            "closed_trades": len(closed),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": f"{(len(wins) / len(closed) * 100):.1f}%" if closed else "0.0%"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-        message = data.get("message", {})
-        raw_text = message.get("text", "").strip().lower()
-        sender_chat_id = str(message.get("chat", {}).get("id", ""))
+    data = await request.json()
+    
+    if "message" in data:
+        message = data["message"]
+        chat_id = str(message.get("chat", {}).get("id"))
+        text = message.get("text", "").strip()
 
-        if not sender_chat_id or not raw_text:
-            return {"status": "ignored"}
+        if text in ["/stats", "/logs", "/pips", "/help"]:
+            conn = get_db_connection()
+            cur = conn.cursor()
 
-        print(f"[WEBHOOK RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
+            if text == "/stats":
+                cur.execute("SELECT COUNT(*) as total FROM signals WHERE status = 'EXECUTED'")
+                total = cur.fetchone()['total']
+                cur.execute("SELECT COUNT(*) as wins FROM signals WHERE outcome LIKE 'WIN%' OR outcome LIKE 'CLOSED%'")
+                wins = cur.fetchone()['wins']
+                
+                win_rate = (wins / total * 100) if total > 0 else 0.0
+                reply = f"📊 *PERFORMANCE METRICS*\n\nTotal Trades: *{total}*\nWins: *{wins}*\nWin Rate: *{win_rate:.1f}%*"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            if raw_text.startswith("/help") or raw_text.startswith("/start"):
-                help_msg = (
-                    "🤖 *TRADING BOT COMMANDS:*\n\n"
-                    "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
-                    "• `/pips` - View overall net pips and trade-by-trade breakdown\n"
-                    "• `/logs` - View details of the last 10 signals\n"
-                    "• `/help` - Display command menu"
-                )
-                await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
+            elif text == "/logs":
+                cur.execute("SELECT id, action, entry_price, status, outcome FROM signals ORDER BY id DESC LIMIT 10")
+                logs = cur.fetchall()
+                reply = "📜 *LAST 10 TRADE LOGS:*\n\n"
+                for l in logs:
+                    reply += f"• *ID {l['id']}* | {l['action']} @ ${float(l['entry_price']):.2f} | Status: {l['outcome']}\n"
 
-            elif raw_text.startswith("/pips"):
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor(cursor_factory=RealDictCursor)
-                    cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome != 'PENDING' ORDER BY id DESC LIMIT 10")
-                    closed_trades = cursor.fetchall()
-                    
-                    cursor.execute("""
-                        SELECT SUM(
-                            CASE 
-                                WHEN action = 'BUY' THEN (exit_price - price) * 10
-                                WHEN action = 'SELL' THEN (price - exit_price) * 10
-                            END
-                        ) AS net_pips FROM signals WHERE status = 'EXECUTED' AND outcome != 'PENDING'
-                    """)
-                    total_row = cursor.fetchone()
-                    total_net_pips = float(total_row['net_pips']) if total_row and total_row['net_pips'] is not None else 0.0
+            elif text == "/pips":
+                cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE outcome NOT IN ('PENDING', 'VETOED') AND exit_price IS NOT NULL")
+                trades = cur.fetchall()
+                total_pips = 0.0
+                for t in trades:
+                    diff = float(t['exit_price']) - float(t['entry_price']) if t['action'] == "BUY" else float(t['entry_price']) - float(t['exit_price'])
+                    total_pips += (diff * 10.0)
+                reply = f"💰 *NET PIPS REPORT*\n\nTotal Net Pips: *{total_pips:+.1f} pips*"
 
-                    cursor.close()
-                    conn.close()
+            elif text == "/help":
+                reply = "🤖 *COMMAND MENU:*\n\n/stats - View Win Rate & Trade Performance\n/logs - View Last 10 Trade Entries\n/pips - View Total Net Pips Gain/Loss"
 
-                    if not closed_trades:
-                        await send_telegram_alert(client, "No closed trades available to calculate pips yet.", target_chat_id=sender_chat_id)
-                    else:
-                        pips_breakdown = ""
-                        for t in closed_trades:
-                            entry = float(t['price'])
-                            exit_p = float(t['exit_price']) if t['exit_price'] is not None else entry
-                            action = t['action']
-                            
-                            pips = (exit_p - entry) * 10.0 if action == "BUY" else (entry - exit_p) * 10.0
-                            sign = "+" if pips > 0 else ""
-                            pips_breakdown += f"• *ID {t['id']}* ({action}): {sign}{pips:.1f} pips ({t['outcome']})\n"
+            cur.close()
+            conn.close()
 
-                        pips_msg = (
-                            f"📈 *PIPS PERFORMANCE REPORT*\n\n"
-                            f"{pips_breakdown}\n"
-                            f"🎯 *Total Net Pips (All Time):* *{'+' if total_net_pips > 0 else ''}{total_net_pips:.1f} Pips*"
-                        )
-                        await send_telegram_alert(client, pips_msg, target_chat_id=sender_chat_id)
-                except Exception as err:
-                    await send_telegram_alert(client, f"⚠️ Error calculating pips: {err}", target_chat_id=sender_chat_id)
-
-            elif raw_text.startswith("/logs"):
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor(cursor_factory=RealDictCursor)
-                    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 10")
-                    rows = cursor.fetchall()
-                    cursor.close()
-                    conn.close()
-
-                    if not rows:
-                        await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
-                    else:
-                        log_text = "📜 *LAST 10 TRADE LOGS:*\n\n"
-                        for r in rows:
-                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
-                        await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
-                except Exception as log_err:
-                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
-
-            elif raw_text.startswith("/stats"):
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor(cursor_factory=RealDictCursor)
-                    cursor.execute("SELECT * FROM signals")
-                    rows = cursor.fetchall()
-
-                    executed = [r for r in rows if r['status'] == 'EXECUTED']
-                    vetoed = [r for r in rows if r['status'] == 'VETOED']
-                    pending = [r for r in executed if r['outcome'] == 'PENDING']
-                    closed = [r for r in executed if r['outcome'] != 'PENDING']
-
-                    wins_tp1 = len([r for r in closed if 'TP1' in str(r['outcome'])])
-                    wins_tp2 = len([r for r in closed if 'TP2' in str(r['outcome'])])
-                    losses = len([r for r in closed if 'LOSS' in str(r['outcome'])])
-
-                    total_closed = len(closed)
-                    win_rate = ((wins_tp1 + wins_tp2) / total_closed * 100) if total_closed > 0 else 0.0
-
-                    cursor.close()
-                    conn.close()
-
-                    stats_msg = (
-                        f"📊 *SYSTEM PERFORMANCE STATS (NEON CLOUD)*\n\n"
-                        f"• Executed Signals: {len(executed)}\n"
-                        f"• AI Vetoes: {len(vetoed)}\n"
-                        f"• Pending Trades: {len(pending)}\n"
-                        f"• Closed Trades: {total_closed}\n"
-                        f"• Total Wins: {wins_tp1 + wins_tp2} (TP1: {wins_tp1} | TP2: {wins_tp2})\n"
-                        f"• Total Losses: {losses}\n"
-                        f"• Win Rate: *{win_rate:.1f}%*"
-                    )
-                    await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
-                except Exception as db_err:
-                    await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
-
-    except Exception as e:
-        print(f"[WEBHOOK ERROR] {e}")
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(url, json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"})
 
     return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run("alert_bot:app", host="0.0.0.0", port=8000)

@@ -181,7 +181,6 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
     
-    # Safely convert available numeric columns without requiring 'volume'
     for col in ["open", "high", "low", "close"]:
         if col in df.columns:
             df[col] = df[col].astype(float)
@@ -249,13 +248,19 @@ def check_divergence(df: pd.DataFrame):
     return "None"
 
 # --- TELEGRAM NOTIFICATIONS ---
-async def send_telegram_alert(client: httpx.AsyncClient, text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
+    chat_id = target_chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    
     try:
-        await client.post(url, json=payload)
+        res = await client.post(url, json=payload)
+        if res.status_code != 200:
+            # Fallback to plain text without Markdown if formatting failed
+            payload_plain = {"chat_id": chat_id, "text": text}
+            await client.post(url, json=payload_plain)
     except Exception as e:
         print(f"Telegram Notification Error: {e}")
 
@@ -453,6 +458,10 @@ async def telegram_polling_loop():
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
                             text = message.get("text", "").strip()
+                            sender_chat_id = str(message.get("chat", {}).get("id", ""))
+
+                            if not sender_chat_id:
+                                continue
 
                             if text == "/help":
                                 help_msg = (
@@ -461,7 +470,7 @@ async def telegram_polling_loop():
                                     "• `/logs` - View details of the last 5 signals\n"
                                     "• `/help` - Display command menu"
                                 )
-                                await send_telegram_alert(client, help_msg)
+                                await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
 
                             elif text == "/logs":
                                 try:
@@ -473,14 +482,14 @@ async def telegram_polling_loop():
                                     conn.close()
 
                                     if not rows:
-                                        await send_telegram_alert(client, "No trade logs recorded yet.")
+                                        await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
                                     else:
                                         log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
                                         for r in rows:
                                             log_text += f"• *ID {r['id']}* | {r['action']} @ ${r['price']:.2f} | Status: `{r['status']}` ({r['outcome']})\n"
-                                        await send_telegram_alert(client, log_text)
+                                        await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
                                 except Exception as log_err:
-                                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}")
+                                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
 
                             elif text == "/stats":
                                 try:
@@ -514,9 +523,9 @@ async def telegram_polling_loop():
                                         f"• Total Losses: {losses}\n"
                                         f"• Win Rate: *{win_rate:.1f}%*"
                                     )
-                                    await send_telegram_alert(client, stats_msg)
+                                    await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
                                 except Exception as db_err:
-                                    await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}")
+                                    await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
 
             except Exception as e:
                 print(f"Error in Telegram polling loop: {e}")

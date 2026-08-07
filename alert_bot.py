@@ -96,7 +96,6 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         cursor = conn.cursor()
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         
-        # Explicit type conversion to standard Python types to prevent psycopg2 np.float64 errors
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -265,6 +264,7 @@ def check_divergence(df: pd.DataFrame):
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
     chat_id = target_chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not chat_id:
+        print("[TELEGRAM ERROR] Missing token or chat_id")
         return
     url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": str(chat_id), "text": text, "parse_mode": "Markdown"}
@@ -272,10 +272,15 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
     try:
         res = await client.post(url, json=payload)
         if res.status_code != 200:
+            print(f"[TELEGRAM API WARNING] Code {res.status_code}: {res.text}. Retrying plain text.")
             payload_plain = {"chat_id": str(chat_id), "text": text}
-            await client.post(url, json=payload_plain)
+            res_plain = await client.post(url, json=payload_plain)
+            if res_plain.status_code != 200:
+                print(f"[TELEGRAM API ERROR] Failed plain text: {res_plain.text}")
+        else:
+            print(f"[TELEGRAM SENT] Message delivered to Chat ID {chat_id}")
     except Exception as e:
-        print(f"Telegram Notification Error: {e}")
+        print(f"[TELEGRAM EXCEPTION] {e}")
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(proposed_action: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, divergence: str):
@@ -455,18 +460,25 @@ async def background_scanning_loop():
 # --- TELEGRAM POLLING LOOP ---
 async def telegram_polling_loop():
     if not TELEGRAM_BOT_TOKEN:
+        print("[TELEGRAM ERROR] TELEGRAM_BOT_TOKEN environment variable not set.")
         return
-    url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    offset = 0
 
     async with httpx.AsyncClient(timeout=10.0) as client:
+        # Force remove any webhook to allow long polling
+        try:
+            del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
+            print(f"[TELEGRAM] Webhook clear status: {del_res.status_code}")
+        except Exception as e:
+            print(f"[TELEGRAM WARNING] Webhook clear failed: {e}")
+
+        offset = 0
         while True:
             try:
-                res = await client.get(f"{url}?offset={offset}&timeout=5")
+                res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=5")
                 if res.status_code == 200 and res.text:
                     data = res.json()
 
-                    if "result" in data:
+                    if data.get("ok") and "result" in data:
                         for update in data["result"]:
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
@@ -539,6 +551,8 @@ async def telegram_polling_loop():
                                     await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
                                 except Exception as db_err:
                                     await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
+                else:
+                    print(f"[TELEGRAM POLLING WARNING] Code {res.status_code}: {res.text}")
 
             except Exception as e:
                 print(f"Error in Telegram polling loop: {e}")

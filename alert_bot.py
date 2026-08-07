@@ -324,7 +324,7 @@ TECHNICAL CONTEXT:
 CRITICAL VETO RULES:
 - VETO if price is directly buying into 1H resistance or selling into 1H support.
 - VETO if 15M ADX is below 18.0 indicating horizontal chop.
-- VETO if 5M Stoch RSI is exhausted (>85 for BUY, <15 for SELL) without bullish/bearish divergence.
+- VETO if 5M Stoch RSI is exhausted (>85 for BUY, <15 for SELL) without bullish/bearish divergence UNLESS 15M ADX is above 35.0 (strong trend continuation).
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}

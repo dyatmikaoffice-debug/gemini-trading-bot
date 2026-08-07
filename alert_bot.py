@@ -274,7 +274,7 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         print("[TELEGRAM ERROR] Missing token or chat_id")
         return
-    url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     
     try:
@@ -471,11 +471,11 @@ async def background_scanning_loop():
 async def lifespan(app: FastAPI):
     init_db()
 
-    # Automatically register Webhook with Telegram on server startup
+    # Automatically register Webhook with Telegram on server startup (api.telegram.org)
     if TELEGRAM_BOT_TOKEN:
         try:
             webhook_endpoint = "https://divergent-confluence-trading-bot.onrender.com/telegram-webhook"
-            set_url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
+            set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(set_url)

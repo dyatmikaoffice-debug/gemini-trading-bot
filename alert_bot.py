@@ -473,111 +473,110 @@ async def start_telegram_listener():
         print("[TELEGRAM ERROR] TELEGRAM_BOT_TOKEN environment variable not set.")
         return
 
+    # Clear webhooks ONCE on boot WITHOUT dropping pending user messages
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as init_client:
+            await init_client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
+            print("[TELEGRAM INIT] Webhook cleared successfully.")
+            await send_telegram_alert(init_client, "🚀 *Trading Bot Connected & Online!*\n\nType `/stats` or `/logs` to check status.")
+    except Exception as e:
+        print(f"[TELEGRAM INIT WARNING] Could not clear webhook: {e}")
+
     offset = 0
+    print("[TELEGRAM LISTENER] Starting long-polling loop...")
+
     while True:
         try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                try:
-                    await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=True")
-                    await send_telegram_alert(client, "🚀 *Trading Bot Connected & Online!*\n\nType `/stats` or `/logs` to check status.")
-                except Exception as clear_err:
-                    print(f"[TELEGRAM INIT WARNING] {clear_err}")
+            # Short-lived client session per request prevents stale TCP sockets
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=5"
+                res = await client.get(url)
 
-                while True:
-                    try:
-                        res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=10")
-                        
-                        if res.status_code == 200 and res.text and res.text.strip():
-                            try:
-                                data = res.json()
-                            except json.JSONDecodeError:
-                                await asyncio.sleep(2)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("ok"):
+                        for update in data.get("result", []):
+                            offset = update["update_id"] + 1
+                            message = update.get("message", {})
+                            raw_text = message.get("text", "").strip().lower()
+                            sender_chat_id = str(message.get("chat", {}).get("id", ""))
+
+                            if not sender_chat_id or not raw_text:
                                 continue
 
-                            if isinstance(data, dict) and data.get("ok") and "result" in data:
-                                updates = data["result"]
-                                for update in updates:
-                                    offset = update["update_id"] + 1
-                                    message = update.get("message", {})
-                                    raw_text = message.get("text", "").strip().lower()
-                                    sender_chat_id = str(message.get("chat", {}).get("id", ""))
+                            print(f"[TELEGRAM RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
 
-                                    if not sender_chat_id or not raw_text:
-                                        continue
+                            if raw_text.startswith("/help") or raw_text.startswith("/start"):
+                                help_msg = (
+                                    "🤖 *TRADING BOT COMMANDS:*\n\n"
+                                    "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
+                                    "• `/logs` - View details of the last 5 signals\n"
+                                    "• `/help` - Display command menu"
+                                )
+                                await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
 
-                                    print(f"[TELEGRAM RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
+                            elif raw_text.startswith("/logs"):
+                                try:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                                    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
+                                    rows = cursor.fetchall()
+                                    cursor.close()
+                                    conn.close()
 
-                                    if raw_text.startswith("/help") or raw_text.startswith("/start"):
-                                        help_msg = (
-                                            "🤖 *TRADING BOT COMMANDS:*\n\n"
-                                            "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
-                                            "• `/logs` - View details of the last 5 signals\n"
-                                            "• `/help` - Display command menu"
-                                        )
-                                        await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
+                                    if not rows:
+                                        await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
+                                    else:
+                                        log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
+                                        for r in rows:
+                                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
+                                        await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
+                                except Exception as log_err:
+                                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
 
-                                    elif raw_text.startswith("/logs"):
-                                        try:
-                                            conn = get_db_connection()
-                                            cursor = conn.cursor(cursor_factory=RealDictCursor)
-                                            cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
-                                            rows = cursor.fetchall()
-                                            cursor.close()
-                                            conn.close()
+                            elif raw_text.startswith("/stats"):
+                                try:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                                    cursor.execute("SELECT * FROM signals")
+                                    rows = cursor.fetchall()
 
-                                            if not rows:
-                                                await send_telegram_alert(client, "No trade logs recorded yet.", target_chat_id=sender_chat_id)
-                                            else:
-                                                log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
-                                                for r in rows:
-                                                    log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
-                                                await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
-                                        except Exception as log_err:
-                                            await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
+                                    executed = [r for r in rows if r['status'] == 'EXECUTED']
+                                    vetoed = [r for r in rows if r['status'] == 'VETOED']
+                                    pending = [r for r in executed if r['outcome'] == 'PENDING']
+                                    closed = [r for r in executed if r['outcome'] != 'PENDING']
 
-                                    elif raw_text.startswith("/stats"):
-                                        try:
-                                            conn = get_db_connection()
-                                            cursor = conn.cursor(cursor_factory=RealDictCursor)
-                                            cursor.execute("SELECT * FROM signals")
-                                            rows = cursor.fetchall()
+                                    wins_tp1 = len([r for r in closed if 'TP1' in str(r['outcome'])])
+                                    wins_tp2 = len([r for r in closed if 'TP2' in str(r['outcome'])])
+                                    losses = len([r for r in closed if 'LOSS' in str(r['outcome'])])
 
-                                            executed = [r for r in rows if r['status'] == 'EXECUTED']
-                                            vetoed = [r for r in rows if r['status'] == 'VETOED']
-                                            pending = [r for r in executed if r['outcome'] == 'PENDING']
-                                            closed = [r for r in executed if r['outcome'] != 'PENDING']
+                                    total_closed = len(closed)
+                                    win_rate = ((wins_tp1 + wins_tp2) / total_closed * 100) if total_closed > 0 else 0.0
 
-                                            wins_tp1 = len([r for r in closed if 'TP1' in str(r['outcome'])])
-                                            wins_tp2 = len([r for r in closed if 'TP2' in str(r['outcome'])])
-                                            losses = len([r for r in closed if 'LOSS' in str(r['outcome'])])
+                                    cursor.close()
+                                    conn.close()
 
-                                            total_closed = len(closed)
-                                            win_rate = ((wins_tp1 + wins_tp2) / total_closed * 100) if total_closed > 0 else 0.0
+                                    stats_msg = (
+                                        f"📊 *SYSTEM PERFORMANCE STATS (NEON CLOUD)*\n\n"
+                                        f"• Executed Signals: {len(executed)}\n"
+                                        f"• AI Vetoes: {len(vetoed)}\n"
+                                        f"• Pending Trades: {len(pending)}\n"
+                                        f"• Closed Trades: {total_closed}\n"
+                                        f"• Total Wins: {wins_tp1 + wins_tp2} (TP1: {wins_tp1} | TP2: {wins_tp2})\n"
+                                        f"• Total Losses: {losses}\n"
+                                        f"• Win Rate: *{win_rate:.1f}%*"
+                                    )
+                                    await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
+                                except Exception as db_err:
+                                    await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
 
-                                            cursor.close()
-                                            conn.close()
+        except httpx.TimeoutException:
+            pass
+        except Exception as e:
+            print(f"[TELEGRAM POLL ERROR] {e}")
+            await asyncio.sleep(2)
 
-                                            stats_msg = (
-                                                f"📊 *SYSTEM PERFORMANCE STATS (NEON CLOUD)*\n\n"
-                                                f"• Executed Signals: {len(executed)}\n"
-                                                f"• AI Vetoes: {len(vetoed)}\n"
-                                                f"• Pending Trades: {len(pending)}\n"
-                                                f"• Closed Trades: {total_closed}\n"
-                                                f"• Total Wins: {wins_tp1 + wins_tp2} (TP1: {wins_tp1} | TP2: {wins_tp2})\n"
-                                                f"• Total Losses: {losses}\n"
-                                                f"• Win Rate: *{win_rate:.1f}%*"
-                                            )
-                                            await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
-                                        except Exception as db_err:
-                                            await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
-
-                    except Exception as poll_err:
-                        print(f"[TELEGRAM POLL ERROR] {poll_err}")
-                        await asyncio.sleep(2)
-
-        except Exception as client_err:
-            print(f"[TELEGRAM CLIENT RESTART] {client_err}")
-            await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
 # --- FASTAPI LIFESPAN & ROUTING ---
 @asynccontextmanager

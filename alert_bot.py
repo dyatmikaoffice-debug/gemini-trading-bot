@@ -88,7 +88,7 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
     - Current Price: ${price:.2f}
-    - 5M EMA 50: ${ema50:.2f} \vert{} 5M EMA 200:${ema200:.2f}
+    - 5M EMA 50: ${ema50:.2f} | 5M EMA 200: ${ema200:.2f}
     - 15M ADX Trend Strength: {adx:.1f}
     - 5M Stoch RSI %K: {stoch_k:.1f}
 
@@ -283,7 +283,7 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
 
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} \vert{} EMA200:${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | EMA200: ${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
 
                 # Step 4: AI Analysis & Signal Dispatch
                 if proposed_action != "HOLD":
@@ -437,3 +437,107 @@ async def telegram_webhook(request: Request):
                 total_pips = 0.0
                 gross_win_pips = 0.0
                 gross_loss_pips = 0.0
+                winning_trades_count = 0
+                losing_trades_count = 0
+
+                for t in trades:
+                    entry = float(t['entry_price'])
+                    exit_p = float(t['exit_price'])
+                    action = t['action']
+                    
+                    diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                    pips = diff * 10.0
+                    
+                    total_pips += pips
+                    if pips > 0:
+                        gross_win_pips += pips
+                        winning_trades_count += 1
+                    elif pips < 0:
+                        gross_loss_pips += abs(pips)
+                        losing_trades_count += 1
+
+                avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                est_profit_usd = total_pips * 0.10
+
+                reply = (
+                    f"💵 *DETAILED PIPS & EARNINGS REPORT*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *SUMMARY:* \n"
+                    f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
+                    f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                    f"📈 *PIPS BREAKDOWN:*\n"
+                    f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                    f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                    f"🎯 *AVERAGE METRICS:*\n"
+                    f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                    f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                    f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 _Note: Calculated at $0.10/pip (0.01 lot XAU/USD)._"
+                )
+
+            elif text == "/logs":
+                cur.execute("""
+                    SELECT id, action, entry_price, exit_price, outcome, created_at 
+                    FROM signals 
+                    WHERE status = 'EXECUTED' 
+                    ORDER BY id DESC 
+                    LIMIT 10
+                """)
+                logs = cur.fetchall()
+
+                if not logs:
+                    reply = "📜 *LAST 10 TRADE LOGS:*\n\n_No executed trades found in database._"
+                else:
+                    reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    for l in logs:
+                        trade_id = l['id']
+                        action = l['action']
+                        entry = float(l['entry_price'])
+                        exit_p = float(l['exit_price']) if l['exit_price'] else None
+                        outcome = l['outcome']
+                        date_str = l['created_at'].strftime("%m-%d %H:%M") if l['created_at'] else "N/A"
+
+                        if exit_p is not None:
+                            diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                            pips = diff * 10.0
+                            pip_str = f"*{pips:+.1f} pips*"
+                        else:
+                            pip_str = "*ACTIVE / IN PROGRESS*"
+
+                        if "WIN" in outcome or "CLOSED" in outcome:
+                            icon = "🟢"
+                        elif "LOSS" in outcome:
+                            icon = "🔴"
+                        else:
+                            icon = "🟡"
+
+                        reply += (
+                            f"{icon} *ID #{trade_id}* | *{action} XAU/USD*\n"
+                            f"• Entry: *${entry:.2f}* → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                            f"• Outcome: *{outcome}*\n"
+                            f"• Result: {pip_str} | Time: `{date_str}`\n"
+                            f"──────────────────────────\n"
+                        )
+
+            elif text == "/help":
+                reply = (
+                    "🤖 *HIGH WIN-RATE BOT COMMANDS:*\n\n"
+                    "/stats - Comprehensive Win-Rate & Risk Performance Report\n"
+                    "/pips - Detailed Gross/Net Pips & USD Profit Breakdown\n"
+                    "/logs - Detailed View of Last 10 Trades & Outcomes\n"
+                    "/help - Display Interactive Command Guide"
+                )
+
+            cur.close()
+            conn.close()
+
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(url, json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"})
+
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run("alert_bot:app", host="0.0.0.0", port=8000)

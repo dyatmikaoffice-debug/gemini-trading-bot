@@ -396,12 +396,19 @@ async def background_scanning_loop():
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
+                # --- TREND-FILTERED SIGNAL EVALUATION ---
+                # 1. Divergence Signals (Only accepted if NOT counter to strong trend)
                 if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)":
-                    proposed_action = "BUY"
-                    trigger_type = "Divergence Reversal"
+                    if c_5m > ema_5m or c_5m > vwap_5m:
+                        proposed_action = "BUY"
+                        trigger_type = "Divergence Reversal"
+
                 elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)":
-                    proposed_action = "SELL"
-                    trigger_type = "Divergence Reversal"
+                    if c_5m < ema_5m or c_5m < vwap_5m:
+                        proposed_action = "SELL"
+                        trigger_type = "Divergence Reversal"
+
+                # 2. Pure Trend Continuation Signals
                 elif is_5m_bull and stoch_buy_cross:
                     proposed_action = "BUY"
                     trigger_type = "Trend Setup"

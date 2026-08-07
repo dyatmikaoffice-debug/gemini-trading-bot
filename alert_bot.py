@@ -215,4 +215,225 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
             conn.commit()
             logging.info(f"[TRADE TRACKER] Signal ID {trade_id} updated -> {new_outcome}")
 
-    cur.close
+    cur.close()
+    conn.close()
+
+# ---------------------------------------------------------
+# BACKGROUND MARKET SCANNER
+# ---------------------------------------------------------
+async def background_scanning_loop():
+    while True:
+        try:
+            url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=100&apikey={TWELVE_DATA_API_KEY}"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(url)
+                data = res.json()
+
+            if "values" in data:
+                df = pd.DataFrame(data['values'])
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = df[col].astype(float)
+                df = df.sort_values('datetime').reset_index(drop=True)
+
+                df = calculate_indicators(df)
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+
+                price = float(latest['close'])
+                ema50 = float(latest['ema50'])
+                ema200 = float(latest['ema200'])
+                adx = float(latest['adx'])
+                stoch_k = float(latest['stoch_k'])
+                stoch_d = float(latest['stoch_d'])
+                atr = float(latest['atr'])
+
+                high_3c = float(df['high'].tail(3).max())
+                low_3c = float(df['low'].tail(3).min())
+
+                update_open_trades(price, high_3c, low_3c)
+
+                # Step 1: Multi-Timeframe Trend Lock Filter
+                proposed_action = "HOLD"
+                is_uptrend = (price > ema200) and (ema50 > ema200)
+                is_downtrend = (price < ema200) and (ema50 < ema200)
+
+                # Step 2: ADX & Stochastic Entry Check
+                if adx >= 20.0:
+                    if is_uptrend:
+                        if (adx >= 35.0 and stoch_k < 50 and prev['stoch_k'] <= prev['stoch_d'] and stoch_k > stoch_d) or \
+                           (stoch_k < 20 and prev['stoch_k'] <= prev['stoch_d'] and stoch_k > stoch_d):
+                            proposed_action = "BUY"
+
+                    elif is_downtrend:
+                        if (adx >= 35.0 and stoch_k > 50 and prev['stoch_k'] >= prev['stoch_d'] and stoch_k < stoch_d) or \
+                           (stoch_k > 80 and prev['stoch_k'] >= prev['stoch_d'] and stoch_k < stoch_d):
+                            proposed_action = "SELL"
+
+                # Step 3: State-Aware Cooldown Guard
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT entry_price, outcome FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1")
+                last_trade = cur.fetchone()
+                
+                min_distance = 6.0
+                if last_trade and last_trade['outcome'] in ['WIN (TP1 HIT)', 'WIN (TP2 HIT)', 'CLOSED (TP1 HIT / SL BE)']:
+                    min_distance = 3.0
+
+                if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
+                    proposed_action = "HOLD"
+
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} \vert{} EMA200:${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+
+                # Step 4: AI Analysis & Signal Dispatch
+                if proposed_action != "HOLD":
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, stoch_k, ema50, ema200)
+                    
+                    sl_dist = max(4.5, min(8.0, atr * 2.0))
+                    tp1_dist = sl_dist * 1.5
+                    tp2_dist = sl_dist * 3.0
+
+                    if proposed_action == "BUY":
+                        sl = price - sl_dist
+                        tp1 = price + tp1_dist
+                        tp2 = price + tp2_dist
+                    else:
+                        sl = price + sl_dist
+                        tp1 = price - tp1_dist
+                        tp2 = price - tp2_dist
+
+                    status_str = "EXECUTED" if ai_decision == "APPROVE" else "VETOED"
+                    
+                    cur.execute("""
+                        INSERT INTO signals (action, entry_price, sl_price, tp1_price, tp2_price, status, outcome, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', NOW())
+                        RETURNING id;
+                    """, (proposed_action, float(price), float(sl), float(tp1), float(tp2), status_str))
+                    conn.commit()
+                    new_id = cur.fetchone()['id']
+
+                    if ai_decision == "APPROVE":
+                        msg = f"⚡ *HIGH WIN-RATE SIGNAL #{new_id}*\n\n" \
+                              f"Action: *{proposed_action} XAU/USD*\n" \
+                              f"Entry Price: *${price:.2f}*\n" \
+                              f"Stop Loss: *${sl:.2f}*\n" \
+                              f"Take Profit 1: *${tp1:.2f}*\n" \
+                              f"Take Profit 2: *${tp2:.2f}*\n" \
+                              f"Trend ADX: *{adx:.1f}*"
+                        await send_telegram_alert(msg)
+
+                cur.close()
+                conn.close()
+
+            del df
+            gc.collect()
+
+        except Exception as e:
+            logging.error(f"[SCANNER EXCEPTION] {e}")
+
+        await asyncio.sleep(360)
+
+# ---------------------------------------------------------
+# FASTAPI APP INITIALIZATION & LIFESPAN
+# ---------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(background_scanning_loop())
+    await setup_auto_webhook()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def root():
+    return {"status": "Live", "bot": "Gold Auto Signal Bot V2 High Win-Rate"}
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    
+    if "message" in data:
+        message = data["message"]
+        chat_id = str(message.get("chat", {}).get("id"))
+        text = message.get("text", "").strip()
+
+        if text in ["/stats", "/logs", "/pips", "/help"]:
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            if text == "/stats":
+                cur.execute("SELECT COUNT(*) as total FROM signals WHERE status = 'EXECUTED'")
+                total_executed = cur.fetchone()['total'] or 0
+
+                cur.execute("SELECT COUNT(*) as vetoes FROM signals WHERE status = 'VETOED'")
+                total_vetoes = cur.fetchone()['vetoes'] or 0
+
+                cur.execute("SELECT COUNT(*) as pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+                total_pending = cur.fetchone()['pending'] or 0
+
+                cur.execute("SELECT COUNT(*) as tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
+                tp1_wins = cur.fetchone()['tp1_wins'] or 0
+
+                cur.execute("SELECT COUNT(*) as tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
+                tp2_wins = cur.fetchone()['tp2_wins'] or 0
+
+                cur.execute("SELECT COUNT(*) as losses FROM signals WHERE outcome LIKE 'LOSS%'")
+                losses = cur.fetchone()['losses'] or 0
+
+                cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                closed_trades = cur.fetchall()
+
+                total_pips = 0.0
+                win_pips = 0.0
+                loss_pips = 0.0
+                total_wins_count = tp1_wins + tp2_wins
+
+                for t in closed_trades:
+                    entry = float(t['entry_price'])
+                    exit_p = float(t['exit_price'])
+                    action = t['action']
+                    
+                    diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                    pips = diff * 10.0
+                    
+                    total_pips += pips
+                    if pips > 0:
+                        win_pips += pips
+                    else:
+                        loss_pips += abs(pips)
+
+                win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                est_dollar = total_pips * 0.10
+                avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
+
+                reply = (
+                    f"📊 *DETAILED PERFORMANCE REPORT*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 *NET PIPS & PROFIT:*\n"
+                    f"• Net Pips: *{total_pips:+.1f} pips*\n"
+                    f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
+                    f"📈 *WIN / LOSS BREAKDOWN:*\n"
+                    f"• Total Executed: *{total_executed}*\n"
+                    f"• Total Wins: *{total_wins_count}* ({win_rate:.1f}%)\n"
+                    f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                    f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
+                    f"• Total Losses (SL Hit): *{losses}*\n"
+                    f"• Active Pending: *{total_pending}*\n\n"
+                    f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
+                    f"• Total Signals: *{total_executed + total_vetoes}*\n"
+                    f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
+                    f"🎯 *RISK & TRADE METRICS:*\n"
+                    f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                    f"• Profit Factor: *{profit_factor:.2f}*\n"
+                    f"• Win Rate: *{win_rate:.1f}%*"
+                )
+
+            elif text == "/pips":
+                cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                trades = cur.fetchall()
+
+                total_pips = 0.0
+                gross_win_pips = 0.0
+                gross_loss_pips = 0.0

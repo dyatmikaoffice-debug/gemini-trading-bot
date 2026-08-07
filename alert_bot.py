@@ -1,7 +1,8 @@
 import os
 import json
 import asyncio
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import httpx
@@ -20,6 +21,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Initialize Clients
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -30,7 +32,6 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 EXCHANGE = "OANDA"
-DB_FILE = "trade_logs.db"
 
 # Cooldown Tracker
 LAST_SIGNAL_ACTION = "HOLD"
@@ -43,45 +44,64 @@ class SignalOutput(BaseModel):
     reasoning: str = Field(default="Market conditions do not favor entry.", description="2 clean sentences explaining the setup decision or veto reason.")
 
 
-# --- SQLITE PAPER-TRADING LOGGING & TRACKING SYSTEM ---
+# --- NEON POSTGRESQL DATABASE SYSTEM ---
+def get_db_connection():
+    """Establishes connection to Neon PostgreSQL instance."""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing.")
+    return psycopg2.connect(DATABASE_URL)
+
+
 def init_db():
-    """Initializes SQLite database table with trade outcome tracking columns."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            status TEXT NOT NULL,
-            action TEXT NOT NULL,
-            trigger_type TEXT NOT NULL,
-            price REAL NOT NULL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            confidence REAL,
-            adx_15m REAL,
-            stoch_rsi_15m REAL,
-            divergence_type TEXT,
-            reasoning TEXT,
-            outcome TEXT DEFAULT 'PENDING',
-            exit_price REAL,
-            outcome_timestamp TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    """Initializes PostgreSQL table structure on Neon if not exists."""
+    if not DATABASE_URL:
+        print("[DATABASE WARNING] DATABASE_URL missing. Skipping PostgreSQL init.")
+        return
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id SERIAL PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                status TEXT NOT NULL,
+                action TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                price REAL NOT NULL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                confidence REAL,
+                adx_15m REAL,
+                stoch_rsi_15m REAL,
+                divergence_type TEXT,
+                reasoning TEXT,
+                outcome TEXT DEFAULT 'PENDING',
+                exit_price REAL,
+                outcome_timestamp TEXT
+            );
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("[NEON DATABASE] Table structure verified successfully.")
+    except Exception as e:
+        print(f"[NEON DATABASE ERROR] Initialization failed: {e}")
 
 
 def log_trade_signal(status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float, confidence: float, adx_15m: float, stoch_15m: float, divergence: str, reasoning: str):
-    """Logs executed trades and AI veto decisions to SQLite database."""
+    """Logs executed trades and AI veto decisions to Neon PostgreSQL."""
+    if not DATABASE_URL:
+        return
+
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         initial_outcome = "PENDING" if status == "EXECUTED" else "N/A"
         cursor.execute("""
             INSERT INTO signals (timestamp, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, outcome)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             datetime.now(timezone.utc).isoformat(),
             status,
@@ -99,93 +119,99 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
             initial_outcome
         ))
         conn.commit()
+        cursor.close()
         conn.close()
-        print(f"[PAPER TRADER LOG] Signal recorded successfully with status: {status}")
+        print(f"[NEON LOG] Signal recorded successfully with status: {status}")
     except Exception as e:
-        print(f"Failed to log trade to SQLite: {e}")
+        print(f"Failed to log trade to Neon: {e}")
 
 
 def update_trade_outcomes():
     """Evaluates pending trades against recent candle Highs/Lows to mark TP1, TP2, or SL hits."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
-    pending_signals = cursor.fetchall()
-
-    if not pending_signals:
-        conn.close()
+    if not DATABASE_URL:
         return
 
-    # Fetch recent 5M candles for verification
-    df_5m = fetch_twelve_data("5min", outputsize=100)
-    if df_5m.empty:
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+        pending_signals = cursor.fetchall()
+
+        if not pending_signals:
+            cursor.close()
+            conn.close()
+            return
+
+        df_5m = fetch_twelve_data("5min", outputsize=100)
+        if df_5m.empty:
+            cursor.close()
+            conn.close()
+            return
+
+        now_utc = datetime.now(timezone.utc)
+
+        for sig in pending_signals:
+            sig_id = sig["id"]
+            sig_time = datetime.fromisoformat(sig["timestamp"])
+            action = sig["action"]
+            sl = sig["sl"]
+            tp1 = sig["tp1"]
+            tp2 = sig["tp2"]
+
+            candles_after = df_5m[df_5m["datetime"] >= sig_time]
+            if candles_after.empty:
+                continue
+
+            outcome = "PENDING"
+            exit_price = None
+
+            for _, candle in candles_after.iterrows():
+                high = candle["High"]
+                low = candle["Low"]
+
+                if action == "BUY":
+                    if low <= sl:
+                        outcome = "HIT_SL"
+                        exit_price = sl
+                        break
+                    elif high >= tp2:
+                        outcome = "HIT_TP2"
+                        exit_price = tp2
+                        break
+                    elif high >= tp1 and outcome != "HIT_TP1":
+                        outcome = "HIT_TP1"
+                        exit_price = tp1
+
+                elif action == "SELL":
+                    if high >= sl:
+                        outcome = "HIT_SL"
+                        exit_price = sl
+                        break
+                    elif low <= tp2:
+                        outcome = "HIT_TP2"
+                        exit_price = tp2
+                        break
+                    elif low <= tp1 and outcome != "HIT_TP1":
+                        outcome = "HIT_TP1"
+                        exit_price = tp1
+
+            if outcome == "PENDING" and (now_utc - sig_time) > timedelta(hours=24):
+                outcome = "EXPIRED"
+                exit_price = candles_after.iloc[-1]["Close"]
+
+            if outcome != "PENDING":
+                cursor.execute("""
+                    UPDATE signals 
+                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s 
+                    WHERE id = %s
+                """, (outcome, exit_price, datetime.now(timezone.utc).isoformat(), sig_id))
+                conn.commit()
+                print(f"[OUTCOME TRACKER] Signal #{sig_id} ({action}) updated to: {outcome} at ${exit_price}")
+
+        cursor.close()
         conn.close()
-        return
-
-    now_utc = datetime.now(timezone.utc)
-
-    for sig in pending_signals:
-        sig_id = sig["id"]
-        sig_time = datetime.fromisoformat(sig["timestamp"])
-        action = sig["action"]
-        sl = sig["sl"]
-        tp1 = sig["tp1"]
-        tp2 = sig["tp2"]
-
-        # Filter candles occurring AFTER signal generation
-        candles_after = df_5m[df_5m["datetime"] >= sig_time]
-        if candles_after.empty:
-            continue
-
-        outcome = "PENDING"
-        exit_price = None
-
-        for _, candle in candles_after.iterrows():
-            high = candle["High"]
-            low = candle["Low"]
-
-            if action == "BUY":
-                if low <= sl:
-                    outcome = "HIT_SL"
-                    exit_price = sl
-                    break
-                elif high >= tp2:
-                    outcome = "HIT_TP2"
-                    exit_price = tp2
-                    break
-                elif high >= tp1 and outcome != "HIT_TP1":
-                    outcome = "HIT_TP1"
-                    exit_price = tp1
-
-            elif action == "SELL":
-                if high >= sl:
-                    outcome = "HIT_SL"
-                    exit_price = sl
-                    break
-                elif low <= tp2:
-                    outcome = "HIT_TP2"
-                    exit_price = tp2
-                    break
-                elif low <= tp1 and outcome != "HIT_TP1":
-                    outcome = "HIT_TP1"
-                    exit_price = tp1
-
-        # Timeout trade if unfulfilled after 24 hours
-        if outcome == "PENDING" and (now_utc - sig_time) > timedelta(hours=24):
-            outcome = "EXPIRED"
-            exit_price = candles_after.iloc[-1]["Close"]
-
-        if outcome != "PENDING":
-            cursor.execute("""
-                UPDATE signals 
-                SET outcome = ?, exit_price = ?, outcome_timestamp = ? 
-                WHERE id = ?
-            """, (outcome, exit_price, datetime.now(timezone.utc).isoformat(), sig_id))
-            conn.commit()
-            print(f"[OUTCOME TRACKER] Signal #{sig_id} ({action}) updated to: {outcome} at ${exit_price}")
-
-    conn.close()
+    except Exception as e:
+        print(f"Outcome evaluation error: {e}")
 
 
 def send_telegram_message(message: str):
@@ -211,7 +237,10 @@ def send_telegram_message(message: str):
 
 def format_stats_message() -> str:
     """Formats system statistics for Telegram direct response."""
-    conn = sqlite3.connect(DB_FILE)
+    if not DATABASE_URL:
+        return "Database not configured."
+
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'EXECUTED'")
@@ -235,13 +264,14 @@ def format_stats_message() -> str:
     cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'PENDING'")
     pending = cursor.fetchone()[0]
     
+    cursor.close()
     conn.close()
 
     closed_trades = wins + losses
     win_rate = round((wins / closed_trades * 100), 1) if closed_trades > 0 else 0.0
 
     return (
-        f"📊 SYSTEM PERFORMANCE STATS\n\n"
+        f"📊 SYSTEM PERFORMANCE STATS (NEON CLOUD)\n\n"
         f"• Executed Signals: {total_executed}\n"
         f"• AI Vetoes: {total_vetoed}\n"
         f"• Pending Trades: {pending}\n"
@@ -254,11 +284,14 @@ def format_stats_message() -> str:
 
 def format_recent_logs_message(limit: int = 5) -> str:
     """Formats the latest logged signals for Telegram direct response."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+    if not DATABASE_URL:
+        return "Database not configured."
+
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT %s", (limit,))
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
 
     if not rows:
@@ -296,7 +329,6 @@ async def telegram_polling_loop():
                         message = update.get("message", {})
                         text = message.get("text", "").strip()
 
-                        # Strip command handles if present (e.g., /stats@botname)
                         cmd = text.split("@")[0].lower()
 
                         if cmd == "/stats":
@@ -506,7 +538,6 @@ def get_mtf_data():
 def analyze_and_alert():
     global LAST_SIGNAL_ACTION, LAST_SIGNAL_PRICE
 
-    # Update outcomes of existing open trades
     update_trade_outcomes()
 
     print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
@@ -549,9 +580,8 @@ def analyze_and_alert():
 
     trigger_type = "Divergence Reversal" if (is_bull_div or is_bear_div) else "Trend Setup"
 
-    # --- CAPPED RISK SL & TP MATH ---
     active_atr = mtf["5m"]["atr"]
-    max_allowed_risk = round(2.0 * active_atr, 2)  # Caps SL distance to max 2x ATR
+    max_allowed_risk = round(2.0 * active_atr, 2)
 
     if candidate_action == "BUY":
         raw_risk = price - mtf["5m"]["swing_low"]
@@ -728,25 +758,31 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Trading bot background scanner, outcome tracker, and Telegram listener are active!"}
+    return {"status": "ok", "message": "Trading bot background scanner, outcome tracker, and Telegram listener are active on Neon PostgreSQL!"}
 
 
 @app.get("/logs")
 def get_trade_logs(limit: int = 50):
-    """Retrieves paper trading signal history and live outcome statuses."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+    """Retrieves paper trading signal history from Neon."""
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URL environment variable missing"}
+
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT %s", (limit,))
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
-    return {"count": len(rows), "logs": [dict(row) for row in rows]}
+    return {"count": len(rows), "logs": rows}
 
 
 @app.get("/stats")
 def get_trade_stats():
-    """Retrieves live win/loss performance, win rate %, and AI veto counts."""
-    conn = sqlite3.connect(DB_FILE)
+    """Retrieves live win/loss performance stats from Neon."""
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URL environment variable missing"}
+
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("SELECT COUNT(*) FROM signals WHERE status = 'EXECUTED'")
@@ -770,6 +806,7 @@ def get_trade_stats():
     cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome = 'PENDING'")
     pending = cursor.fetchone()[0]
     
+    cursor.close()
     conn.close()
 
     closed_trades = wins + losses

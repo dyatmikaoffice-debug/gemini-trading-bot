@@ -184,7 +184,6 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
 
 # --- INDICATORS CALCULATIONS ---
 def calculate_metrics(df: pd.DataFrame):
-    # Truncate dataframe to tail 100 rows to optimize memory
     df = df.tail(100).copy()
     
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -422,7 +421,6 @@ async def background_scanning_loop():
                     else:
                         log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
 
-                # Explicitly delete references and collect garbage to keep RAM low
                 del df_5m, df_15m, df_1h
                 gc.collect()
 
@@ -448,9 +446,37 @@ async def telegram_polling_loop():
                     for update in data["result"]:
                         offset = update["update_id"] + 1
                         message = update.get("message", {})
-                        text = message.get("text", "")
+                        text = message.get("text", "").strip()
 
-                        if text == "/stats":
+                        if text == "/help":
+                            help_msg = (
+                                "🤖 *TRADING BOT COMMANDS:*\n\n"
+                                "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
+                                "• `/logs` - View details of the last 5 signals\n"
+                                "• `/help` - Display command menu"
+                            )
+                            await send_telegram_alert(client, help_msg)
+
+                        elif text == "/logs":
+                            try:
+                                conn = get_db_connection()
+                                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                                cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
+                                rows = cursor.fetchall()
+                                cursor.close()
+                                conn.close()
+
+                                if not rows:
+                                    await send_telegram_alert(client, "No trade logs recorded yet.")
+                                else:
+                                    log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
+                                    for r in rows:
+                                        log_text += f"• *ID {r['id']}* | {r['action']} @ ${r['price']:.2f} | Status: `{r['status']}` ({r['outcome']})\n"
+                                    await send_telegram_alert(client, log_text)
+                            except Exception as log_err:
+                                await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}")
+
+                        elif text == "/stats":
                             try:
                                 conn = get_db_connection()
                                 cursor = conn.cursor(cursor_factory=RealDictCursor)

@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# --- ENVIRONMENT VARIABLES & AGGRESSIVE SANITIZATION ---
+# --- ENVIRONMENT VARIABLES & SANITIZATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -481,9 +481,12 @@ async def telegram_polling_loop():
 
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         try:
-            del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
+            del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=True")
             print(f"[TELEGRAM] Webhook clear status: {del_res.status_code}")
             await asyncio.sleep(1.0)
+            
+            # Send immediate connection ping to phone on boot
+            await send_telegram_alert(client, "🚀 *Trading Bot Connected & Online!*\n\nType `/stats` or `/logs` to check status.")
         except Exception as e:
             print(f"[TELEGRAM WARNING] Webhook clear failed: {e}")
 
@@ -500,7 +503,8 @@ async def telegram_polling_loop():
                         continue
 
                     if isinstance(data, dict) and data.get("ok") and "result" in data:
-                        for update in data["result"]:
+                        updates = data["result"]
+                        for update in updates:
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
                             raw_text = message.get("text", "").strip().lower()
@@ -509,7 +513,9 @@ async def telegram_polling_loop():
                             if not sender_chat_id or not raw_text:
                                 continue
 
-                            if raw_text.startswith("/help"):
+                            print(f"[TELEGRAM RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
+
+                            if raw_text.startswith("/help") or raw_text.startswith("/start"):
                                 help_msg = (
                                     "🤖 *TRADING BOT COMMANDS:*\n\n"
                                     "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"

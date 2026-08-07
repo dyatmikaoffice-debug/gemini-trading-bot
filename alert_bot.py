@@ -173,7 +173,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
         exit_price = None
 
         if action == "BUY":
-            # Check 1: Stop Loss Hit (Evaluated First)
+            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if low_3c <= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
@@ -181,7 +181,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Check 2: Take Profit Targets
+            # Priority Check 2: Take Profit Targets
             elif high_3c >= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -190,7 +190,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 exit_price = tp1
 
         elif action == "SELL":
-            # Check 1: Stop Loss Hit (Evaluated First)
+            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if high_3c >= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
@@ -198,7 +198,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Check 2: Take Profit Targets
+            # Priority Check 2: Take Profit Targets
             elif low_3c <= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -401,3 +401,54 @@ async def telegram_webhook(request: Request):
                         win_pips += pips
                     else:
                         loss_pips += abs(pips)
+
+                win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                est_dollar = total_pips * 0.10
+                avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
+
+                reply = (
+                    f"📊 *DETAILED PERFORMANCE REPORT*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 *NET PIPS & PROFIT:*\n"
+                    f"• Net Pips: *{total_pips:+.1f} pips*\n"
+                    f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
+                    f"📈 *WIN / LOSS BREAKDOWN:*\n"
+                    f"• Total Executed: *{total_executed}*\n"
+                    f"• Total Wins: *{total_wins_count}* ({win_rate:.1f}%)\n"
+                    f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                    f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
+                    f"• Total Losses (SL Hit): *{losses}*\n"
+                    f"• Active Pending: *{total_pending}*\n\n"
+                    f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
+                    f"• Total Signals: *{total_executed + total_vetoes}*\n"
+                    f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
+                    f"🎯 *RISK & TRADE METRICS:*\n"
+                    f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                    f"• Profit Factor: *{profit_factor:.2f}*\n"
+                    f"• Win Rate: *{win_rate:.1f}%*"
+                )
+
+            elif text == "/pips":
+                cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                trades = cur.fetchall()
+
+                total_pips = 0.0
+                gross_win_pips = 0.0
+                gross_loss_pips = 0.0
+                winning_trades_count = 0
+                losing_trades_count = 0
+
+                for t in trades:
+                    entry = float(t['entry_price'])
+                    exit_p = float(t['exit_price'])
+                    action = t['action']
+                    
+                    diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                    pips = diff * 10.0
+                    
+                    total_pips += pips
+                    if pips > 0:
+                        gross_win_pips += pips
+                        winning_

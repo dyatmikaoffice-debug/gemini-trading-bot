@@ -43,10 +43,6 @@ groq_client = OpenAI(
 SYMBOL = "XAU/USD"
 EXCHANGE = "TDEX"
 
-# Cooldown Tracker & State
-LAST_SIGNAL_ACTION = "HOLD"
-LAST_SIGNAL_PRICE = 0.0
-
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
@@ -129,7 +125,6 @@ def update_open_trades(current_high: float, current_low: float):
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        # Query both PENDING trades and trades that hit TP1 but are actively tracking toward TP2
         cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')")
         open_trades = cursor.fetchall()
 
@@ -155,44 +150,35 @@ def update_open_trades(current_high: float, current_low: float):
             exit_price = None
 
             if action == "BUY":
-                # Check TP2 hit first
                 if tp2 is not None and c_high >= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                # If TP1 was previously hit, check Break-Even (Entry Price) stop
                 elif current_outcome == "WIN (TP1 HIT)":
                     if c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved in calculations
-                # First time touching TP1
+                        exit_price = tp1  # Retain TP1 price for calculations
                 elif tp1 is not None and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
-                # Initial Stop Loss hit before TP1
                 elif sl is not None and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
 
             elif action == "SELL":
-                # Check TP2 hit first
                 if tp2 is not None and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                # If TP1 was previously hit, check Break-Even (Entry Price) stop
                 elif current_outcome == "WIN (TP1 HIT)":
                     if c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved in calculations
-                # First time touching TP1
+                        exit_price = tp1  # Retain TP1 price for calculations
                 elif tp1 is not None and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
-                # Initial Stop Loss hit before TP1
                 elif sl is not None and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
 
-            # Only commit update if progress was made
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
                     UPDATE signals 
@@ -366,8 +352,6 @@ Respond strictly in valid JSON matching schema:
 
 # --- BACKGROUND SCANNING LOOP ---
 async def background_scanning_loop():
-    global LAST_SIGNAL_ACTION, LAST_SIGNAL_PRICE
-    
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
@@ -442,11 +426,33 @@ async def background_scanning_loop():
                     proposed_action = "SELL"
                     trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
 
-                # Distance & Cooldown Guard ($6.00 distance)
+                # --- OPTION 2: STATE-AWARE COOLDOWN & DISTANCE GUARD ---
                 if proposed_action != "HOLD":
-                    if proposed_action == LAST_SIGNAL_ACTION and abs(curr_price - LAST_SIGNAL_PRICE) < 6.0:
-                        print(f"Skipping: Price within $6.00 of previous {proposed_action} alert.")
-                        proposed_action = "HOLD"
+                    try:
+                        conn = get_db_connection()
+                        cursor = conn.cursor(cursor_factory=RealDictCursor)
+                        cursor.execute("""
+                            SELECT price, outcome FROM signals 
+                            WHERE status = 'EXECUTED' AND action = %s 
+                            ORDER BY id DESC LIMIT 1
+                        """, (proposed_action,))
+                        last_trade = cursor.fetchone()
+                        cursor.close()
+                        conn.close()
+
+                        if last_trade:
+                            last_entry_price = float(last_trade['price'])
+                            last_outcome = str(last_trade['outcome'])
+                            
+                            # If previous trade is active & PENDING, require full $6.00 distance to prevent double exposure
+                            # If previous trade hit TP1/BE/SL, reduce required distance to $3.00 to allow fast re-entries
+                            required_distance = 6.0 if last_outcome == "PENDING" else 3.0
+
+                            if abs(curr_price - last_entry_price) < required_distance:
+                                print(f"[STATE-AWARE COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f} (Status: {last_outcome}).")
+                                proposed_action = "HOLD"
+                    except Exception as cd_err:
+                        print(f"[STATE-AWARE COOLDOWN ERROR] {cd_err}")
 
                 # --- VISIBLE SCAN STATUS LOGS ---
                 if proposed_action == "HOLD":
@@ -470,9 +476,6 @@ async def background_scanning_loop():
                         tp2_price = curr_price - (sl_dist * tp2_mult)
 
                     if ai_decision.action == proposed_action:
-                        LAST_SIGNAL_ACTION = proposed_action
-                        LAST_SIGNAL_PRICE = curr_price
-
                         log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
 
                         msg = (
@@ -508,7 +511,6 @@ async def background_scanning_loop():
 async def lifespan(app: FastAPI):
     init_db()
 
-    # Automatically register Webhook with Telegram on server startup (api.telegram.org)
     if TELEGRAM_BOT_TOKEN:
         try:
             webhook_endpoint = "https://divergent-confluence-trading-bot.onrender.com/telegram-webhook"

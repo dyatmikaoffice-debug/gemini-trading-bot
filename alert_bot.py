@@ -466,10 +466,23 @@ async def background_scanning_loop():
 
             await asyncio.sleep(360)
 
-# --- FASTAPI LIFESPAN & ROUTING ---
+# --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+
+    # Automatically register Webhook with Telegram on server startup
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            webhook_endpoint = "https://divergent-confluence-trading-bot.onrender.com/telegram-webhook"
+            set_url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(set_url)
+                print(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
+        except Exception as e:
+            print(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
+
     scan_task = asyncio.create_task(background_scanning_loop())
     yield
     scan_task.cancel()

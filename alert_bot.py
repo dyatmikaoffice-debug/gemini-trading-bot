@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Clean Telegram token (strip 'bot' if user included it in Env Vars to prevent double prefix)
+# Clean Telegram token (strip 'bot' prefix if user included it in Env Vars)
 if RAW_BOT_TOKEN.startswith("bot"):
     TELEGRAM_BOT_TOKEN = RAW_BOT_TOKEN[3:]
 else:
@@ -102,7 +102,6 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         cursor = conn.cursor()
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         
-        # Cast NumPy types explicitly to standard Python floats
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -194,7 +193,11 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
     res = await client.get(url)
     if res.status_code != 200 or not res.text:
         return None
-    data = res.json()
+    try:
+        data = res.json()
+    except Exception:
+        return None
+
     if "values" not in data:
         return None
     df = pd.DataFrame(data["values"])
@@ -476,6 +479,7 @@ async def telegram_polling_loop():
         try:
             del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
             print(f"[TELEGRAM] Webhook clear status: {del_res.status_code}")
+            await asyncio.sleep(1.0)  # Pause to let Telegram finalize session clearing
         except Exception as e:
             print(f"[TELEGRAM WARNING] Webhook clear failed: {e}")
 
@@ -483,10 +487,16 @@ async def telegram_polling_loop():
         while True:
             try:
                 res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=5")
-                if res.status_code == 200 and res.text:
-                    data = res.json()
+                
+                # Safely parse JSON response without raising unhandled exceptions
+                if res.status_code == 200 and res.text and res.text.strip():
+                    try:
+                        data = res.json()
+                    except json.JSONDecodeError:
+                        await asyncio.sleep(2)
+                        continue
 
-                    if data.get("ok") and "result" in data:
+                    if isinstance(data, dict) and data.get("ok") and "result" in data:
                         for update in data["result"]:
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
@@ -559,8 +569,6 @@ async def telegram_polling_loop():
                                     await send_telegram_alert(client, stats_msg, target_chat_id=sender_chat_id)
                                 except Exception as db_err:
                                     await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}", target_chat_id=sender_chat_id)
-                else:
-                    print(f"[TELEGRAM POLLING WARNING] Code {res.status_code}: {res.text}")
 
             except Exception as e:
                 print(f"Error in Telegram polling loop: {e}")

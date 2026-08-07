@@ -172,14 +172,19 @@ def update_open_trades(current_high: float, current_low: float):
 async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100):
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={timeframe}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     res = await client.get(url)
+    if res.status_code != 200 or not res.text:
+        return None
     data = res.json()
     if "values" not in data:
         return None
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    
+    # Safely convert available numeric columns without requiring 'volume'
+    for col in ["open", "high", "low", "close"]:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
     return df
 
 # --- INDICATORS CALCULATIONS ---
@@ -440,77 +445,78 @@ async def telegram_polling_loop():
         while True:
             try:
                 res = await client.get(f"{url}?offset={offset}&timeout=5")
-                data = res.json()
+                if res.status_code == 200 and res.text:
+                    data = res.json()
 
-                if "result" in data:
-                    for update in data["result"]:
-                        offset = update["update_id"] + 1
-                        message = update.get("message", {})
-                        text = message.get("text", "").strip()
+                    if "result" in data:
+                        for update in data["result"]:
+                            offset = update["update_id"] + 1
+                            message = update.get("message", {})
+                            text = message.get("text", "").strip()
 
-                        if text == "/help":
-                            help_msg = (
-                                "🤖 *TRADING BOT COMMANDS:*\n\n"
-                                "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
-                                "• `/logs` - View details of the last 5 signals\n"
-                                "• `/help` - Display command menu"
-                            )
-                            await send_telegram_alert(client, help_msg)
-
-                        elif text == "/logs":
-                            try:
-                                conn = get_db_connection()
-                                cursor = conn.cursor(cursor_factory=RealDictCursor)
-                                cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
-                                rows = cursor.fetchall()
-                                cursor.close()
-                                conn.close()
-
-                                if not rows:
-                                    await send_telegram_alert(client, "No trade logs recorded yet.")
-                                else:
-                                    log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
-                                    for r in rows:
-                                        log_text += f"• *ID {r['id']}* | {r['action']} @ ${r['price']:.2f} | Status: `{r['status']}` ({r['outcome']})\n"
-                                    await send_telegram_alert(client, log_text)
-                            except Exception as log_err:
-                                await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}")
-
-                        elif text == "/stats":
-                            try:
-                                conn = get_db_connection()
-                                cursor = conn.cursor(cursor_factory=RealDictCursor)
-                                cursor.execute("SELECT * FROM signals")
-                                rows = cursor.fetchall()
-
-                                executed = [r for r in rows if r['status'] == 'EXECUTED']
-                                vetoed = [r for r in rows if r['status'] == 'VETOED']
-                                pending = [r for r in executed if r['outcome'] == 'PENDING']
-                                closed = [r for r in executed if r['outcome'] != 'PENDING']
-
-                                wins_tp1 = len([r for r in closed if 'TP1' in str(r['outcome'])])
-                                wins_tp2 = len([r for r in closed if 'TP2' in str(r['outcome'])])
-                                losses = len([r for r in closed if 'LOSS' in str(r['outcome'])])
-
-                                total_closed = len(closed)
-                                win_rate = ((wins_tp1 + wins_tp2) / total_closed * 100) if total_closed > 0 else 0.0
-
-                                cursor.close()
-                                conn.close()
-
-                                stats_msg = (
-                                    f"📊 *SYSTEM PERFORMANCE STATS (NEON CLOUD)*\n\n"
-                                    f"• Executed Signals: {len(executed)}\n"
-                                    f"• AI Vetoes: {len(vetoed)}\n"
-                                    f"• Pending Trades: {len(pending)}\n"
-                                    f"• Closed Trades: {total_closed}\n"
-                                    f"• Total Wins: {wins_tp1 + wins_tp2} (TP1: {wins_tp1} | TP2: {wins_tp2})\n"
-                                    f"• Total Losses: {losses}\n"
-                                    f"• Win Rate: *{win_rate:.1f}%*"
+                            if text == "/help":
+                                help_msg = (
+                                    "🤖 *TRADING BOT COMMANDS:*\n\n"
+                                    "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
+                                    "• `/logs` - View details of the last 5 signals\n"
+                                    "• `/help` - Display command menu"
                                 )
-                                await send_telegram_alert(client, stats_msg)
-                            except Exception as db_err:
-                                await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}")
+                                await send_telegram_alert(client, help_msg)
+
+                            elif text == "/logs":
+                                try:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                                    cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
+                                    rows = cursor.fetchall()
+                                    cursor.close()
+                                    conn.close()
+
+                                    if not rows:
+                                        await send_telegram_alert(client, "No trade logs recorded yet.")
+                                    else:
+                                        log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
+                                        for r in rows:
+                                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${r['price']:.2f} | Status: `{r['status']}` ({r['outcome']})\n"
+                                        await send_telegram_alert(client, log_text)
+                                except Exception as log_err:
+                                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}")
+
+                            elif text == "/stats":
+                                try:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                                    cursor.execute("SELECT * FROM signals")
+                                    rows = cursor.fetchall()
+
+                                    executed = [r for r in rows if r['status'] == 'EXECUTED']
+                                    vetoed = [r for r in rows if r['status'] == 'VETOED']
+                                    pending = [r for r in executed if r['outcome'] == 'PENDING']
+                                    closed = [r for r in executed if r['outcome'] != 'PENDING']
+
+                                    wins_tp1 = len([r for r in closed if 'TP1' in str(r['outcome'])])
+                                    wins_tp2 = len([r for r in closed if 'TP2' in str(r['outcome'])])
+                                    losses = len([r for r in closed if 'LOSS' in str(r['outcome'])])
+
+                                    total_closed = len(closed)
+                                    win_rate = ((wins_tp1 + wins_tp2) / total_closed * 100) if total_closed > 0 else 0.0
+
+                                    cursor.close()
+                                    conn.close()
+
+                                    stats_msg = (
+                                        f"📊 *SYSTEM PERFORMANCE STATS (NEON CLOUD)*\n\n"
+                                        f"• Executed Signals: {len(executed)}\n"
+                                        f"• AI Vetoes: {len(vetoed)}\n"
+                                        f"• Pending Trades: {len(pending)}\n"
+                                        f"• Closed Trades: {total_closed}\n"
+                                        f"• Total Wins: {wins_tp1 + wins_tp2} (TP1: {wins_tp1} | TP2: {wins_tp2})\n"
+                                        f"• Total Losses: {losses}\n"
+                                        f"• Win Rate: *{win_rate:.1f}%*"
+                                    )
+                                    await send_telegram_alert(client, stats_msg)
+                                except Exception as db_err:
+                                    await send_telegram_alert(client, f"⚠️ Error querying Neon DB stats: {db_err}")
 
             except Exception as e:
                 print(f"Error in Telegram polling loop: {e}")

@@ -373,7 +373,7 @@ async def background_scanning_loop():
                 
                 # ADX Filter
                 if adx_15m < 18.0:
-                    print(f"Skipping: Low ADX ({adx_15m:.1f}) indicates horizontal chop.")
+                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | ADX: {adx_15m:.1f} < 18.0 (Chop Filter Active)")
                     del df_5m, df_15m, df_1h
                     gc.collect()
                     await asyncio.sleep(360)
@@ -397,7 +397,6 @@ async def background_scanning_loop():
                 trigger_type = "None"
 
                 # --- TREND-FILTERED SIGNAL EVALUATION ---
-                # 1. Divergence Signals (Only accepted if NOT counter to strong trend)
                 if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)":
                     if c_5m > ema_5m or c_5m > vwap_5m:
                         proposed_action = "BUY"
@@ -408,7 +407,6 @@ async def background_scanning_loop():
                         proposed_action = "SELL"
                         trigger_type = "Divergence Reversal"
 
-                # 2. Pure Trend Continuation Signals
                 elif is_5m_bull and stoch_buy_cross:
                     proposed_action = "BUY"
                     trigger_type = "Trend Setup"
@@ -422,7 +420,11 @@ async def background_scanning_loop():
                         print(f"Skipping: Price within $6.00 of previous {proposed_action} alert.")
                         proposed_action = "HOLD"
 
-                if proposed_action != "HOLD":
+                # --- VISIBLE SCAN STATUS LOGS ---
+                if proposed_action == "HOLD":
+                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
+                else:
+                    print(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, df_1h, divergence)
 
                     atr_5m = float(df_5m["atr"].iloc[-1])

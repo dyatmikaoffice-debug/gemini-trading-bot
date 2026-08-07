@@ -721,7 +721,7 @@ Output JSON with schema keys:
             f"Entry Price: ${price:.2f}\n\n"
             f"Stop Loss (SL): ${sl_val:.2f}\n"
             f"Take Profit 1 (TP1): ${tp1_val:.2f} (1:{tp1_mult:.1f} RRR)\n"
-            f"Take Profit 2 (TP2): ${tp2_val:.2f}\n\n"
+            f"Take Profit 2 (TP2): ${tp2_val:.2f} (1:{tp2_mult:.1f} RRR)\n\n"
             f"INDICATOR METRICS:\n"
             f"- Setup Type: {trigger_type}\n"
             f"- Divergence Context: {div_note}\n"

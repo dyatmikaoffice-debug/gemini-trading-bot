@@ -163,7 +163,7 @@ def update_open_trades(current_high: float, current_low: float):
                 elif current_outcome == "WIN (TP1 HIT)":
                     if c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = entry_price
+                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved in calculations
                 # First time touching TP1
                 elif tp1 is not None and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"
@@ -182,7 +182,7 @@ def update_open_trades(current_high: float, current_low: float):
                 elif current_outcome == "WIN (TP1 HIT)":
                     if c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = entry_price
+                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved in calculations
                 # First time touching TP1
                 elif tp1 is not None and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"

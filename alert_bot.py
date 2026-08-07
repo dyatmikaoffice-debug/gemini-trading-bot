@@ -17,19 +17,23 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# --- ENVIRONMENT VARIABLES & SANITIZATION ---
+# --- ENVIRONMENT VARIABLES & AGGRESSIVE SANITIZATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+RAW_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Clean Telegram token (strip 'bot' prefix if user included it in Env Vars)
-if RAW_BOT_TOKEN.startswith("bot"):
-    TELEGRAM_BOT_TOKEN = RAW_BOT_TOKEN[3:]
+# Strip ALL whitespace, newlines (\n), tabs (\t), and carriage returns (\r)
+CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
+TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
+
+# Standardize prefix formatting
+if CLEAN_BOT_TOKEN.startswith("bot"):
+    TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN[3:]
 else:
-    TELEGRAM_BOT_TOKEN = RAW_BOT_TOKEN
+    TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN
 
 # Initialize AI Clients
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -272,18 +276,18 @@ def check_divergence(df: pd.DataFrame):
 
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
-    chat_id = target_chat_id or TELEGRAM_CHAT_ID
+    chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         print("[TELEGRAM ERROR] Missing token or chat_id")
         return
     url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": str(chat_id), "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     
     try:
         res = await client.post(url, json=payload)
         if res.status_code != 200:
             print(f"[TELEGRAM API WARNING] Code {res.status_code}: {res.text}. Retrying plain text.")
-            payload_plain = {"chat_id": str(chat_id), "text": text}
+            payload_plain = {"chat_id": chat_id, "text": text}
             res_plain = await client.post(url, json=payload_plain)
             if res_plain.status_code != 200:
                 print(f"[TELEGRAM API ERROR] Failed plain text: {res_plain.text}")
@@ -479,7 +483,7 @@ async def telegram_polling_loop():
         try:
             del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
             print(f"[TELEGRAM] Webhook clear status: {del_res.status_code}")
-            await asyncio.sleep(1.0)  # Pause to let Telegram finalize session clearing
+            await asyncio.sleep(1.0)
         except Exception as e:
             print(f"[TELEGRAM WARNING] Webhook clear failed: {e}")
 
@@ -488,7 +492,6 @@ async def telegram_polling_loop():
             try:
                 res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=5")
                 
-                # Safely parse JSON response without raising unhandled exceptions
                 if res.status_code == 200 and res.text and res.text.strip():
                     try:
                         data = res.json()

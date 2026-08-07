@@ -6,3 +6,4 @@ pydantic
 yfinance
 pandas
 openai
+psycopg2-binary

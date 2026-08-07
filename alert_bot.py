@@ -17,13 +17,19 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# --- ENVIRONMENT VARIABLES ---
+# --- ENVIRONMENT VARIABLES & SANITIZATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Clean Telegram token (strip 'bot' if user included it in Env Vars to prevent double prefix)
+if RAW_BOT_TOKEN.startswith("bot"):
+    TELEGRAM_BOT_TOKEN = RAW_BOT_TOKEN[3:]
+else:
+    TELEGRAM_BOT_TOKEN = RAW_BOT_TOKEN
 
 # Initialize AI Clients
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -96,6 +102,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         cursor = conn.cursor()
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         
+        # Cast NumPy types explicitly to standard Python floats
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -277,8 +284,10 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
             res_plain = await client.post(url, json=payload_plain)
             if res_plain.status_code != 200:
                 print(f"[TELEGRAM API ERROR] Failed plain text: {res_plain.text}")
+            else:
+                print(f"[TELEGRAM SENT] Delivered plain text to Chat ID {chat_id}")
         else:
-            print(f"[TELEGRAM SENT] Message delivered to Chat ID {chat_id}")
+            print(f"[TELEGRAM SENT] Delivered Markdown to Chat ID {chat_id}")
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
@@ -337,7 +346,7 @@ Respond strictly in valid JSON matching schema:
 async def background_scanning_loop():
     global LAST_SIGNAL_ACTION, LAST_SIGNAL_PRICE
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
                 print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
@@ -463,8 +472,7 @@ async def telegram_polling_loop():
         print("[TELEGRAM ERROR] TELEGRAM_BOT_TOKEN environment variable not set.")
         return
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Force remove any webhook to allow long polling
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         try:
             del_res = await client.get(f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook")
             print(f"[TELEGRAM] Webhook clear status: {del_res.status_code}")

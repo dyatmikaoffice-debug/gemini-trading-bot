@@ -88,21 +88,33 @@ def init_db():
         print(f"[NEON DB ERROR] Failed to initialize database: {e}")
 
 def log_trade_signal(status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float, confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str):
-    """Logs trade executions and AI veto decisions to Neon database."""
+    """Logs trade executions and AI veto decisions to Neon database using native Python types."""
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
+        
+        # Explicit type conversion to standard Python types to prevent psycopg2 np.float64 errors
+        price_val = float(price) if price is not None else 0.0
+        sl_val = float(sl) if sl is not None else 0.0
+        tp1_val = float(tp1) if tp1 is not None else 0.0
+        tp2_val = float(tp2) if tp2 is not None else 0.0
+        conf_val = float(confidence) if confidence is not None else 0.0
+        adx_val = float(adx_15m) if adx_15m is not None else 0.0
+        stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
+
         cursor.execute("""
             INSERT INTO signals 
             (timestamp, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (wib_time, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning))
+        """, (wib_time, status, action, trigger_type, price_val, sl_val, tp1_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
+        
         conn.commit()
         cursor.close()
         conn.close()
+        print(f"[NEON DB LOGGED] Status: {status} | Action: {action} | Price: ${price_val:.2f}")
     except Exception as e:
         print(f"[NEON DB ERROR] Failed to log signal: {e}")
 
@@ -122,35 +134,37 @@ def update_open_trades(current_high: float, current_low: float):
             return
 
         wib_now = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
+        c_high = float(current_high)
+        c_low = float(current_low)
 
         for trade in open_trades:
             trade_id = trade['id']
             action = trade['action']
-            sl = trade['sl']
-            tp1 = trade['tp1']
-            tp2 = trade['tp2']
+            sl = float(trade['sl']) if trade['sl'] is not None else None
+            tp1 = float(trade['tp1']) if trade['tp1'] is not None else None
+            tp2 = float(trade['tp2']) if trade['tp2'] is not None else None
 
             outcome = None
             exit_price = None
 
             if action == "BUY":
-                if current_low <= sl:
+                if sl is not None and c_low <= sl:
                     outcome = "LOSS (SL HIT)"
                     exit_price = sl
-                elif current_high >= tp2:
+                elif tp2 is not None and c_high >= tp2:
                     outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                elif current_high >= tp1:
+                elif tp1 is not None and c_high >= tp1:
                     outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
             elif action == "SELL":
-                if current_high >= sl:
+                if sl is not None and c_high >= sl:
                     outcome = "LOSS (SL HIT)"
                     exit_price = sl
-                elif current_low <= tp2:
+                elif tp2 is not None and c_low <= tp2:
                     outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                elif current_low <= tp1:
+                elif tp1 is not None and c_low <= tp1:
                     outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
 
@@ -159,7 +173,7 @@ def update_open_trades(current_high: float, current_low: float):
                     UPDATE signals 
                     SET outcome = %s, exit_price = %s, outcome_timestamp = %s
                     WHERE id = %s
-                """, (outcome, exit_price, wib_now, trade_id))
+                """, (outcome, float(exit_price), wib_now, trade_id))
                 conn.commit()
                 print(f"[TRADE CLOSED] Signal ID {trade_id} -> {outcome} at ${exit_price:.2f}")
 
@@ -232,16 +246,16 @@ def check_divergence(df: pd.DataFrame):
     if len(df) < 15:
         return "None"
     
-    p_now = df["close"].iloc[-1]
-    p_prev = df["close"].iloc[-5:-1].min()
-    s_now = df["stoch_k"].iloc[-1]
-    s_prev = df["stoch_k"].iloc[-5:-1].min()
+    p_now = float(df["close"].iloc[-1])
+    p_prev = float(df["close"].iloc[-5:-1].min())
+    s_now = float(df["stoch_k"].iloc[-1])
+    s_prev = float(df["stoch_k"].iloc[-5:-1].min())
 
     if p_now < p_prev and s_now > s_prev and s_now < 30:
         return "Bullish Divergence (Lower Price Low + Higher Stoch Low)"
 
-    p_prev_max = df["close"].iloc[-5:-1].max()
-    s_prev_max = df["stoch_k"].iloc[-5:-1].max()
+    p_prev_max = float(df["close"].iloc[-5:-1].max())
+    s_prev_max = float(df["stoch_k"].iloc[-5:-1].max())
     if p_now > p_prev_max and s_now < s_prev_max and s_now > 70:
         return "Bearish Divergence (Higher Price High + Lower Stoch High)"
 
@@ -253,13 +267,12 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.com/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": str(chat_id), "text": text, "parse_mode": "Markdown"}
     
     try:
         res = await client.post(url, json=payload)
         if res.status_code != 200:
-            # Fallback to plain text without Markdown if formatting failed
-            payload_plain = {"chat_id": chat_id, "text": text}
+            payload_plain = {"chat_id": str(chat_id), "text": text}
             await client.post(url, json=payload_plain)
     except Exception as e:
         print(f"Telegram Notification Error: {e}")
@@ -271,9 +284,9 @@ Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
 A technical trigger suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 5-Minute: Close=${df_5m['close'].iloc[-1]:.2f}, EMA 50=${df_5m['ema_50'].iloc[-1]:.2f}, VWAP=${df_5m['vwap'].iloc[-1]:.2f}, Stoch RSI %K=${df_5m['stoch_k'].iloc[-1]:.1f}.
-2. 15-Minute: Close=${df_15m['close'].iloc[-1]:.2f}, ADX Trend Strength=${df_15m['adx'].iloc[-1]:.1f}, Stoch RSI %K=${df_15m['stoch_k'].iloc[-1]:.1f}.
-3. 1-Hour: Close=${df_1h['close'].iloc[-1]:.2f}, EMA 50=${df_1h['ema_50'].iloc[-1]:.2f}, VWAP=${df_1h['vwap'].iloc[-1]:.2f}.
+1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
+2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
+3. 1-Hour: Close=${float(df_1h['close'].iloc[-1]):.2f}, EMA 50=${float(df_1h['ema_50'].iloc[-1]):.2f}, VWAP=${float(df_1h['vwap'].iloc[-1]):.2f}.
 4. Divergence State: {divergence}.
 
 CRITICAL VETO RULES:
@@ -336,13 +349,13 @@ async def background_scanning_loop():
                 df_15m = calculate_metrics(df_15m)
                 df_1h = calculate_metrics(df_1h)
 
-                curr_high = df_5m["high"].iloc[-1]
-                curr_low = df_5m["low"].iloc[-1]
+                curr_high = float(df_5m["high"].iloc[-1])
+                curr_low = float(df_5m["low"].iloc[-1])
                 update_open_trades(curr_high, curr_low)
 
-                curr_price = df_5m["close"].iloc[-1]
-                adx_15m = df_15m["adx"].iloc[-1]
-                stoch_15m = df_15m["stoch_k"].iloc[-1]
+                curr_price = float(df_5m["close"].iloc[-1])
+                adx_15m = float(df_15m["adx"].iloc[-1])
+                stoch_15m = float(df_15m["stoch_k"].iloc[-1])
                 
                 # ADX Filter
                 if adx_15m < 18.0:
@@ -353,16 +366,16 @@ async def background_scanning_loop():
                     continue
 
                 # Signal Logic Setup
-                c_5m, ema_5m, vwap_5m = df_5m["close"].iloc[-1], df_5m["ema_50"].iloc[-1], df_5m["vwap"].iloc[-1]
-                c_5m_prev, o_5m = df_5m["close"].iloc[-2], df_5m["open"].iloc[-1]
+                c_5m, ema_5m, vwap_5m = float(df_5m["close"].iloc[-1]), float(df_5m["ema_50"].iloc[-1]), float(df_5m["vwap"].iloc[-1])
+                c_5m_prev, o_5m = float(df_5m["close"].iloc[-2]), float(df_5m["open"].iloc[-1])
                 
                 is_5m_bull = (c_5m > ema_5m) and (c_5m > vwap_5m) and (c_5m > o_5m)
                 is_5m_bear = (c_5m < ema_5m) and (c_5m < vwap_5m) and (c_5m < o_5m)
 
                 divergence = check_divergence(df_5m)
 
-                stoch_k_curr = df_5m["stoch_k"].iloc[-1]
-                stoch_k_prev = df_5m["stoch_k"].iloc[-2]
+                stoch_k_curr = float(df_5m["stoch_k"].iloc[-1])
+                stoch_k_prev = float(df_5m["stoch_k"].iloc[-2])
                 stoch_buy_cross = (stoch_k_prev < 20) and (stoch_k_curr >= 20)
                 stoch_sell_cross = (stoch_k_prev > 80) and (stoch_k_curr <= 80)
 
@@ -391,7 +404,7 @@ async def background_scanning_loop():
                 if proposed_action != "HOLD":
                     ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, df_1h, divergence)
 
-                    atr_5m = df_5m["atr"].iloc[-1]
+                    atr_5m = float(df_5m["atr"].iloc[-1])
                     sl_dist = min(atr_5m * 1.5, 6.0)
                     tp1_mult = 1.5
                     tp2_mult = 4.0 if adx_15m > 35.0 else 2.5
@@ -457,13 +470,13 @@ async def telegram_polling_loop():
                         for update in data["result"]:
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
-                            text = message.get("text", "").strip()
+                            raw_text = message.get("text", "").strip().lower()
                             sender_chat_id = str(message.get("chat", {}).get("id", ""))
 
-                            if not sender_chat_id:
+                            if not sender_chat_id or not raw_text:
                                 continue
 
-                            if text == "/help":
+                            if raw_text.startswith("/help"):
                                 help_msg = (
                                     "🤖 *TRADING BOT COMMANDS:*\n\n"
                                     "• `/stats` - View live win rate, TP/SL hits, and veto counts\n"
@@ -472,7 +485,7 @@ async def telegram_polling_loop():
                                 )
                                 await send_telegram_alert(client, help_msg, target_chat_id=sender_chat_id)
 
-                            elif text == "/logs":
+                            elif raw_text.startswith("/logs"):
                                 try:
                                     conn = get_db_connection()
                                     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -486,12 +499,12 @@ async def telegram_polling_loop():
                                     else:
                                         log_text = "📜 *LAST 5 TRADE LOGS:*\n\n"
                                         for r in rows:
-                                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${r['price']:.2f} | Status: `{r['status']}` ({r['outcome']})\n"
+                                            log_text += f"• *ID {r['id']}* | {r['action']} @ ${float(r['price']):.2f} | Status: `{r['status']}` ({r['outcome']})\n"
                                         await send_telegram_alert(client, log_text, target_chat_id=sender_chat_id)
                                 except Exception as log_err:
                                     await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
 
-                            elif text == "/stats":
+                            elif raw_text.startswith("/stats"):
                                 try:
                                     conn = get_db_connection()
                                     cursor = conn.cursor(cursor_factory=RealDictCursor)

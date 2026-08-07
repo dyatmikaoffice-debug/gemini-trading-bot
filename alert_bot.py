@@ -413,8 +413,13 @@ async def background_scanning_loop():
 
                 stoch_k_curr = float(df_5m["stoch_k"].iloc[-1])
                 stoch_k_prev = float(df_5m["stoch_k"].iloc[-2])
-                stoch_buy_cross = (stoch_k_prev < 20) and (stoch_k_curr >= 20)
-                stoch_sell_cross = (stoch_k_prev > 80) and (stoch_k_curr <= 80)
+
+                # Adaptive Stoch RSI Threshold based on ADX Trend Strength
+                stoch_buy_limit = 50.0 if adx_15m > 35.0 else 20.0
+                stoch_sell_limit = 50.0 if adx_15m > 35.0 else 80.0
+
+                stoch_buy_cross = (stoch_k_prev < stoch_buy_limit) and (stoch_k_curr >= stoch_buy_limit)
+                stoch_sell_cross = (stoch_k_prev > stoch_sell_limit) and (stoch_k_curr <= stoch_sell_limit)
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
@@ -432,10 +437,10 @@ async def background_scanning_loop():
 
                 elif is_5m_bull and stoch_buy_cross:
                     proposed_action = "BUY"
-                    trigger_type = "Trend Setup"
+                    trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
                 elif is_5m_bear and stoch_sell_cross:
                     proposed_action = "SELL"
-                    trigger_type = "Trend Setup"
+                    trigger_type = "High Trend Continuation" if adx_15m > 35.0 else "Trend Setup"
 
                 # Distance & Cooldown Guard ($6.00 distance)
                 if proposed_action != "HOLD":

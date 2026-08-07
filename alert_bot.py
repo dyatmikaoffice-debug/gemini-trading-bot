@@ -24,7 +24,7 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
 
-# Sanitize Telegram Token
+# Sanitize Telegram Bot Token
 BOT_TOKEN = "".join(TELEGRAM_BOT_TOKEN.split())
 
 # Database Connection Helper
@@ -88,7 +88,7 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
     - Current Price: ${price:.2f}
-    - 5M EMA 50: ${ema50:.2f} | 5M EMA 200: ${ema200:.2f}
+    - 5M EMA 50: ${ema50:.2f} \vert{} 5M EMA 200:${ema200:.2f}
     - 15M ADX Trend Strength: {adx:.1f}
     - 5M Stoch RSI %K: {stoch_k:.1f}
 
@@ -120,7 +120,7 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k:
         return "APPROVE"
 
 # ---------------------------------------------------------
-# TELEGRAM MESSAGING & WEBHOOK AUTOMATION
+# TELEGRAM MESSAGING & AUTOMATED WEBHOOK SETUP
 # ---------------------------------------------------------
 async def send_telegram_alert(message: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -173,15 +173,15 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
         exit_price = None
 
         if action == "BUY":
-            # Check 1: Stop Loss Hit (Evaluated First to Reflect Broker Reality)
+            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if low_3c <= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                    exit_price = tp1  # Preserve TP1 pips gain
+                    exit_price = tp1  # Lock in TP1 pips gain
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Check 2: Take Profit Targets
+            # Priority Check 2: Take Profit Targets
             elif high_3c >= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -190,15 +190,15 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 exit_price = tp1
 
         elif action == "SELL":
-            # Check 1: Stop Loss Hit (Evaluated First)
+            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if high_3c >= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                    exit_price = tp1  # Preserve TP1 pips gain
+                    exit_price = tp1  # Lock in TP1 pips gain
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Check 2: Take Profit Targets
+            # Priority Check 2: Take Profit Targets
             elif low_3c <= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -285,7 +285,7 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
 
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | EMA200: ${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} \vert{} EMA200:${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
 
                 # Step 4: AI Analysis & Signal Dispatch
                 if proposed_action != "HOLD":
@@ -336,7 +336,7 @@ async def background_scanning_loop():
         await asyncio.sleep(360)  # 6-minute interval loop
 
 # ---------------------------------------------------------
-# FASTAPI APP & DETAILED TELEGRAM COMMAND HANDLER
+# FASTAPI APP & TELEGRAM COMMAND HANDLER
 # ---------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -364,7 +364,7 @@ async def telegram_webhook(request: Request):
             cur = conn.cursor()
 
             if text == "/stats":
-                # Detailed Performance Metrics Dashboard
+                # Executed & Vetoed counts
                 cur.execute("SELECT COUNT(*) as total FROM signals WHERE status = 'EXECUTED'")
                 total_executed = cur.fetchone()['total'] or 0
 
@@ -374,6 +374,7 @@ async def telegram_webhook(request: Request):
                 cur.execute("SELECT COUNT(*) as pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
                 total_pending = cur.fetchone()['pending'] or 0
 
+                # Detailed outcome counts
                 cur.execute("SELECT COUNT(*) as tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
                 tp1_wins = cur.fetchone()['tp1_wins'] or 0
 
@@ -397,7 +398,7 @@ async def telegram_webhook(request: Request):
                     action = t['action']
                     
                     diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-                    pips = diff * 10.0  # $1.00 move in Gold = 10 pips
+                    pips = diff * 10.0  # $1.00 price move = 10 pips
                     
                     total_pips += pips
                     if pips > 0:
@@ -406,7 +407,7 @@ async def telegram_webhook(request: Request):
                         loss_pips += abs(pips)
 
                 win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                est_dollar = total_pips * 0.20  # $0.20 per pip at 0.02 lot
+                est_dollar = total_pips * 0.10  # $0.10 per pip for 0.01 Lot
                 avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
                 avg_loss = (loss_pips / losses) if losses > 0 else 0.0
                 profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
@@ -416,7 +417,7 @@ async def telegram_webhook(request: Request):
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *NET PIPS & PROFIT:*\n"
                     f"• Net Pips: *{total_pips:+.1f} pips*\n"
-                    f"• Est. Profit (0.02 Lot): *${est_dollar:+.2f}*\n\n"
+                    f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
                     f"📈 *WIN / LOSS BREAKDOWN:*\n"
                     f"• Total Executed: *{total_executed}*\n"
                     f"• Total Wins: *{total_wins_count}* ({win_rate:.1f}%)\n"
@@ -433,39 +434,53 @@ async def telegram_webhook(request: Request):
                     f"• Win Rate: *{win_rate:.1f}%*"
                 )
 
-            elif text == "/logs":
-                cur.execute("SELECT id, action, entry_price, outcome FROM signals ORDER BY id DESC LIMIT 10")
-                logs = cur.fetchall()
-                reply = "📜 *LAST 10 TRADE LOGS:*\n\n"
-                for l in logs:
-                    reply += f"• *ID {l['id']}* | {l['action']} @ ${float(l['entry_price']):.2f} | Status: *{l['outcome']}*\n"
-
             elif text == "/pips":
                 cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
                 trades = cur.fetchall()
-                total_pips = 0.0
-                for t in trades:
-                    diff = float(t['exit_price']) - float(t['entry_price']) if t['action'] == "BUY" else float(t['entry_price']) - float(t['exit_price'])
-                    total_pips += (diff * 10.0)
-                reply = f"💰 *NET PIPS REPORT*\n\nTotal Net Pips: *{total_pips:+.1f} pips*\nEst. Profit (0.02 Lot): *${(total_pips * 0.20):+.2f}*"
 
-            elif text == "/help":
+                total_pips = 0.0
+                gross_win_pips = 0.0
+                gross_loss_pips = 0.0
+                winning_trades_count = 0
+                losing_trades_count = 0
+
+                for t in trades:
+                    entry = float(t['entry_price'])
+                    exit_p = float(t['exit_price'])
+                    action = t['action']
+                    
+                    diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                    pips = diff * 10.0
+                    
+                    total_pips += pips
+                    if pips > 0:
+                        gross_win_pips += pips
+                        winning_trades_count += 1
+                    elif pips < 0:
+                        gross_loss_pips += abs(pips)
+                        losing_trades_count += 1
+
+                avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                est_profit_usd = total_pips * 0.10  # $0.10 per pip for 0.01 Lot
+
                 reply = (
-                    "🤖 *COMMAND MENU:*\n\n"
-                    "/stats - Detailed Performance Analytics Dashboard\n"
-                    "/logs - View Last 10 Trade Entries & Outcomes\n"
-                    "/pips - Net Pips & Dollar Earnings Report\n"
-                    "/help - Display Interactive Command Guide"
+                    f"💵 *DETAILED PIPS & EARNINGS REPORT*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *SUMMARY:* \n"
+                    f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
+                    f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                    f"📈 *PIPS BREAKDOWN:*\n"
+                    f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                    f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                    f"🎯 *AVERAGE METRICS:*\n"
+                    f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                    f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                    f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 _Note: Calculated at $0.10/pip (0.01 lot XAU/USD)._"
                 )
 
-            cur.close()
-            conn.close()
-
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(url, json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"})
-
-    return {"status": "ok"}
-
-if __name__ == "__main__":
-    uvicorn.run("alert_bot:app", host="0.0.0.0", port=8000)
+            elif text == "/logs":
+                cur.execute("""
+                    SELECT id,

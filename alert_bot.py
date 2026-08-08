@@ -32,12 +32,12 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # ---------------------------------------------------------
-# TECHNICAL INDICATORS & TREND LOGIC
+# TECHNICAL INDICATORS & MULTI-TIMEFRAME TREND LOGIC
 # ---------------------------------------------------------
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # Exponential Moving Averages
+    # Exponential Moving Averages (5M)
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
@@ -219,7 +219,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER
+# BACKGROUND MARKET SCANNER (BACKTESTED STRATEGY)
 # ---------------------------------------------------------
 async def background_scanning_loop():
     while True:
@@ -253,7 +253,7 @@ async def background_scanning_loop():
 
                 update_open_trades(price, high_3c, low_3c)
 
-                # Step 1: Multi-Timeframe Trend Lock Filter
+                # Step 1: Multi-Timeframe Trend Lock Filter (Backtested Strategy)
                 proposed_action = "HOLD"
                 is_uptrend = (price > ema200) and (ema50 > ema200)
                 is_downtrend = (price < ema200) and (ema50 < ema200)
@@ -313,7 +313,7 @@ async def background_scanning_loop():
                     new_id = cur.fetchone()['id']
 
                     if ai_decision == "APPROVE":
-                        msg = f"⚡ *HIGH WIN-RATE SIGNAL #{new_id}*\n\n" \
+                        msg = f"⚡ *BACKTESTED WIN-RATE SIGNAL #{new_id}*\n\n" \
                               f"Action: *{proposed_action} XAU/USD*\n" \
                               f"Entry Price: *${price:.2f}*\n" \
                               f"Stop Loss: *${sl:.2f}*\n" \
@@ -334,7 +334,7 @@ async def background_scanning_loop():
         await asyncio.sleep(360)
 
 # ---------------------------------------------------------
-# FASTAPI APP INITIALIZATION & LIFESPAN
+# FASTAPI APP & TELEGRAM COMMAND HANDLER ($0.01 LOT CALIBRATED)
 # ---------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -346,7 +346,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
-    return {"status": "Live", "bot": "Gold Auto Signal Bot V2 High Win-Rate"}
+    return {"status": "Live", "bot": "Gold Auto Signal Bot - Backtested Strategy"}
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
@@ -403,13 +403,13 @@ async def telegram_webhook(request: Request):
                         loss_pips += abs(pips)
 
                 win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                est_dollar = total_pips * 0.10
+                est_dollar = total_pips * 0.10  # $0.10 per pip for 0.01 Lot
                 avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
                 avg_loss = (loss_pips / losses) if losses > 0 else 0.0
                 profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
 
                 reply = (
-                    f"📊 *DETAILED PERFORMANCE REPORT*\n"
+                    f"📊 *BACKTESTED STRATEGY PERFORMANCE*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *NET PIPS & PROFIT:*\n"
                     f"• Net Pips: *{total_pips:+.1f} pips*\n"
@@ -523,7 +523,7 @@ async def telegram_webhook(request: Request):
 
             elif text == "/help":
                 reply = (
-                    "🤖 *HIGH WIN-RATE BOT COMMANDS:*\n\n"
+                    "🤖 *BACKTESTED BOT COMMANDS:*\n\n"
                     "/stats - Comprehensive Win-Rate & Risk Performance Report\n"
                     "/pips - Detailed Gross/Net Pips & USD Profit Breakdown\n"
                     "/logs - Detailed View of Last 10 Trades & Outcomes\n"

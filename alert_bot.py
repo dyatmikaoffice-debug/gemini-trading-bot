@@ -31,17 +31,16 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # ---------------------------------------------------------
-# TECHNICAL INDICATORS: 9, 21, 50, 200 EMAs + ATR + ADX + STOCH RSI
+# TECHNICAL INDICATORS: 9, 21, 100 EMAs + ATR + ADX
 # ---------------------------------------------------------
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # 4 Exponential Moving Averages (9, 21, 50, 200)
+    # 3 Exponential Moving Averages (9, 21, 100)
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     
     # Average True Range (14)
     df['high_low'] = df['high'] - df['low']
@@ -49,20 +48,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['low_cp'] = (df['low'] - df['close'].shift(1)).abs()
     df['tr'] = df[['high_low', 'high_cp', 'low_cp']].max(axis=1)
     df['atr'] = df['tr'].rolling(14).mean()
-
-    # Stochastic RSI (14, 3, 3)
-    rsi_period = 14
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(rsi_period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(rsi_period).mean()
-    rs = gain / (loss + 1e-10)
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    min_rsi = df['rsi'].rolling(rsi_period).min()
-    max_rsi = df['rsi'].rolling(rsi_period).max()
-    stoch_rsi = (df['rsi'] - min_rsi) / (max_rsi - min_rsi + 1e-10)
-    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
-    df['stoch_d'] = df['stoch_k'].rolling(3).mean()
 
     # Average Directional Index - ADX (14)
     up = df['high'].diff()
@@ -82,7 +67,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # AI ANALYST RISK FILTER
 # ---------------------------------------------------------
 
-async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k: float, ema9: float, ema21: float, ema50: float, ema200: float, atr: float) -> str:
+async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: float, ema21: float, ema100: float, atr: float) -> str:
     if not GROQ_API_KEY:
         return "APPROVE"
         
@@ -91,15 +76,14 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
     - Current Price: ${price:.2f}
-    - 5M EMAs -> 9: ${ema9:.2f} | 21: ${ema21:.2f} | 50: ${ema50:.2f} | 200: ${ema200:.2f}
+    - 5M EMAs -> 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f}
     - 15M ADX Trend Strength: {adx:.1f}
-    - 5M Stoch RSI %K: {stoch_k:.1f}
     - Current ATR: ${atr:.2f}
 
     STRICT RULES:
-    1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA, 50 EMA, or 200 EMA (counter-trend).
-    2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA, 50 EMA, or 200 EMA (counter-trend).
-    3. VETO if ADX < 12 (extreme low-volatility chop zone).
+    1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 100 EMA (counter-trend).
+    2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA or 100 EMA (counter-trend).
+    3. VETO if ADX < 10 (extreme low-volatility chop zone).
 
     Respond strictly with APPROVE or VETO followed by a 1-sentence explanation.
     """
@@ -177,7 +161,6 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
         exit_price = None
         
         if action == "BUY":
-            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if low_3c <= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
@@ -185,7 +168,6 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Priority Check 2: Take Profit Targets
             elif high_3c >= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -194,7 +176,6 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 exit_price = tp1
                 
         elif action == "SELL":
-            # Priority Check 1: Stop Loss Hit (Evaluated First)
             if high_3c >= sl:
                 if "TP1 HIT" in outcome:
                     new_outcome = "CLOSED (TP1 HIT / SL BE)"
@@ -202,7 +183,6 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
                 else:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-            # Priority Check 2: Take Profit Targets
             elif low_3c <= tp2:
                 new_outcome = "WIN (TP2 HIT)"
                 exit_price = tp2
@@ -223,7 +203,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (EMA 9/21 TOUCH + REBOUND TRIGGERS)
+# BACKGROUND MARKET SCANNER (HIGH FREQUENCY 9/21/100 EMA)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -249,11 +229,8 @@ async def background_scanning_loop():
                 price = float(latest['close'])
                 ema9 = float(latest['ema9'])
                 ema21 = float(latest['ema21'])
-                ema50 = float(latest['ema50'])
-                ema200 = float(latest['ema200'])
+                ema100 = float(latest['ema100'])
                 adx = float(latest['adx'])
-                stoch_k = float(latest['stoch_k'])
-                stoch_d = float(latest['stoch_d'])
                 atr = float(latest['atr'])
                 
                 high_3c = float(df['high'].tail(3).max())
@@ -261,48 +238,42 @@ async def background_scanning_loop():
                 
                 update_open_trades(price, high_3c, low_3c)
 
-                # Step 1: Directional Alignments (Full Trend Lock)
-                is_bullish_alignment = (price > ema9) and (ema9 > ema21) and (ema21 > ema50) and (ema50 > ema200)
-                is_bearish_alignment = (price < ema9) and (ema9 < ema21) and (ema21 < ema50) and (ema50 < ema200)
+                # Step 1: Directional Alignment (9 / 21 / 100 EMA)
+                is_bullish_alignment = (price > ema9) and (ema9 > ema21) and (ema21 > ema100)
+                is_bearish_alignment = (price < ema9) and (ema9 < ema21) and (ema21 < ema100)
 
-                # Step 2: Measure EMA Spreads (Distance between max and min of EMA 9, 21, 50)
-                latest_spread = max(latest['ema9'], latest['ema21'], latest['ema50']) - min(latest['ema9'], latest['ema21'], latest['ema50'])
-                prev_spread = max(prev['ema9'], prev['ema21'], prev['ema50']) - min(prev['ema9'], prev['ema21'], prev['ema50'])
-                prev2_spread = max(prev2['ema9'], prev2['ema21'], prev2['ema50']) - min(prev2['ema9'], prev2['ema21'], prev2['ema50'])
-
-                # Check if EMAs were squeezed / compressed in recent bars
-                was_compressed = (prev_spread <= 1.2 * atr) or (prev2_spread <= 1.2 * atr)
+                # Step 2: Measure EMA Spreads (Distance between EMA 9 and 21)
+                latest_spread = abs(latest['ema9'] - latest['ema21'])
+                prev_spread = abs(prev['ema9'] - prev['ema21'])
+                
+                was_compressed = prev_spread <= (1.0 * atr)
                 is_expanding = latest_spread > prev_spread
 
-                # Step 3: Trigger Conditions (Squeeze Fan-Out OR EMA 9 / EMA 21 Touch Rebound)
                 proposed_action = "HOLD"
 
-                if adx >= 15.0:
-                    # --- TRIGGER TYPE 1: Squeeze Breakout & Fan-Out Separation ---
+                # Step 3: Fast Execution Triggers (ADX >= 12.0)
+                if adx >= 12.0:
+                    # --- TRIGGER TYPE 1: Squeeze Breakout & Fan-Out ---
                     if was_compressed and is_expanding:
                         if is_bullish_alignment and (prev['ema9'] <= prev['ema21']):
                             proposed_action = "BUY"
                         elif is_bearish_alignment and (prev['ema9'] >= prev['ema21']):
                             proposed_action = "SELL"
 
-                    # --- TRIGGER TYPE 2: EMA 9 OR EMA 21 Touch + Reversal Candle Rebound ---
+                    # --- TRIGGER TYPE 2: EMA 9 or EMA 21 Rebound ---
                     if proposed_action == "HOLD":
                         if is_bullish_alignment:
-                            # Previous candle low touched/dipped into EMA 9 OR EMA 21
                             prev_touched_ema = (prev['low'] <= (prev['ema9'] * 1.0005)) or (prev['low'] <= (prev['ema21'] * 1.0005))
                             latest_is_green = (latest['close'] > latest['open']) and (latest['close'] > latest['ema9'])
-                            stoch_up = (prev['stoch_k'] <= prev['stoch_d']) and (stoch_k > stoch_d)
                             
-                            if prev_touched_ema and latest_is_green and stoch_up:
+                            if prev_touched_ema and latest_is_green:
                                 proposed_action = "BUY"
 
                         elif is_bearish_alignment:
-                            # Previous candle high touched/spiked into EMA 9 OR EMA 21
                             prev_touched_ema = (prev['high'] >= (prev['ema9'] * 0.9995)) or (prev['high'] >= (prev['ema21'] * 0.9995))
                             latest_is_red = (latest['close'] < latest['open']) and (latest['close'] < latest['ema9'])
-                            stoch_down = (prev['stoch_k'] >= prev['stoch_d']) and (stoch_k < stoch_d)
                             
-                            if prev_touched_ema and latest_is_red and stoch_down:
+                            if prev_touched_ema and latest_is_red:
                                 proposed_action = "SELL"
 
                 # Step 4: Proximity Cap Guard (2.5 * ATR)
@@ -324,11 +295,11 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
                     
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 50: ${ema50:.2f} | 200: ${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
 
                 # Step 6: AI Analysis & Signal Dispatch
                 if proposed_action != "HOLD":
-                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, stoch_k, ema9, ema21, ema50, ema200, atr)
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, ema9, ema21, ema100, atr)
                     
                     sl_dist = max(4.0, min(7.0, atr * 1.5))
                     tp1_dist = sl_dist * 1.5
@@ -355,13 +326,13 @@ async def background_scanning_loop():
 
                     if ai_decision == "APPROVE":
                         msg = (
-                            f"⚡ EMA REBOUND SIGNAL #{new_id}\n\n"
+                            f"⚡ HIGH FREQUENCY 100 EMA SIGNAL #{new_id}\n\n"
                             f"Action: *{proposed_action} XAU/USD*\n"
                             f"Entry Price: *${price:.2f}*\n"
                             f"Stop Loss: *${sl:.2f}*\n"
                             f"Take Profit 1: *${tp1:.2f}*\n"
                             f"Take Profit 2: *${tp2:.2f}*\n"
-                            f"Trigger: *EMA 9/21 Touch + Rebound Confirmation*\n"
+                            f"System: *EMA 9/21/100 Dynamic Trend*\n"
                             f"ADX Momentum: *{adx:.1f}*"
                         )
                         await send_telegram_alert(msg)
@@ -390,9 +361,9 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
-    return {"status": "Live", "bot": "Gold EMA Confluence Signal Bot"}
+    return {"status": "Live", "bot": "Gold 100 EMA High Frequency Signal Bot"}
 
-# MT5 Bridge Endpoint (For MetaTrader 5 WebRequest Copier EA)
+# MT5 Bridge Endpoint
 @app.get("/get-latest-signal")
 def get_latest_signal():
     conn = get_db_connection()
@@ -413,7 +384,7 @@ def get_latest_signal():
         }
     return {"status": "NO_SIGNAL"}
 
-# Telegram Webhook Handler ($0.01 Lot Calibrated)
+# Telegram Webhook Handler
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -469,13 +440,13 @@ async def telegram_webhook(request: Request):
                         loss_pips += abs(pips)
 
                 win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                est_dollar = total_pips * 0.10  # $0.10 per pip for 0.01 Lot
+                est_dollar = total_pips * 0.10
                 avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
                 avg_loss = (loss_pips / losses) if losses > 0 else 0.0
                 profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
 
                 reply = (
-                    f"📊 *EMA SYSTEM PERFORMANCE*\n"
+                    f"📊 *EMA 100 SYSTEM PERFORMANCE*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *NET PIPS & PROFIT:*\n"
                     f"• Net Pips: *{total_pips:+.1f} pips*\n"

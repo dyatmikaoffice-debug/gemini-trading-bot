@@ -190,7 +190,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (ALL CROSSOVERS TRIGGER)
+# BACKGROUND MARKET SCANNER (PURE CROSSOVER MODE)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -242,51 +242,33 @@ async def background_scanning_loop():
                 # --- 1. TRIPLE CROSSOVER (Highest Priority) ---
                 if is_triple_bullish_cross:
                     proposed_action = "BUY"
-                    trigger_reason = "🔥 TRIPLE EMA BULLISH EXPLOSION (Big Move Imminent)"
+                    trigger_reason = "🔥 TRIPLE EMA BULLISH EXPLOSION"
                 elif is_triple_bearish_cross:
                     proposed_action = "SELL"
-                    trigger_reason = "🔥 TRIPLE EMA BEARISH EXPLOSION (Big Move Imminent)"
+                    trigger_reason = "🔥 TRIPLE EMA BEARISH EXPLOSION"
 
-                # --- 2. INDIVIDUAL CROSSOVERS ---
-                elif ema9_cross_above_21 and latest['ema21'] > latest['ema100']:
+                # --- 2. INDIVIDUAL CROSSOVERS (Raw Intersects Trigger Instantly) ---
+                elif ema9_cross_above_21:
                     proposed_action = "BUY"
-                    trigger_reason = "EMA 9 Potong Ke Atas EMA 21 (Valid Uptrend)"
+                    trigger_reason = "EMA 9 Crossed Above EMA 21"
+                elif ema9_cross_below_21:
+                    proposed_action = "SELL"
+                    trigger_reason = "EMA 9 Crossed Below EMA 21"
+
                 elif ema9_cross_above_100:
                     proposed_action = "BUY"
-                    trigger_reason = "EMA 9 Potong Ke Atas EMA 100 (Awal Reversal Bullish)"
-                elif ema21_cross_above_100:
-                    proposed_action = "BUY"
-                    trigger_reason = "EMA 21 Potong Ke Atas EMA 100 (Konfirmasi Reversal Bullish)"
-
-                elif ema9_cross_below_21 and latest['ema21'] < latest['ema100']:
-                    proposed_action = "SELL"
-                    trigger_reason = "EMA 9 Potong Ke Bawah EMA 21 (Valid Downtrend)"
+                    trigger_reason = "EMA 9 Crossed Above EMA 100"
                 elif ema9_cross_below_100:
                     proposed_action = "SELL"
-                    trigger_reason = "EMA 9 Potong Ke Bawah EMA 100 (Awal Reversal Bearish)"
+                    trigger_reason = "EMA 9 Crossed Below EMA 100"
+
+                elif ema21_cross_above_100:
+                    proposed_action = "BUY"
+                    trigger_reason = "EMA 21 Crossed Above EMA 100"
                 elif ema21_cross_below_100:
                     proposed_action = "SELL"
-                    trigger_reason = "EMA 21 Potong Ke Bawah EMA 100 (Konfirmasi Reversal Bearish)"
+                    trigger_reason = "EMA 21 Crossed Below EMA 100"
 
-                # Proximity Cap Guard Filter (2.5 x ATR)
-                max_distance_cap = 2.5 * atr
-                if proposed_action == "BUY" and (price - ema21) > max_distance_cap:
-                    logging.info(f"[PROXIMITY VETO] BUY blocked: Price ${price:.2f} is ${price - ema21:.2f} above 21 EMA")
-                    proposed_action = "HOLD"
-                elif proposed_action == "SELL" and (ema21 - price) > max_distance_cap:
-                    logging.info(f"[PROXIMITY VETO] SELL blocked: Price ${price:.2f} is ${ema21 - price:.2f} below 21 EMA")
-                    proposed_action = "HOLD"
-
-                # Cooldown Guard Filter
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("SELECT entry_price, outcome FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1")
-                last_trade = cur.fetchone()
-                
-                min_distance = 2.5
-                if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
-                    proposed_action = "HOLD"
-                    
                 logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | Action: {proposed_action}")
 
                 # AI Evaluation & Signal Dispatch

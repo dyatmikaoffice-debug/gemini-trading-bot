@@ -278,12 +278,12 @@ def check_divergence(df: pd.DataFrame):
     s_now = float(df["stoch_k"].iloc[-1])
     s_prev = float(df["stoch_k"].iloc[-5:-1].min())
 
-    if p_now < p_prev and s_now > s_prev and s_now < 30:
+    if p_now < p_prev and s_now > s_prev and s_now < 40:
         return "Bullish Divergence (Lower Price Low + Higher Stoch Low)"
 
     p_prev_max = float(df["close"].iloc[-5:-1].max())
     s_prev_max = float(df["stoch_k"].iloc[-5:-1].max())
-    if p_now > p_prev_max and s_now < s_prev_max and s_now > 70:
+    if p_now > p_prev_max and s_now < s_prev_max and s_now > 60:
         return "Bearish Divergence (Higher Price High + Lower Stoch High)"
 
     return "None"
@@ -311,22 +311,21 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
-# --- AI ANALYST EVALUATION ---
-async def analyze_signal_with_ai(proposed_action: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, divergence: str):
+# --- AI ANALYST EVALUATION (REVISED FOR 5M & 15M ONLY) ---
+async def analyze_signal_with_ai(proposed_action: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, divergence: str):
     prompt = f"""
 Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
 A technical trigger suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
-2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
-3. 1-Hour: Close=${float(df_1h['close'].iloc[-1]):.2f}, EMA 50=${float(df_1h['ema_50'].iloc[-1]):.2f}, VWAP=${float(df_1h['vwap'].iloc[-1]):.2f}.
-4. Divergence State: {divergence}.
+1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
+2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, EMA 50=${float(df_15m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_15m['ema_200'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
+3. Divergence State: {divergence}.
 
 CRITICAL VETO RULES:
-- VETO if price is directly buying into 1H resistance or selling into 1H support.
 - VETO if 5M Stoch RSI is exhausted (>85 for BUY, <15 for SELL) without bullish/bearish divergence.
 - VETO if proposed BUY is below 5M EMA 200 or proposed SELL is above 5M EMA 200 (counter-trend trap).
+- VETO if 15M ADX is below 15.0 indicating extreme horizontal chop.
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -362,26 +361,24 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP (9-WIN TRADING RULE SYSTEM) ---
+# --- BACKGROUND SCANNING LOOP (5M & 15M ONLY, SAFE 300s CYCLE) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
-                print("Checking Twelve Data Multi-Timeframe Spot Gold Data...")
+                print("Checking Twelve Data Multi-Timeframe Spot Gold Data (5m & 15m)...")
                 df_5m = await fetch_timeframe_data(client, "5min")
                 df_15m = await fetch_timeframe_data(client, "15min")
-                df_1h = await fetch_timeframe_data(client, "1h")
 
-                if df_5m is None or df_15m is None or df_1h is None:
+                if df_5m is None or df_15m is None:
                     print("Failed to fetch complete timeframe candles. Retrying next cycle.")
-                    await asyncio.sleep(360)
+                    await asyncio.sleep(300)
                     continue
 
                 df_5m = calculate_metrics(df_5m)
                 df_15m = calculate_metrics(df_15m)
-                df_1h = calculate_metrics(df_1h)
 
-                # Look across the last 3 candles to cover the 6-minute sleep window
+                # Look across the last 3 candles to ensure wicks are covered
                 curr_high = float(df_5m["high"].tail(3).max())
                 curr_low = float(df_5m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
@@ -395,9 +392,12 @@ async def background_scanning_loop():
                 ema_50_5m = float(df_5m["ema_50"].iloc[-1])
                 ema_200_5m = float(df_5m["ema_200"].iloc[-1])
                 
-                # 9-WIN CORE RULE 1: EMA 50 & EMA 200 Multi-Timeframe Trend Lock
-                is_uptrend = (c_5m > ema_200_5m) and (ema_50_5m > ema_200_5m)
-                is_downtrend = (c_5m < ema_200_5m) and (ema_50_5m < ema_200_5m)
+                # Multi-Timeframe Trend Lock (5m & 15m)
+                c_15m = float(df_15m["close"].iloc[-1])
+                ema_200_15m = float(df_15m["ema_200"].iloc[-1])
+
+                is_uptrend = (c_5m > ema_200_5m) and (ema_50_5m > ema_200_5m) and (c_15m > ema_200_15m)
+                is_downtrend = (c_5m < ema_200_5m) and (ema_50_5m < ema_200_5m) and (c_15m < ema_200_15m)
 
                 divergence = check_divergence(df_5m)
 
@@ -406,19 +406,19 @@ async def background_scanning_loop():
                 stoch_d_curr = float(df_5m["stoch_d"].iloc[-1])
                 stoch_d_prev = float(df_5m["stoch_d"].iloc[-2])
 
-                # 9-WIN CORE RULE 2: Stochastic RSI Pullback Crossover out of Oversold (<30) / Overbought (>70)
-                stoch_buy_cross = (stoch_k_prev <= stoch_d_prev) and (stoch_k_curr > stoch_d_curr) and (stoch_k_curr < 30.0)
-                stoch_sell_cross = (stoch_k_prev >= stoch_d_prev) and (stoch_k_curr < stoch_d_curr) and (stoch_k_curr > 70.0)
+                # Widened Stochastic RSI crossover boundary (< 40.0 / > 60.0) for increased frequency
+                stoch_buy_cross = (stoch_k_prev <= stoch_d_prev) and (stoch_k_curr > stoch_d_curr) and (stoch_k_curr < 40.0)
+                stoch_sell_cross = (stoch_k_prev >= stoch_d_prev) and (stoch_k_curr < stoch_d_curr) and (stoch_k_curr > 60.0)
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
                 # --- TREND-FILTERED SIGNAL EVALUATION ---
-                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)" and is_uptrend:
+                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)":
                     proposed_action = "BUY"
                     trigger_type = "Divergence Reversal"
 
-                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)" and is_downtrend:
+                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)":
                     proposed_action = "SELL"
                     trigger_type = "Divergence Reversal"
 
@@ -457,10 +457,10 @@ async def background_scanning_loop():
 
                 # --- VISIBLE SCAN STATUS LOGS ---
                 if proposed_action == "HOLD":
-                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | EMA 200: ${ema_200_5m:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
+                    print(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M EMA 200: ${ema_200_5m:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
                 else:
                     print(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, df_1h, divergence)
+                    ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, divergence)
 
                     atr_5m = float(df_5m["atr"].iloc[-1])
                     sl_dist = max(4.50, min(8.00, atr_5m * 2.0))
@@ -499,13 +499,14 @@ async def background_scanning_loop():
                     else:
                         log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
 
-                del df_5m, df_15m, df_1h
+                del df_5m, df_15m
                 gc.collect()
 
             except Exception as e:
                 print(f"[SCAN LOOP ERROR] {e}")
 
-            await asyncio.sleep(360)
+            # 300 seconds (5 minutes) sleep = 576 requests/day (well under Twelve Data's 800 free cap)
+            await asyncio.sleep(300)
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager

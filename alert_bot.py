@@ -90,7 +90,10 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, stoch_k:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
     - Current Price: ${price:.2f}
-    - 5M 9 EMA: ${ema9:.2f} \vert{} 21 EMA:${ema21:.2f} | 200 EMA: ${ema200:.2f}     - 15M ADX Trend Strength: {adx:.1f}     - 5M Stoch RSI \%K: {stoch_k:.1f}     - Current ATR:${atr:.2f}
+    - 5M 9 EMA: ${ema9:.2f} | 21 EMA: ${ema21:.2f} | 200 EMA: ${ema200:.2f}
+    - 15M ADX Trend Strength: {adx:.1f}
+    - 5M Stoch RSI %K: {stoch_k:.1f}
+    - Current ATR: ${atr:.2f}
 
     STRICT RULES:
     1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 200 EMA (counter-trend).
@@ -275,10 +278,10 @@ async def background_scanning_loop():
                 # Step 3: Expanded Proximity Guard (2.5 * ATR)
                 max_distance_cap = 2.5 * atr
                 if proposed_action == "BUY" and (price - ema21) > max_distance_cap:
-                    logging.info(f"[PROXIMITY VETO] BUY blocked: Price ${price:.2f} is${price - ema21:.2f} above 21 EMA")
+                    logging.info(f"[PROXIMITY VETO] BUY blocked: Price ${price:.2f} is ${price - ema21:.2f} above 21 EMA")
                     proposed_action = "HOLD"
                 elif proposed_action == "SELL" and (ema21 - price) > max_distance_cap:
-                    logging.info(f"[PROXIMITY VETO] SELL blocked: Price ${price:.2f} is${ema21 - price:.2f} below 21 EMA")
+                    logging.info(f"[PROXIMITY VETO] SELL blocked: Price ${price:.2f} is ${ema21 - price:.2f} below 21 EMA")
                     proposed_action = "HOLD"
 
                 # Step 4: Reduced Cooldown Guard (2.5 pips)
@@ -291,7 +294,7 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
                     
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} \vert{} 9 EMA:${ema9:.2f} | 21 EMA: ${ema21:.2f} \vert{} 200 EMA:${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9 EMA: ${ema9:.2f} | 21 EMA: ${ema21:.2f} | 200 EMA: ${ema200:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
 
                 # Step 5: AI Analysis & Signal Dispatch
                 if proposed_action != "HOLD":
@@ -530,3 +533,47 @@ async def telegram_webhook(request: Request):
                         entry = float(l['entry_price'])
                         exit_p = float(l['exit_price']) if l['exit_price'] else None
                         outcome = l['outcome']
+                        date_str = l['created_at'].strftime("%m-%d %H:%M") if l['created_at'] else "N/A"
+
+                        if exit_p is not None:
+                            diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                            pips = diff * 10.0
+                            pip_str = f"*{pips:+.1f} pips*"
+                        else:
+                            pip_str = "*ACTIVE / IN PROGRESS*"
+
+                        if "WIN" in outcome or "CLOSED" in outcome:
+                            icon = "🟢"
+                        elif "LOSS" in outcome:
+                            icon = "🔴"
+                        else:
+                            icon = "🟡"
+
+                        reply += (
+                            f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                            f"• Entry: ${entry:.2f} → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                            f"• Outcome: *{outcome}*\n"
+                            f"• Result: {pip_str} | Time: {date_str}\n"
+                            f"──────────────────────────\n"
+                        )
+
+            elif text == "/help":
+                reply = (
+                    f"🤖 *3 EMA SIGNAL BOT COMMANDS:*\n\n"
+                    f"`/stats` - Comprehensive Win-Rate & Risk Performance Report\n"
+                    f"`/pips` - Detailed Gross/Net Pips & USD Profit Breakdown\n"
+                    f"`/logs` - Detailed View of Last 10 Trades & Outcomes\n"
+                    f"`/help` - Display Interactive Command Guide"
+                )
+
+            cur.close()
+            conn.close()
+
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(url, json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"})
+
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run("alert_bot:app", host="0.0.0.0", port=8000)

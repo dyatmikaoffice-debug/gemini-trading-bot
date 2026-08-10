@@ -31,7 +31,7 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # ---------------------------------------------------------
-# TECHNICAL INDICATORS: 9, 21, 100 EMAs + ATR + ADX
+# TECHNICAL INDICATORS: EMA 9, 21, 100 + ATR + ADX
 # ---------------------------------------------------------
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -67,7 +67,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # AI ANALYST RISK FILTER
 # ---------------------------------------------------------
 
-async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: float, ema21: float, ema100: float, atr: float) -> str:
+async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: float, ema21: float, ema100: float, atr: float, trigger_reason: str) -> str:
     if not GROQ_API_KEY:
         return "APPROVE"
         
@@ -75,14 +75,15 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: fl
     You are an institutional Gold Risk Analyst. Evaluate this trade setup:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
+    - Trigger Source: {trigger_reason}
     - Current Price: ${price:.2f}
     - 5M EMAs -> 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f}
     - 15M ADX Trend Strength: {adx:.1f}
     - Current ATR: ${atr:.2f}
 
     STRICT RULES:
-    1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 100 EMA (counter-trend).
-    2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA or 100 EMA (counter-trend).
+    1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 100 EMA.
+    2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA or 100 EMA.
     3. VETO if ADX < 10 (extreme low-volatility chop zone).
 
     Respond strictly with APPROVE or VETO followed by a 1-sentence explanation.
@@ -203,7 +204,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (HIGH FREQUENCY 9/21/100 EMA)
+# BACKGROUND MARKET SCANNER (ALL 3 EMA CROSSOVERS TRIGGER)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -224,7 +225,6 @@ async def background_scanning_loop():
                 df = calculate_indicators(df)
                 latest = df.iloc[-1]
                 prev = df.iloc[-2]
-                prev2 = df.iloc[-3]
                 
                 price = float(latest['close'])
                 ema9 = float(latest['ema9'])
@@ -238,45 +238,44 @@ async def background_scanning_loop():
                 
                 update_open_trades(price, high_3c, low_3c)
 
-                # Step 1: Directional Alignment (9 / 21 / 100 EMA)
-                is_bullish_alignment = (price > ema9) and (ema9 > ema21) and (ema21 > ema100)
-                is_bearish_alignment = (price < ema9) and (ema9 < ema21) and (ema21 < ema100)
+                # Deteksi Perpotongan Garis Bullish (Cross Above)
+                ema9_cross_above_21 = (prev['ema9'] <= prev['ema21']) and (latest['ema9'] > latest['ema21'])
+                ema9_cross_above_100 = (prev['ema9'] <= prev['ema100']) and (latest['ema9'] > latest['ema100'])
+                ema21_cross_above_100 = (prev['ema21'] <= prev['ema100']) and (latest['ema21'] > latest['ema100'])
 
-                # Step 2: Measure EMA Spreads (Distance between EMA 9 and 21)
-                latest_spread = abs(latest['ema9'] - latest['ema21'])
-                prev_spread = abs(prev['ema9'] - prev['ema21'])
-                
-                was_compressed = prev_spread <= (1.0 * atr)
-                is_expanding = latest_spread > prev_spread
+                # Deteksi Perpotongan Garis Bearish (Cross Below)
+                ema9_cross_below_21 = (prev['ema9'] >= prev['ema21']) and (latest['ema9'] < latest['ema21'])
+                ema9_cross_below_100 = (prev['ema9'] >= prev['ema100']) and (latest['ema9'] < latest['ema100'])
+                ema21_cross_below_100 = (prev['ema21'] >= prev['ema100']) and (latest['ema21'] < latest['ema100'])
 
                 proposed_action = "HOLD"
+                trigger_reason = ""
 
-                # Step 3: Fast Execution Triggers (ADX >= 12.0)
+                # Saringan Volatilitas ADX >= 12.0
                 if adx >= 12.0:
-                    # --- TRIGGER TYPE 1: Squeeze Breakout & Fan-Out ---
-                    if was_compressed and is_expanding:
-                        if is_bullish_alignment and (prev['ema9'] <= prev['ema21']):
-                            proposed_action = "BUY"
-                        elif is_bearish_alignment and (prev['ema9'] >= prev['ema21']):
-                            proposed_action = "SELL"
+                    # --- EVALUASI SINYAL BUY ---
+                    if ema9_cross_above_21 and latest['ema21'] > latest['ema100']:
+                        proposed_action = "BUY"
+                        trigger_reason = "EMA 9 Potong Ke Atas EMA 21 (Valid Uptrend)"
+                    elif ema9_cross_above_100:
+                        proposed_action = "BUY"
+                        trigger_reason = "EMA 9 Potong Ke Atas EMA 100 (Awal Reversal Bullish)"
+                    elif ema21_cross_above_100:
+                        proposed_action = "BUY"
+                        trigger_reason = "EMA 21 Potong Ke Atas EMA 100 (Konfirmasi Reversal Bullish)"
 
-                    # --- TRIGGER TYPE 2: EMA 9 or EMA 21 Rebound ---
-                    if proposed_action == "HOLD":
-                        if is_bullish_alignment:
-                            prev_touched_ema = (prev['low'] <= (prev['ema9'] * 1.0005)) or (prev['low'] <= (prev['ema21'] * 1.0005))
-                            latest_is_green = (latest['close'] > latest['open']) and (latest['close'] > latest['ema9'])
-                            
-                            if prev_touched_ema and latest_is_green:
-                                proposed_action = "BUY"
+                    # --- EVALUASI SINYAL SELL ---
+                    elif ema9_cross_below_21 and latest['ema21'] < latest['ema100']:
+                        proposed_action = "SELL"
+                        trigger_reason = "EMA 9 Potong Ke Bawah EMA 21 (Valid Downtrend)"
+                    elif ema9_cross_below_100:
+                        proposed_action = "SELL"
+                        trigger_reason = "EMA 9 Potong Ke Bawah EMA 100 (Awal Reversal Bearish)"
+                    elif ema21_cross_below_100:
+                        proposed_action = "SELL"
+                        trigger_reason = "EMA 21 Potong Ke Bawah EMA 100 (Konfirmasi Reversal Bearish)"
 
-                        elif is_bearish_alignment:
-                            prev_touched_ema = (prev['high'] >= (prev['ema9'] * 0.9995)) or (prev['high'] >= (prev['ema21'] * 0.9995))
-                            latest_is_red = (latest['close'] < latest['open']) and (latest['close'] < latest['ema9'])
-                            
-                            if prev_touched_ema and latest_is_red:
-                                proposed_action = "SELL"
-
-                # Step 4: Proximity Cap Guard (2.5 * ATR)
+                # Proximity Guard Filter (Dibatasi 2.5 x ATR untuk cegah entry puncak candle)
                 max_distance_cap = 2.5 * atr
                 if proposed_action == "BUY" and (price - ema21) > max_distance_cap:
                     logging.info(f"[PROXIMITY VETO] BUY blocked: Price ${price:.2f} is ${price - ema21:.2f} above 21 EMA")
@@ -285,7 +284,7 @@ async def background_scanning_loop():
                     logging.info(f"[PROXIMITY VETO] SELL blocked: Price ${price:.2f} is ${ema21 - price:.2f} below 21 EMA")
                     proposed_action = "HOLD"
 
-                # Step 5: Cooldown Guard
+                # Cooldown Guard Filter
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute("SELECT entry_price, outcome FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1")
@@ -297,9 +296,9 @@ async def background_scanning_loop():
                     
                 logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
 
-                # Step 6: AI Analysis & Signal Dispatch
+                # AI Evaluation & Sinyal Dispatch
                 if proposed_action != "HOLD":
-                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, ema9, ema21, ema100, atr)
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, ema9, ema21, ema100, atr, trigger_reason)
                     
                     sl_dist = max(4.0, min(7.0, atr * 1.5))
                     tp1_dist = sl_dist * 1.5
@@ -326,13 +325,13 @@ async def background_scanning_loop():
 
                     if ai_decision == "APPROVE":
                         msg = (
-                            f"⚡ HIGH FREQUENCY 100 EMA SIGNAL #{new_id}\n\n"
+                            f"⚡ ALL EMA CROSSOVER SIGNAL #{new_id}\n\n"
                             f"Action: *{proposed_action} XAU/USD*\n"
                             f"Entry Price: *${price:.2f}*\n"
                             f"Stop Loss: *${sl:.2f}*\n"
                             f"Take Profit 1: *${tp1:.2f}*\n"
                             f"Take Profit 2: *${tp2:.2f}*\n"
-                            f"System: *EMA 9/21/100 Dynamic Trend*\n"
+                            f"Pemicu: *{trigger_reason}*\n"
                             f"ADX Momentum: *{adx:.1f}*"
                         )
                         await send_telegram_alert(msg)
@@ -361,7 +360,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
-    return {"status": "Live", "bot": "Gold 100 EMA High Frequency Signal Bot"}
+    return {"status": "Live", "bot": "Gold All EMA Crossover Signal Bot"}
 
 # MT5 Bridge Endpoint
 @app.get("/get-latest-signal")
@@ -446,7 +445,7 @@ async def telegram_webhook(request: Request):
                 profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
 
                 reply = (
-                    f"📊 *EMA 100 SYSTEM PERFORMANCE*\n"
+                    f"📊 *EMA ALL-CROSS PERFORMANCE*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *NET PIPS & PROFIT:*\n"
                     f"• Net Pips: *{total_pips:+.1f} pips*\n"
@@ -511,7 +510,7 @@ async def telegram_webhook(request: Request):
                     f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
                     f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💡 *Note:* Calculated at $0.10/pip (0.01 lot XAU/USD)."
+                    f"💡 *Catatan:* Dihitung pada $0.10/pip (0.01 lot XAU/USD)."
                 )
 
             elif text == "/logs":
@@ -525,7 +524,7 @@ async def telegram_webhook(request: Request):
                 logs = cur.fetchall()
 
                 if not logs:
-                    reply = "📜 *LAST 10 TRADE LOGS:*\n\n_No executed trades found in database._"
+                    reply = "📜 *LAST 10 TRADE LOGS:*\n\n_Belum ada transaksi yang tereksekusi di database._"
                 else:
                     reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     for l in logs:
@@ -560,11 +559,11 @@ async def telegram_webhook(request: Request):
 
             elif text == "/help":
                 reply = (
-                    f"🤖 *EMA SIGNAL BOT COMMANDS:*\n\n"
-                    f"`/stats` - Comprehensive Win-Rate & Risk Performance Report\n"
-                    f"`/pips` - Detailed Gross/Net Pips & USD Profit Breakdown\n"
-                    f"`/logs` - Detailed View of Last 10 Trades & Outcomes\n"
-                    f"`/help` - Display Interactive Command Guide"
+                    f"🤖 *EMA ALL-CROSS SIGNAL BOT COMMANDS:*\n\n"
+                    f"`/stats` - Laporan Performa Win-Rate & Risiko Lengkap\n"
+                    f"`/pips` - Rincian Pips Kotor/Bersih & Estimasi Profit USD\n"
+                    f"`/logs` - Tampilan Detail 10 Sinyal Terakhir & Hasilnya\n"
+                    f"`/help` - Menampilkan Panduan Perintah Interaktif"
                 )
 
             cur.close()

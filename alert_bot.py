@@ -32,13 +32,14 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # ---------------------------------------------------------
-# TECHNICAL INDICATORS & 3-EMA / MACD / BB ARCHITECTURE
+# TECHNICAL INDICATORS & 4-EMA CONFLUENCE ARCHITECTURE
 # ---------------------------------------------------------
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # 3 EMA Configuration (Fast 9, Medium 50, Slow/Reference 200)
+    # 4-EMA Confluence Setup (EMA 9, EMA 20, EMA 50, and EMA 200 Reference)
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
@@ -69,16 +70,16 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------
 # AI ANALYST RISK FILTER
 # ---------------------------------------------------------
-async def analyze_signal_with_ai(price: float, action: str, ema9: float, ema50: float, ema200: float, macd_hist: float) -> str:
+async def analyze_signal_with_ai(price: float, action: str, ema9: float, ema20: float, ema50: float, ema200: float, macd_hist: float) -> str:
     if not GROQ_API_KEY:
         return "APPROVE"
         
     prompt = f"""
-    You are an institutional Gold Risk Analyst. Evaluate this 3-EMA trade setup:
+    You are an institutional Gold Risk Analyst. Evaluate this 4-EMA Confluence setup:
     - Pair: Spot Gold (XAU/USD)
     - Action Proposed: {action}
     - Current Price: ${price:.2f}
-    - 5M EMA 9: ${ema9:.2f} | 5M EMA 50: ${ema50:.2f} | 5M EMA 200 Reference: ${ema200:.2f}
+    - 5M EMA 9: ${ema9:.2f} | EMA 20: ${ema20:.2f} | EMA 50: ${ema50:.2f} | EMA 200 Reference: ${ema200:.2f}
     - MACD Histogram Momentum: {macd_hist:.4f}
 
     STRICT RULES:
@@ -202,7 +203,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (3-EMA & MACD / BB STRATEGY)
+# BACKGROUND MARKET SCANNER (4-EMA CONFLUENCE ARCHITECTURE)
 # ---------------------------------------------------------
 async def background_scanning_loop():
     while True:
@@ -221,10 +222,12 @@ async def background_scanning_loop():
 
                 df = calculate_indicators(df)
                 latest = df.iloc[-1]
-                prev = df.iloc[-1]
+                prev = df.iloc[-2]
+                prev2 = df.iloc[-3]
 
                 price = float(latest['close'])
                 ema9 = float(latest['ema9'])
+                ema20 = float(latest['ema20'])
                 ema50 = float(latest['ema50'])
                 ema200 = float(latest['ema200'])
                 atr = float(latest['atr'])
@@ -237,27 +240,24 @@ async def background_scanning_loop():
 
                 update_open_trades(price, high_3c, low_3c)
 
-                # Step 1: 3-EMA Dynamic Alignment & Reference Check
+                # Step 1: 4-EMA Confluence Alignment Filter
                 proposed_action = "HOLD"
                 
-                # EMA 200 acts as a flexible reference bias rather than an absolute block
-                is_bullish_alignment = (ema9 > ema50)
-                is_bearish_alignment = (ema9 < ema50)
+                is_bullish_confluence = (ema9 > ema20) and (ema20 > ema50)
+                is_bearish_confluence = (ema9 < ema20) and (ema20 < ema50)
 
                 # Step 2: Bollinger Bandwidth Squeeze & MACD Exhaustion Filters
                 is_consolidating = bb_width < bb_width_ma
-                macd_exhaustion_buy = (is_bullish_alignment and macd_hist < df.iloc[-2]['macd_hist'] and df.iloc[-2]['macd_hist'] < df.iloc[-3]['macd_hist'])
-                macd_exhaustion_sell = (is_bearish_alignment and macd_hist > df.iloc[-2]['macd_hist'] and df.iloc[-2]['macd_hist'] > df.iloc[-3]['macd_hist'])
+                macd_exhaustion_buy = (is_bullish_confluence and macd_hist < prev['macd_hist'] and prev['macd_hist'] < prev2['macd_hist'])
+                macd_exhaustion_sell = (is_bearish_confluence and macd_hist > prev['macd_hist'] and prev['macd_hist'] > prev2['macd_hist'])
 
-                # Step 3: Pure 3-EMA Execution Trigger (No RSI)
+                # Step 3: Execution Trigger
                 if not is_consolidating:
-                    if is_bullish_alignment and not macd_exhaustion_buy:
-                        # Pullback / Touch entry near EMA 9 with expanding MACD histogram
+                    if is_bullish_confluence and not macd_exhaustion_buy:
                         if price >= ema9 and macd_hist > 0:
                             proposed_action = "BUY"
 
-                    elif is_bearish_alignment and not macd_exhaustion_sell:
-                        # Rally entry near EMA 9 with expanding negative MACD histogram
+                    elif is_bearish_confluence and not macd_exhaustion_sell:
                         if price <= ema9 and macd_hist < 0:
                             proposed_action = "SELL"
                 else:
@@ -276,11 +276,11 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
 
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | EMA9: ${ema9:.2f} | EMA50: ${ema50:.2f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | EMA9: ${ema9:.2f} | EMA20: ${ema20:.2f} | Action: {proposed_action}")
 
                 # Step 5: AI Analysis & Signal Dispatch
                 if proposed_action != "HOLD":
-                    ai_decision = await analyze_signal_with_ai(price, proposed_action, ema9, ema50, ema200, macd_hist)
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, ema9, ema20, ema50, ema200, macd_hist)
                     
                     sl_dist = max(4.5, min(8.0, atr * 2.0))
                     tp1_dist = sl_dist * 1.5
@@ -306,13 +306,13 @@ async def background_scanning_loop():
                     new_id = cur.fetchone()['id']
 
                     if ai_decision == "APPROVE":
-                        msg = f"⚡ *3-EMA SYSTEM SIGNAL #{new_id}*\n\n" \
+                        msg = f"⚡ *4-EMA CONFLUENCE SIGNAL #{new_id}*\n\n" \
                               f"Action: *{proposed_action} XAU/USD*\n" \
                               f"Entry Price: *${price:.2f}*\n" \
                               f"Stop Loss: *${sl:.2f}*\n" \
                               f"Take Profit 1: *${tp1:.2f}*\n" \
                               f"Take Profit 2: *${tp2:.2f}*\n" \
-                              f"EMA 9/50 Fan-Out: `{ema9:.2f} / {ema50:.2f}`"
+                              f"EMA 9/20/50 Fan: `{ema9:.2f} / {ema20:.2f} / {ema50:.2f}`"
                         await send_telegram_alert(msg)
 
                 cur.close()
@@ -339,7 +339,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
-    return {"status": "Live", "bot": "Gold 3-EMA Signal Bot System"}
+    return {"status": "Live", "bot": "Gold 4-EMA Confluence Signal Bot"}
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
@@ -402,7 +402,7 @@ async def telegram_webhook(request: Request):
                 profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
 
                 reply = (
-                    f"📊 *3-EMA SYSTEM PERFORMANCE*\n"
+                    f"📊 *4-EMA CONFLUENCE PERFORMANCE*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *NET PIPS & PROFIT:*\n"
                     f"• Net Pips: *{total_pips:+.1f} pips*\n"
@@ -516,7 +516,7 @@ async def telegram_webhook(request: Request):
 
             elif text == "/help":
                 reply = (
-                    "🤖 *3-EMA BOT COMMANDS:*\n\n"
+                    "🤖 *4-EMA BOT COMMANDS:*\n\n"
                     "/stats - Comprehensive Win-Rate & Risk Performance Report\n"
                     "/pips - Detailed Gross/Net Pips & USD Profit Breakdown\n"
                     "/logs - Detailed View of Last 10 Trades & Outcomes\n"

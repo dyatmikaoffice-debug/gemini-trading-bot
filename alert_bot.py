@@ -31,7 +31,7 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # ---------------------------------------------------------
-# TECHNICAL INDICATORS: EMA 9, 21, 100 + ATR + ADX
+# TECHNICAL INDICATORS: EMA 9, 21, 100 + ATR
 # ---------------------------------------------------------
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -49,25 +49,13 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['tr'] = df[['high_low', 'high_cp', 'low_cp']].max(axis=1)
     df['atr'] = df['tr'].rolling(14).mean()
 
-    # Average Directional Index - ADX (14)
-    up = df['high'].diff()
-    down = -df['low'].diff()
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    
-    tr_smooth = df['tr'].rolling(14).sum()
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / (tr_smooth + 1e-10))
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / (tr_smooth + 1e-10))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-    df['adx'] = dx.rolling(14).mean()
-
     return df
 
 # ---------------------------------------------------------
 # AI ANALYST RISK FILTER
 # ---------------------------------------------------------
 
-async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: float, ema21: float, ema100: float, atr: float, trigger_reason: str) -> str:
+async def analyze_signal_with_ai(price: float, action: str, ema9: float, ema21: float, ema100: float, atr: float, trigger_reason: str) -> str:
     if not GROQ_API_KEY:
         return "APPROVE"
         
@@ -78,13 +66,11 @@ async def analyze_signal_with_ai(price: float, action: str, adx: float, ema9: fl
     - Trigger Source: {trigger_reason}
     - Current Price: ${price:.2f}
     - 5M EMAs -> 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f}
-    - 15M ADX Trend Strength: {adx:.1f}
     - Current ATR: ${atr:.2f}
 
     STRICT RULES:
     1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 100 EMA.
     2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA or 100 EMA.
-    3. VETO if ADX < 10 (extreme low-volatility chop zone).
 
     Respond strictly with APPROVE or VETO followed by a 1-sentence explanation.
     """
@@ -204,7 +190,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (TRIPLE CROSS & DUAL CROSS DETECTOR)
+# BACKGROUND MARKET SCANNER (ADX FILTER OFF)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -230,7 +216,6 @@ async def background_scanning_loop():
                 ema9 = float(latest['ema9'])
                 ema21 = float(latest['ema21'])
                 ema100 = float(latest['ema100'])
-                adx = float(latest['adx'])
                 atr = float(latest['atr'])
                 
                 high_3c = float(df['high'].tail(3).max())
@@ -247,45 +232,43 @@ async def background_scanning_loop():
                 ema9_cross_below_100 = (prev['ema9'] >= prev['ema100']) and (latest['ema9'] < latest['ema100'])
                 ema21_cross_below_100 = (prev['ema21'] >= prev['ema100']) and (latest['ema21'] < latest['ema100'])
 
-                # Triple Crossover Detection (All 3 lines converge and cross at once)
+                # Triple Crossover Detection
                 is_triple_bullish_cross = ema9_cross_above_21 and ema9_cross_above_100 and ema21_cross_above_100
                 is_triple_bearish_cross = ema9_cross_below_21 and ema9_cross_below_100 and ema21_cross_below_100
 
                 proposed_action = "HOLD"
                 trigger_reason = ""
 
-                # Filter Volatilitas ADX >= 12.0
-                if adx >= 12.0:
-                    # 1. TRIPLE CROSSOVER (Priority Check - Highest Conviction)
-                    if is_triple_bullish_cross:
-                        proposed_action = "BUY"
-                        trigger_reason = "🔥 TRIPLE EMA BULLISH EXPLOSION (Big Move Imminent)"
-                    elif is_triple_bearish_cross:
-                        proposed_action = "SELL"
-                        trigger_reason = "🔥 TRIPLE EMA BEARISH EXPLOSION (Big Move Imminent)"
+                # --- 1. TRIPLE CROSSOVER (Highest Priority) ---
+                if is_triple_bullish_cross:
+                    proposed_action = "BUY"
+                    trigger_reason = "🔥 TRIPLE EMA BULLISH EXPLOSION (Big Move Imminent)"
+                elif is_triple_bearish_cross:
+                    proposed_action = "SELL"
+                    trigger_reason = "🔥 TRIPLE EMA BEARISH EXPLOSION (Big Move Imminent)"
 
-                    # 2. INDIVIDUAL CROSSOVERS
-                    elif ema9_cross_above_21 and latest['ema21'] > latest['ema100']:
-                        proposed_action = "BUY"
-                        trigger_reason = "EMA 9 Potong Ke Atas EMA 21 (Valid Uptrend)"
-                    elif ema9_cross_above_100:
-                        proposed_action = "BUY"
-                        trigger_reason = "EMA 9 Potong Ke Atas EMA 100 (Awal Reversal Bullish)"
-                    elif ema21_cross_above_100:
-                        proposed_action = "BUY"
-                        trigger_reason = "EMA 21 Potong Ke Atas EMA 100 (Konfirmasi Reversal Bullish)"
+                # --- 2. INDIVIDUAL CROSSOVERS ---
+                elif ema9_cross_above_21 and latest['ema21'] > latest['ema100']:
+                    proposed_action = "BUY"
+                    trigger_reason = "EMA 9 Potong Ke Atas EMA 21 (Valid Uptrend)"
+                elif ema9_cross_above_100:
+                    proposed_action = "BUY"
+                    trigger_reason = "EMA 9 Potong Ke Atas EMA 100 (Awal Reversal Bullish)"
+                elif ema21_cross_above_100:
+                    proposed_action = "BUY"
+                    trigger_reason = "EMA 21 Potong Ke Atas EMA 100 (Konfirmasi Reversal Bullish)"
 
-                    elif ema9_cross_below_21 and latest['ema21'] < latest['ema100']:
-                        proposed_action = "SELL"
-                        trigger_reason = "EMA 9 Potong Ke Bawah EMA 21 (Valid Downtrend)"
-                    elif ema9_cross_below_100:
-                        proposed_action = "SELL"
-                        trigger_reason = "EMA 9 Potong Ke Bawah EMA 100 (Awal Reversal Bearish)"
-                    elif ema21_cross_below_100:
-                        proposed_action = "SELL"
-                        trigger_reason = "EMA 21 Potong Ke Bawah EMA 100 (Konfirmasi Reversal Bearish)"
+                elif ema9_cross_below_21 and latest['ema21'] < latest['ema100']:
+                    proposed_action = "SELL"
+                    trigger_reason = "EMA 9 Potong Ke Bawah EMA 21 (Valid Downtrend)"
+                elif ema9_cross_below_100:
+                    proposed_action = "SELL"
+                    trigger_reason = "EMA 9 Potong Ke Bawah EMA 100 (Awal Reversal Bearish)"
+                elif ema21_cross_below_100:
+                    proposed_action = "SELL"
+                    trigger_reason = "EMA 21 Potong Ke Bawah EMA 100 (Konfirmasi Reversal Bearish)"
 
-                # Proximity Cap Guard Filter (Dibatasi 2.5 x ATR)
+                # Proximity Cap Guard Filter (2.5 x ATR)
                 max_distance_cap = 2.5 * atr
                 if proposed_action == "BUY" and (price - ema21) > max_distance_cap:
                     logging.info(f"[PROXIMITY VETO] BUY blocked: Price ${price:.2f} is ${price - ema21:.2f} above 21 EMA")
@@ -304,11 +287,11 @@ async def background_scanning_loop():
                 if last_trade and abs(price - float(last_trade['entry_price'])) < min_distance:
                     proposed_action = "HOLD"
                     
-                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | ADX: {adx:.1f} | Action: {proposed_action}")
+                logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | Action: {proposed_action}")
 
-                # AI Evaluation & Sinyal Dispatch
+                # AI Evaluation & Signal Dispatch
                 if proposed_action != "HOLD":
-                    ai_decision = await analyze_signal_with_ai(price, proposed_action, adx, ema9, ema21, ema100, atr, trigger_reason)
+                    ai_decision = await analyze_signal_with_ai(price, proposed_action, ema9, ema21, ema100, atr, trigger_reason)
                     
                     sl_dist = max(4.0, min(7.0, atr * 1.5))
                     tp1_dist = sl_dist * 1.5
@@ -341,8 +324,7 @@ async def background_scanning_loop():
                             f"Stop Loss: *${sl:.2f}*\n"
                             f"Take Profit 1: *${tp1:.2f}*\n"
                             f"Take Profit 2: *${tp2:.2f}*\n"
-                            f"Pemicu: *{trigger_reason}*\n"
-                            f"ADX Momentum: *{adx:.1f}*"
+                            f"Pemicu: *{trigger_reason}*"
                         )
                         await send_telegram_alert(msg)
 

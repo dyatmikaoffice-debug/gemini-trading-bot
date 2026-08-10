@@ -52,47 +52,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------
-# AI ANALYST RISK FILTER
-# ---------------------------------------------------------
-
-async def analyze_signal_with_ai(price: float, action: str, ema9: float, ema21: float, ema100: float, atr: float, trigger_reason: str) -> str:
-    if not GROQ_API_KEY:
-        return "APPROVE"
-        
-    prompt = f"""
-    You are an institutional Gold Risk Analyst. Evaluate this trade setup:
-    - Pair: Spot Gold (XAU/USD)
-    - Action Proposed: {action}
-    - Trigger Source: {trigger_reason}
-    - Current Price: ${price:.2f}
-    - 5M EMAs -> 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f}
-    - Current ATR: ${atr:.2f}
-
-    STRICT RULES:
-    1. VETO if proposed BUY occurs when 9 EMA is below 21 EMA or 100 EMA.
-    2. VETO if proposed SELL occurs when 9 EMA is above 21 EMA or 100 EMA.
-
-    Respond strictly with APPROVE or VETO followed by a 1-sentence explanation.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1
-                }
-            )
-            data = res.json()
-            content = data['choices'][0]['message']['content'].strip()
-            return "VETO" if "VETO" in content.upper() else "APPROVE"
-    except Exception as e:
-        logging.error(f"AI Analyst Exception: {e}")
-        return "APPROVE"
-
-# ---------------------------------------------------------
 # TELEGRAM MESSAGING & AUTOMATED WEBHOOK SETUP
 # ---------------------------------------------------------
 
@@ -190,7 +149,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (PURE CROSSOVER MODE)
+# BACKGROUND MARKET SCANNER (INSTANT 100% CROSSOVER DISPATCH)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -247,7 +206,7 @@ async def background_scanning_loop():
                     proposed_action = "SELL"
                     trigger_reason = "🔥 TRIPLE EMA BEARISH EXPLOSION"
 
-                # --- 2. INDIVIDUAL CROSSOVERS (Raw Intersects Trigger Instantly) ---
+                # --- 2. INDIVIDUAL CROSSOVERS (Dispatches Instantly) ---
                 elif ema9_cross_above_21:
                     proposed_action = "BUY"
                     trigger_reason = "EMA 9 Crossed Above EMA 21"
@@ -271,10 +230,8 @@ async def background_scanning_loop():
 
                 logging.info(f"[MARKET SCAN] Price: ${price:.2f} | 9: ${ema9:.2f} | 21: ${ema21:.2f} | 100: ${ema100:.2f} | Action: {proposed_action}")
 
-                # AI Evaluation & Signal Dispatch
+                # Immediate Signal Execution & Telegram Dispatch (AI Veto Safeguard Bypassed)
                 if proposed_action != "HOLD":
-                    ai_decision = await analyze_signal_with_ai(price, proposed_action, ema9, ema21, ema100, atr, trigger_reason)
-                    
                     sl_dist = max(4.0, min(7.0, atr * 1.5))
                     tp1_dist = sl_dist * 1.5
                     tp2_dist = sl_dist * 3.0
@@ -288,8 +245,10 @@ async def background_scanning_loop():
                         tp1 = price - tp1_dist
                         tp2 = price - tp2_dist
 
-                    status_str = "EXECUTED" if ai_decision == "APPROVE" else "VETOED"
+                    status_str = "EXECUTED"
                     
+                    conn = get_db_connection()
+                    cur = conn.cursor()
                     cur.execute("""
                         INSERT INTO signals (action, entry_price, sl_price, tp1_price, tp2_price, status, outcome, created_at)
                         VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', NOW())
@@ -297,21 +256,20 @@ async def background_scanning_loop():
                     """, (proposed_action, float(price), float(sl), float(tp1), float(tp2), status_str))
                     conn.commit()
                     new_id = cur.fetchone()['id']
+                    cur.close()
+                    conn.close()
 
-                    if ai_decision == "APPROVE":
-                        msg = (
-                            f"⚡ EMA CROSSOVER SIGNAL #{new_id}\n\n"
-                            f"Action: *{proposed_action} XAU/USD*\n"
-                            f"Entry Price: *${price:.2f}*\n"
-                            f"Stop Loss: *${sl:.2f}*\n"
-                            f"Take Profit 1: *${tp1:.2f}*\n"
-                            f"Take Profit 2: *${tp2:.2f}*\n"
-                            f"Pemicu: *{trigger_reason}*"
-                        )
-                        await send_telegram_alert(msg)
+                    msg = (
+                        f"⚡ EMA CROSSOVER SIGNAL #{new_id}\n\n"
+                        f"Action: *{proposed_action} XAU/USD*\n"
+                        f"Entry Price: *${price:.2f}*\n"
+                        f"Stop Loss: *${sl:.2f}*\n"
+                        f"Take Profit 1: *${tp1:.2f}*\n"
+                        f"Take Profit 2: *${tp2:.2f}*\n"
+                        f"Trigger: *{trigger_reason}*"
+                    )
+                    await send_telegram_alert(msg)
 
-                cur.close()
-                conn.close()
                 del df
                 gc.collect()
 

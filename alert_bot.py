@@ -89,6 +89,7 @@ def init_db():
     except Exception as e:
         print(f"[NEON DB ERROR] Failed to initialize database: {e}")
 
+# --- FIX: STRICT NATIVE FLOAT SANITIZATION FOR PSYCOPG2 ---
 def log_trade_signal(status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float, confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str):
     if not DATABASE_URL:
         return
@@ -97,6 +98,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         
+        # Explicit conversion to native Python floats prevents numpy schema errors
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -109,7 +111,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
             INSERT INTO signals 
             (timestamp, status, action, trigger_type, price, sl, tp1, tp2, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (wib_time, status, action, trigger_type, price_val, sl_val, tp1_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
+        """, (str(wib_time), str(status), str(action), str(trigger_type), price_val, sl_val, tp1_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
         
         conn.commit()
         cursor.close()
@@ -150,15 +152,13 @@ def update_open_trades(current_high: float, current_low: float):
             exit_price = None
 
             if action == "BUY":
-                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 is not None and c_high >= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
                     elif c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved
-                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss BEFORE TP targets
+                        exit_price = tp1
                 elif sl is not None and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
@@ -170,15 +170,13 @@ def update_open_trades(current_high: float, current_low: float):
                     exit_price = tp1
 
             elif action == "SELL":
-                # Stage 2: Trade already hit TP1 and is tracking to TP2 / BE
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 is not None and c_low <= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
                     elif c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1  # Retain TP1 price so TP1 pips are preserved
-                # Stage 1: PENDING trade — Priority 1 is checking Stop Loss BEFORE TP targets
+                        exit_price = tp1
                 elif sl is not None and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
@@ -445,7 +443,7 @@ async def background_scanning_loop():
                             SELECT price, outcome FROM signals 
                             WHERE status = 'EXECUTED' AND action = %s 
                             ORDER BY id DESC LIMIT 1
-                        """, (proposed_action,))
+                        """, (str(proposed_action),))
                         last_trade = cursor.fetchone()
                         cursor.close()
                         conn.close()
@@ -470,21 +468,21 @@ async def background_scanning_loop():
                     ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, divergence)
 
                     atr_5m = float(df_5m["atr"].iloc[-1])
-                    sl_dist = max(4.50, min(8.00, atr_5m * 2.0))
+                    sl_dist = float(max(4.50, min(8.00, atr_5m * 2.0)))
                     tp1_mult = 1.5
                     tp2_mult = 3.0
 
                     if proposed_action == "BUY":
-                        sl_price = curr_price - sl_dist
-                        tp1_price = curr_price + (sl_dist * tp1_mult)
-                        tp2_price = curr_price + (sl_dist * tp2_mult)
+                        sl_price = float(curr_price - sl_dist)
+                        tp1_price = float(curr_price + (sl_dist * tp1_mult))
+                        tp2_price = float(curr_price + (sl_dist * tp2_mult))
                     else:
-                        sl_price = curr_price + sl_dist
-                        tp1_price = curr_price - (sl_dist * tp1_mult)
-                        tp2_price = curr_price - (sl_dist * tp2_mult)
+                        sl_price = float(curr_price + sl_dist)
+                        tp1_price = float(curr_price - (sl_dist * tp1_mult))
+                        tp2_price = float(curr_price - (sl_dist * tp2_mult))
 
                     if ai_decision.action == proposed_action:
-                        log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                        log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_15m, stoch_15m, divergence, ai_decision.reasoning)
 
                         msg = (
                             f"⚡ *STOCH RSI TRADE SIGNAL*\n\n"
@@ -504,7 +502,7 @@ async def background_scanning_loop():
                         )
                         await send_telegram_alert(client, msg)
                     else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, ai_decision.confidence, adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_15m, stoch_15m, divergence, ai_decision.reasoning)
 
                 del df_5m, df_15m
                 gc.collect()

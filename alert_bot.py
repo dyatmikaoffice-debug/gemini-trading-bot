@@ -320,7 +320,8 @@ Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
 A technical trigger suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}. 2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, EMA 50=${float(df_15m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_15m['ema_200'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI \%K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
+1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
+2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, EMA 50=${float(df_15m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_15m['ema_200'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
 3. Divergence State: {divergence}.
 
 CRITICAL VETO RULES:
@@ -493,4 +494,269 @@ async def background_scanning_loop():
                             f"INDICATOR METRICS:\n"
                             f"- Setup Type: {trigger_type}\n"
                             f"- Divergence Context: {divergence}\n"
-                            f"- 15M
+                            f"- 15M ADX Strength: {adx_15m:.1f}\n"
+                            f"- 15M Stoch RSI: {stoch_15m:.1f}\n\n"
+                            f"Reasoning: {ai_decision.reasoning}"
+                        )
+                        await send_telegram_alert(client, msg)
+                    else:
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+
+                del df_5m, df_15m
+                gc.collect()
+
+            except Exception as e:
+                logging.error(f"[SCAN LOOP ERROR] {e}")
+
+            await asyncio.sleep(300)
+
+# --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+
+    if TELEGRAM_BOT_TOKEN and APP_URL:
+        try:
+            webhook_endpoint = f"{APP_URL.rstrip('/')}/telegram-webhook"
+            set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
+            
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                res = await client.get(set_url)
+                logging.info(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
+        except Exception as e:
+            logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
+
+    scan_task = asyncio.create_task(background_scanning_loop())
+    yield
+    scan_task.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "Trading bot scanner and webhook server active."}
+
+# --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    try:
+        data = await request.json()
+        message = data.get("message", {})
+        raw_text = message.get("text", "").strip().lower()
+        sender_chat_id = str(message.get("chat", {}).get("id", ""))
+
+        if not sender_chat_id or not raw_text:
+            return {"status": "ignored"}
+
+        logging.info(f"[WEBHOOK RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
+
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            if raw_text in ["/help", "/start"]:
+                reply = (
+                    "🤖 *TRADING BOT COMMANDS:*\n\n"
+                    "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
+                    "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
+                    "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
+                    "• `/help` - Display Command Menu"
+                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+
+            elif raw_text == "/stats":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    
+                    cur.execute("SELECT COUNT(*) as total FROM signals WHERE status = 'EXECUTED'")
+                    total_executed = cur.fetchone()['total'] or 0
+
+                    cur.execute("SELECT COUNT(*) as vetoes FROM signals WHERE status = 'VETOED'")
+                    total_vetoes = cur.fetchone()['vetoes'] or 0
+
+                    cur.execute("SELECT COUNT(*) as pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+                    total_pending = cur.fetchone()['pending'] or 0
+
+                    cur.execute("SELECT COUNT(*) as tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
+                    tp1_wins = cur.fetchone()['tp1_wins'] or 0
+
+                    cur.execute("SELECT COUNT(*) as tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
+                    tp2_wins = cur.fetchone()['tp2_wins'] or 0
+
+                    cur.execute("SELECT COUNT(*) as losses FROM signals WHERE outcome LIKE 'LOSS%'")
+                    losses = cur.fetchone()['losses'] or 0
+
+                    cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                    closed_trades = cur.fetchall()
+
+                    total_pips = 0.0
+                    win_pips = 0.0
+                    loss_pips = 0.0
+                    total_wins_count = tp1_wins + tp2_wins
+
+                    for t in closed_trades:
+                        entry = float(t['entry_price'])
+                        exit_p = float(t['exit_price'])
+                        action = t['action']
+                        
+                        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                        pips = diff * 10.0
+                        
+                        total_pips += pips
+                        if pips > 0:
+                            win_pips += pips
+                        else:
+                            loss_pips += abs(pips)
+
+                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                    est_dollar = total_pips * 0.10
+                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
+
+                    cur.close()
+                    conn.close()
+
+                    reply = (
+                        f"📊 *PERFORMANCE ANALYTICS DASHBOARD*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💰 *NET PIPS & PROFIT:*\n"
+                        f"• Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
+                        f"📈 *WIN / LOSS BREAKDOWN:*\n"
+                        f"• Total Executed: *{total_executed}*\n"
+                        f"• Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"• Total Losses (SL Hit): *{losses}*\n"
+                        f"• Active Pending: *{total_pending}*\n\n"
+                        f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
+                        f"• Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
+                        f"🎯 *RISK & TRADE METRICS:*\n"
+                        f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"• Profit Factor: *{profit_factor:.2f}*\n"
+                        f"• Win Rate: *{win_rate:.1f}%*"
+                    )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as db_err:
+                    logging.error(f"[WEBHOOK ERROR /stats] {db_err}")
+                    await send_telegram_alert(client, f"⚠️ Error querying stats: {db_err}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/pips":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                    trades = cur.fetchall()
+
+                    total_pips = 0.0
+                    gross_win_pips = 0.0
+                    gross_loss_pips = 0.0
+                    winning_trades_count = 0
+                    losing_trades_count = 0
+
+                    for t in trades:
+                        entry = float(t['entry_price'])
+                        exit_p = float(t['exit_price'])
+                        action = t['action']
+                        
+                        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                        pips = diff * 10.0
+                        
+                        total_pips += pips
+                        if pips > 0:
+                            gross_win_pips += pips
+                            winning_trades_count += 1
+                        elif pips < 0:
+                            gross_loss_pips += abs(pips)
+                            losing_trades_count += 1
+
+                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                    est_profit_usd = total_pips * 0.10
+
+                    cur.close()
+                    conn.close()
+
+                    reply = (
+                        f"💵 *DETAILED PIPS & EARNINGS REPORT*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 *SUMMARY:*\n"
+                        f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"📈 *PIPS BREAKDOWN:*\n"
+                        f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                        f"🎯 *AVERAGE METRICS:*\n"
+                        f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💡 *Catatan:* Dihitung pada $0.10/pip (0.01 lot XAU/USD)."
+                    )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as err:
+                    logging.error(f"[WEBHOOK ERROR /pips] {err}")
+                    await send_telegram_alert(client, f"⚠️ Error calculating pips: {err}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/logs":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    cur.execute("""
+                        SELECT id, action, entry_price, exit_price, outcome, created_at 
+                        FROM signals 
+                        WHERE status = 'EXECUTED' 
+                        ORDER BY id DESC 
+                        LIMIT 10
+                    """)
+                    logs = cur.fetchall()
+                    cur.close()
+                    conn.close()
+
+                    if not logs:
+                        reply = "📜 *LAST 10 TRADE LOGS:*\n\n_Belum ada transaksi yang tereksekusi di database._"
+                    else:
+                        reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        for l in logs:
+                            trade_id = l['id']
+                            action = l['action']
+                            entry = float(l['entry_price'])
+                            exit_p = float(l['exit_price']) if l['exit_price'] else None
+                            outcome = l['outcome']
+                            date_val = l['created_at']
+                            
+                            if isinstance(date_val, datetime):
+                                date_str = date_val.strftime("%m-%d %H:%M")
+                            else:
+                                date_str = str(date_val) if date_val else "N/A"
+
+                            if exit_p is not None:
+                                diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+                                pips = diff * 10.0
+                                pip_str = f"*{pips:+.1f} pips*"
+                            else:
+                                pip_str = "*ACTIVE / IN PROGRESS*"
+
+                            if "WIN" in outcome or "CLOSED" in outcome:
+                                icon = "🟢"
+                            elif "LOSS" in outcome:
+                                icon = "🔴"
+                            else:
+                                icon = "🟡"
+
+                            reply += (
+                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                                f"• Entry: ${entry:.2f} → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                                f"• Outcome: *{outcome}*\n"
+                                f"• Result: {pip_str} | Time: {date_str}\n"
+                                f"──────────────────────────\n"
+                            )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as log_err:
+                    logging.error(f"[WEBHOOK ERROR /logs] {log_err}")
+                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
+
+    except Exception as e:
+        logging.error(f"[WEBHOOK ERROR] {e}")
+
+    return {"status": "ok"}

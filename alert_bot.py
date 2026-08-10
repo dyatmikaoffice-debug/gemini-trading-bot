@@ -190,7 +190,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (ADX FILTER OFF)
+# BACKGROUND MARKET SCANNER (ALL CROSSOVERS TRIGGER)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():

@@ -223,7 +223,7 @@ def update_open_trades(current_price: float, high_3c: float, low_3c: float):
     conn.close()
 
 # ---------------------------------------------------------
-# BACKGROUND MARKET SCANNER (SQUEEZE / FAN-OUT & REBOUND TRIGGERS)
+# BACKGROUND MARKET SCANNER (EMA 9/21 TOUCH + REBOUND TRIGGERS)
 # ---------------------------------------------------------
 
 async def background_scanning_loop():
@@ -261,7 +261,7 @@ async def background_scanning_loop():
                 
                 update_open_trades(price, high_3c, low_3c)
 
-                # Step 1: Directional Alignments (Full Lock)
+                # Step 1: Directional Alignments (Full Trend Lock)
                 is_bullish_alignment = (price > ema9) and (ema9 > ema21) and (ema21 > ema50) and (ema50 > ema200)
                 is_bearish_alignment = (price < ema9) and (ema9 < ema21) and (ema21 < ema50) and (ema50 < ema200)
 
@@ -274,7 +274,7 @@ async def background_scanning_loop():
                 was_compressed = (prev_spread <= 1.2 * atr) or (prev2_spread <= 1.2 * atr)
                 is_expanding = latest_spread > prev_spread
 
-                # Step 3: Trigger Conditions (Squeeze Fan-Out OR EMA 9 Rebound)
+                # Step 3: Trigger Conditions (Squeeze Fan-Out OR EMA 9 / EMA 21 Touch Rebound)
                 proposed_action = "HOLD"
 
                 if adx >= 15.0:
@@ -285,22 +285,24 @@ async def background_scanning_loop():
                         elif is_bearish_alignment and (prev['ema9'] >= prev['ema21']):
                             proposed_action = "SELL"
 
-                    # --- TRIGGER TYPE 2: EMA 9 Touch + Reversal Candle Rebound ---
+                    # --- TRIGGER TYPE 2: EMA 9 OR EMA 21 Touch + Reversal Candle Rebound ---
                     if proposed_action == "HOLD":
                         if is_bullish_alignment:
-                            prev_touched_ema9 = prev['low'] <= (prev['ema9'] * 1.0005)
+                            # Previous candle low touched/dipped into EMA 9 OR EMA 21
+                            prev_touched_ema = (prev['low'] <= (prev['ema9'] * 1.0005)) or (prev['low'] <= (prev['ema21'] * 1.0005))
                             latest_is_green = (latest['close'] > latest['open']) and (latest['close'] > latest['ema9'])
                             stoch_up = (prev['stoch_k'] <= prev['stoch_d']) and (stoch_k > stoch_d)
                             
-                            if prev_touched_ema9 and latest_is_green and stoch_up:
+                            if prev_touched_ema and latest_is_green and stoch_up:
                                 proposed_action = "BUY"
 
                         elif is_bearish_alignment:
-                            prev_touched_ema9 = prev['high'] >= (prev['ema9'] * 0.9995)
+                            # Previous candle high touched/spiked into EMA 9 OR EMA 21
+                            prev_touched_ema = (prev['high'] >= (prev['ema9'] * 0.9995)) or (prev['high'] >= (prev['ema21'] * 0.9995))
                             latest_is_red = (latest['close'] < latest['open']) and (latest['close'] < latest['ema9'])
                             stoch_down = (prev['stoch_k'] >= prev['stoch_d']) and (stoch_k < stoch_d)
                             
-                            if prev_touched_ema9 and latest_is_red and stoch_down:
+                            if prev_touched_ema and latest_is_red and stoch_down:
                                 proposed_action = "SELL"
 
                 # Step 4: Proximity Cap Guard (2.5 * ATR)
@@ -353,13 +355,13 @@ async def background_scanning_loop():
 
                     if ai_decision == "APPROVE":
                         msg = (
-                            f"⚡ EMA CONFLUENCE SIGNAL #{new_id}\n\n"
+                            f"⚡ EMA REBOUND SIGNAL #{new_id}\n\n"
                             f"Action: *{proposed_action} XAU/USD*\n"
                             f"Entry Price: *${price:.2f}*\n"
                             f"Stop Loss: *${sl:.2f}*\n"
                             f"Take Profit 1: *${tp1:.2f}*\n"
                             f"Take Profit 2: *${tp2:.2f}*\n"
-                            f"Strategy: *EMA 9/21/50 Squeeze Breakout & Rebound*\n"
+                            f"Trigger: *EMA 9/21 Touch + Rebound Confirmation*\n"
                             f"ADX Momentum: *{adx:.1f}*"
                         )
                         await send_telegram_alert(msg)

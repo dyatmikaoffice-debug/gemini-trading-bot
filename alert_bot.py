@@ -259,8 +259,16 @@ def calculate_metrics_m1(df: pd.DataFrame):
     df["atr"] = df["tr"].rolling(window=14).mean()
     return df
 
+# --- INDICATORS CALCULATIONS FOR 5M TIMEFRAME (PULLBACK & TREND CONTEXT) ---
 def calculate_metrics_5m(df: pd.DataFrame):
     df = df.tail(100).copy()
+    df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (typical_price * df["close"]).rolling(window=20).sum() / df["close"].rolling(window=20).sum()
+
     df["tr"] = np.maximum(
         df["high"] - df["low"],
         np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
@@ -305,15 +313,15 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) M1 High-Frequency Scalping.
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) Scalping.
 A technical scalp trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
 1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, EMA 9=${float(df_1m['ema_9'].iloc[-1]):.2f}, EMA 21=${float(df_1m['ema_21'].iloc[-1]):.2f}, VWAP=${float(df_1m['vwap'].iloc[-1]):.2f}.
-2. 5-Minute: ADX Trend Strength=${float(df_5m['adx'].iloc[-1]):.1f}.
+2. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, 5M EMA 9=${float(df_5m['ema_9'].iloc[-1]):.2f}, 5M VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_5m['adx'].iloc[-1]):.1f}.
 
 CRITICAL SCALP VETO RULES:
-- VETO if proposed BUY is below M1 VWAP or proposed SELL is above M1 VWAP (fighting intraday balance).
+- VETO if proposed BUY is below M1/M5 VWAP or proposed SELL is above M1/M5 VWAP (fighting intraday balance).
 - VETO if 5M ADX is below 12.0 indicating complete market freeze / zero volatility.
 
 Respond strictly in valid JSON matching schema:
@@ -349,7 +357,7 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP (2-CANDLE REVERSAL & NO-CUT VWAP RULES) ---
+# --- BACKGROUND SCANNING LOOP (5M PULLBACK TOUCH ONLY) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
@@ -363,7 +371,7 @@ async def background_scanning_loop():
                     await asyncio.sleep(300)
                     continue
 
-                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning M1 VWAP Scalper setups...")
+                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning setups (5M Pullback / 1M Cross)...")
                 df_1m = await fetch_timeframe_data(client, "1min")
                 df_5m = await fetch_timeframe_data(client, "5min")
 
@@ -379,63 +387,72 @@ async def background_scanning_loop():
                 curr_low = float(df_1m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
-                # Current Candle (Candle t)
+                # M1 Current Candle
                 curr_price = float(df_1m["close"].iloc[-1])
                 curr_open = float(df_1m["open"].iloc[-1])
                 vwap_1m = float(df_1m["vwap"].iloc[-1])
-                adx_5m = float(df_5m["adx"].iloc[-1])
-
-                ema9_curr = float(df_1m["ema_9"].iloc[-1])
-                ema9_prev = float(df_1m["ema_9"].iloc[-2])
-                ema21_curr = float(df_1m["ema_21"].iloc[-1])
-                ema21_prev = float(df_1m["ema_21"].iloc[-2])
-
-                # Previous Candle (Candle t-1)
-                open_1m_prev = float(df_1m["open"].iloc[-2])
-                close_1m_prev = float(df_1m["close"].iloc[-2])
                 high_1m_prev = float(df_1m["high"].iloc[-2])
                 low_1m_prev = float(df_1m["low"].iloc[-2])
-                vwap_prev = float(df_1m["vwap"].iloc[-2])
 
-                # RULE 1: Detect Candle Piercing/Cut Through VWAP (Blocks Bounce Signals)
-                bullish_cut_vwap = (open_1m_prev < vwap_prev) and (close_1m_prev > vwap_prev)  # Upward slice
-                bearish_cut_vwap = (open_1m_prev > vwap_prev) and (close_1m_prev < vwap_prev)  # Downward slice
+                ema9_1m_curr = float(df_1m["ema_9"].iloc[-1])
+                ema9_1m_prev = float(df_1m["ema_9"].iloc[-2])
+                ema21_1m_curr = float(df_1m["ema_21"].iloc[-1])
+                ema21_1m_prev = float(df_1m["ema_21"].iloc[-2])
 
-                # RULE 2: 2-Candle Touch & Reversal Confirmation Rules
-                # Touch previous candle low on EMA9 or VWAP, but did NOT close slicing below VWAP, AND current candle closes bullish
-                bullish_reversal = (
-                    (low_1m_prev <= max(ema9_prev, vwap_prev)) and 
-                    (close_1m_prev >= vwap_prev) and 
-                    not bearish_cut_vwap and 
+                # 5M Indicators
+                adx_5m = float(df_5m["adx"].iloc[-1])
+                ema9_5m_curr = float(df_5m["ema_9"].iloc[-1])
+                ema9_5m_prev = float(df_5m["ema_9"].iloc[-2])
+                ema21_5m_curr = float(df_5m["ema_21"].iloc[-1])
+                vwap_5m_curr = float(df_5m["vwap"].iloc[-1])
+                vwap_5m_prev = float(df_5m["vwap"].iloc[-2])
+
+                open_5m_prev = float(df_5m["open"].iloc[-2])
+                close_5m_prev = float(df_5m["close"].iloc[-2])
+                high_5m_prev = float(df_5m["high"].iloc[-2])
+                low_5m_prev = float(df_5m["low"].iloc[-2])
+
+                # --- RULE 1: DETECT CUT/PIERCE THROUGH VWAP ON 5M CHART ---
+                bullish_cut_vwap_5m = (open_5m_prev < vwap_5m_prev) and (close_5m_prev > vwap_5m_prev)
+                bearish_cut_vwap_5m = (open_5m_prev > vwap_5m_prev) and (close_5m_prev < vwap_5m_prev)
+
+                # --- RULE 2: 5-MINUTE CHART PULLBACK TOUCH & REVERSAL CONDITIONS ---
+                # Previous 5M candle low touched/dipped to 5M EMA 9 or 5M VWAP, didn't destructively cut through VWAP, and current M1 price confirms reversal
+                bullish_pullback_5m = (
+                    (ema9_5m_curr > ema21_5m_curr) and 
+                    (low_5m_prev <= max(ema9_5m_prev, vwap_5m_prev)) and 
+                    (close_5m_prev >= vwap_5m_prev) and 
+                    not bearish_cut_vwap_5m and 
                     (curr_price > curr_open) and 
                     (curr_price > high_1m_prev)
                 )
 
-                # Touch previous candle high on EMA9 or VWAP, but did NOT close slicing above VWAP, AND current candle closes bearish
-                bearish_reversal = (
-                    (high_1m_prev >= min(ema9_prev, vwap_prev)) and 
-                    (close_1m_prev <= vwap_prev) and 
-                    not bullish_cut_vwap and 
+                # Previous 5M candle high touched/rallied to 5M EMA 9 or 5M VWAP, didn't destructively cut through VWAP, and current M1 price confirms reversal
+                bearish_pullback_5m = (
+                    (ema9_5m_curr < ema21_5m_curr) and 
+                    (high_5m_prev >= min(ema9_5m_prev, vwap_5m_prev)) and 
+                    (close_5m_prev <= vwap_5m_prev) and 
+                    not bullish_cut_vwap_5m and 
                     (curr_price < curr_open) and 
                     (curr_price < low_1m_prev)
                 )
 
-                # Crossover Triggers
-                bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr) and not bearish_cut_vwap
-                bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr) and not bullish_cut_vwap
+                # 1M Crossover Triggers
+                bullish_cross_1m = (ema9_1m_prev <= ema21_1m_prev) and (ema9_1m_curr > ema21_1m_curr) and not bearish_cut_vwap_5m
+                bearish_cross_1m = (ema9_1m_prev >= ema21_1m_prev) and (ema9_1m_curr < ema21_1m_curr) and not bullish_cut_vwap_5m
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
-                if (bullish_cross or bullish_reversal) and (curr_price > vwap_1m):
+                if (bullish_cross_1m or bullish_pullback_5m) and (curr_price > vwap_1m) and (curr_price > vwap_5m_curr):
                     proposed_action = "BUY"
-                    trigger_type = "M1 VWAP Reversal" if bullish_reversal else "M1 VWAP Crossover"
+                    trigger_type = "5M VWAP Pullback" if bullish_pullback_5m else "M1 VWAP Crossover"
 
-                elif (bearish_cross or bearish_reversal) and (curr_price < vwap_1m):
+                elif (bearish_cross_1m or bearish_pullback_5m) and (curr_price < vwap_1m) and (curr_price < vwap_5m_curr):
                     proposed_action = "SELL"
-                    trigger_type = "M1 VWAP Reversal" if bearish_reversal else "M1 VWAP Crossover"
+                    trigger_type = "5M VWAP Pullback" if bearish_pullback_5m else "M1 VWAP Crossover"
 
-                # State-Aware Cooldown Distance Check
+                # State-Aware Cooldown Distance Check ($3.00 pending / $2.00 closed)
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -461,11 +478,12 @@ async def background_scanning_loop():
                         logging.error(f"[COOLDOWN ERROR] {cd_err}")
 
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | M1 VWAP: ${vwap_1m:.2f} | 5M ADX: {adx_5m:.1f} | Status: HOLD")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M VWAP: ${vwap_5m_curr:.2f} | 5M ADX: {adx_5m:.1f} | Status: HOLD")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
 
+                    # WIDENED SL/TP DISTANCES FOR XAU/USD
                     atr_1m = float(df_1m["atr"].iloc[-1])
                     sl_dist = float(max(2.50, min(4.50, atr_1m * 2.0)))
                     tp1_mult = 1.5
@@ -484,7 +502,7 @@ async def background_scanning_loop():
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
                         id_tag = f" #{new_id}" if new_id else ""
                         msg = (
-                            f"⚡ *M1 VWAP MICRO-SCALP SIGNAL{id_tag}*\n\n"
+                            f"⚡ *5M/1M VWAP SCALP SIGNAL{id_tag}*\n\n"
                             f"Asset: *XAUUSD (Gold Spot)*\n"
                             f"Action: *{proposed_action}*\n"
                             f"Type: *{trigger_type}*\n"
@@ -494,7 +512,7 @@ async def background_scanning_loop():
                             f"Take Profit 2 (TP2): *${tp2_price:.2f}* (1:{tp2_mult:.1f} RRR)\n\n"
                             f"INDICATOR METRICS:\n"
                             f"- Setup: {trigger_type}\n"
-                            f"- M1 VWAP Anchor: ${vwap_1m:.2f}\n"
+                            f"- 5M VWAP Anchor: ${vwap_5m_curr:.2f}\n"
                             f"- 5M ADX Volatility: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"
                         )

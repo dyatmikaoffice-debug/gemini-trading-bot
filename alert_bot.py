@@ -74,7 +74,7 @@ def init_db():
             );
         """)
         
-        # 2. Complete Schema Migration: Ensures all historical and present columns exist without resetting DB
+        # 2. Complete Schema Migration: Ensures all historical and present columns exist cleanly
         migrations = [
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trigger_type TEXT;",
@@ -122,11 +122,12 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         adx_val = float(adx_15m) if adx_15m is not None else 0.0
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
 
+        # Pass 'outcome' explicitly as 'PENDING' and 'outcome_timestamp' as '' to avoid NOT NULL constraints
         cursor.execute("""
-            INSERT INTO signals (timestamp, status, action, trigger_type, price, entry_price, sl, sl_price, tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO signals (timestamp, status, action, trigger_type, price, entry_price, sl, sl_price, tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, outcome, outcome_timestamp, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             RETURNING id;
-        """, (str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val, sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
+        """, (str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val, sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning), "PENDING", ""))
         
         inserted_row = cursor.fetchone()
         new_id = inserted_row['id'] if inserted_row and 'id' in inserted_row else None
@@ -709,7 +710,6 @@ async def telegram_webhook(request: Request):
                     conn = get_db_connection()
                     cur = conn.cursor()
 
-                    # Uses COALESCE to fallback across legacy column names cleanly
                     cur.execute("""
                         SELECT id, action, 
                                COALESCE(entry_price, price, 0) as entry_p, 

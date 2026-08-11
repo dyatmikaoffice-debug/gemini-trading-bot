@@ -357,7 +357,7 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP (5M PULLBACK TOUCH ONLY) ---
+# --- BACKGROUND SCANNING LOOP (WIDE SL BUFFERS & 5M PULLBACK) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
@@ -417,7 +417,6 @@ async def background_scanning_loop():
                 bearish_cut_vwap_5m = (open_5m_prev > vwap_5m_prev) and (close_5m_prev < vwap_5m_prev)
 
                 # --- RULE 2: 5-MINUTE CHART PULLBACK TOUCH & REVERSAL CONDITIONS ---
-                # Previous 5M candle low touched/dipped to 5M EMA 9 or 5M VWAP, didn't destructively cut through VWAP, and current M1 price confirms reversal
                 bullish_pullback_5m = (
                     (ema9_5m_curr > ema21_5m_curr) and 
                     (low_5m_prev <= max(ema9_5m_prev, vwap_5m_prev)) and 
@@ -427,7 +426,6 @@ async def background_scanning_loop():
                     (curr_price > high_1m_prev)
                 )
 
-                # Previous 5M candle high touched/rallied to 5M EMA 9 or 5M VWAP, didn't destructively cut through VWAP, and current M1 price confirms reversal
                 bearish_pullback_5m = (
                     (ema9_5m_curr < ema21_5m_curr) and 
                     (high_5m_prev >= min(ema9_5m_prev, vwap_5m_prev)) and 
@@ -452,7 +450,7 @@ async def background_scanning_loop():
                     proposed_action = "SELL"
                     trigger_type = "5M VWAP Pullback" if bearish_pullback_5m else "M1 VWAP Crossover"
 
-                # State-Aware Cooldown Distance Check ($3.00 pending / $2.00 closed)
+                # State-Aware Cooldown Distance Check ($5.00 pending / $3.00 closed)
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -469,7 +467,7 @@ async def background_scanning_loop():
                         if last_trade:
                             last_entry_price = float(last_trade['entry_p'])
                             last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
-                            required_distance = 3.00 if last_outcome == "PENDING" else 2.00
+                            required_distance = 5.00 if last_outcome == "PENDING" else 3.00
 
                             if abs(curr_price - last_entry_price) < required_distance:
                                 logging.info(f"[SCALP COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f}.")
@@ -483,9 +481,9 @@ async def background_scanning_loop():
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
 
-                    # WIDENED SL/TP DISTANCES FOR XAU/USD
+                    # EXPANDED & WIDER SL/TP DISTANCES FOR XAU/USD (Comfortable Breathing Room)
                     atr_1m = float(df_1m["atr"].iloc[-1])
-                    sl_dist = float(max(2.50, min(4.50, atr_1m * 2.0)))
+                    sl_dist = float(max(4.50, min(8.50, atr_1m * 3.5)))
                     tp1_mult = 1.5
                     tp2_mult = 3.0
 

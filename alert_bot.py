@@ -349,19 +349,18 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP (OPTIMIZED FOR FREE API LIMITS) ---
+# --- BACKGROUND SCANNING LOOP (CROSSOVER + PULLBACK TRIGGERS) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
-                # Calculate current time in WIB (UTC+7)
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
                 # SESSION WINDOWING: Only scan during active London/NY trading hours (14:00 - 23:00 WIB)
                 if not (14 <= current_hour_wib < 23):
                     logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session (14:00 - 23:00 WIB). Pausing API calls...")
-                    await asyncio.sleep(300)  # Sleep 5 minutes without making API requests
+                    await asyncio.sleep(300)
                     continue
 
                 logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning M1 VWAP Scalper setups...")
@@ -392,19 +391,25 @@ async def background_scanning_loop():
                 high_1m_prev = float(df_1m["high"].iloc[-2])
                 low_1m_prev = float(df_1m["low"].iloc[-2])
 
+                # 1. INITIAL MOMENTUM CROSSOVER TRIGGERS
                 bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
                 bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
+
+                # 2. TREND PULLBACK REJECTION TRIGGERS
+                bullish_pullback = (ema9_curr > ema21_curr) and (low_1m_prev <= ema9_prev) and (curr_price > ema9_curr)
+                bearish_pullback = (ema9_curr < ema21_curr) and (high_1m_prev >= ema9_prev) and (curr_price < ema9_curr)
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
-                # M1 VWAP + EMA CROSSOVER + MICRO STRUCTURE BREAKOUT
-                if bullish_cross and (curr_price > vwap_1m) and (curr_price > high_1m_prev):
+                # COMBINED SETUP EVALUATION
+                if (bullish_cross or bullish_pullback) and (curr_price > vwap_1m) and (curr_price > high_1m_prev):
                     proposed_action = "BUY"
-                    trigger_type = "M1 VWAP Micro-Scalp"
-                elif bearish_cross and (curr_price < vwap_1m) and (curr_price < low_1m_prev):
+                    trigger_type = "M1 VWAP Pullback" if bullish_pullback else "M1 VWAP Crossover"
+
+                elif (bearish_cross or bearish_pullback) and (curr_price < vwap_1m) and (curr_price < low_1m_prev):
                     proposed_action = "SELL"
-                    trigger_type = "M1 VWAP Micro-Scalp"
+                    trigger_type = "M1 VWAP Pullback" if bearish_pullback else "M1 VWAP Crossover"
 
                 # Fast Cooldown Distance ($1.50 buffer for M1 scalper)
                 if proposed_action != "HOLD":
@@ -464,7 +469,7 @@ async def background_scanning_loop():
                             f"Take Profit 1 (TP1): *${tp1_price:.2f}* (1:{tp1_mult:.1f} RRR)\n"
                             f"Take Profit 2 (TP2): *${tp2_price:.2f}* (1:{tp2_mult:.1f} RRR)\n\n"
                             f"INDICATOR METRICS:\n"
-                            f"- Setup: M1 VWAP + EMA 9/21 Crossover\n"
+                            f"- Setup: {trigger_type}\n"
                             f"- M1 VWAP Anchor: ${vwap_1m:.2f}\n"
                             f"- 5M ADX Volatility: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"
@@ -479,7 +484,6 @@ async def background_scanning_loop():
             except Exception as e:
                 logging.error(f"[SCAN LOOP ERROR] {e}")
 
-            # 120-second interval = 30 scans/hour = 270 scans/day across 9 active hours (540 total API calls/day)
             await asyncio.sleep(120)
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---

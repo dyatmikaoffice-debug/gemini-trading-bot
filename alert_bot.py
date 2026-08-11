@@ -64,7 +64,6 @@ def init_db():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Base Table Creation
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
@@ -74,7 +73,6 @@ def init_db():
             );
         """)
         
-        # 2. Complete Schema Migration: Ensures all historical and present columns exist cleanly
         migrations = [
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trigger_type TEXT;",
@@ -122,7 +120,6 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         adx_val = float(adx_15m) if adx_15m is not None else 0.0
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
 
-        # Pass 'outcome' explicitly as 'PENDING' and 'outcome_timestamp' as '' to avoid NOT NULL constraints
         cursor.execute("""
             INSERT INTO signals (timestamp, status, action, trigger_type, price, entry_price, sl, sl_price, tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, outcome, outcome_timestamp, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
@@ -247,6 +244,7 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
 # --- INDICATORS CALCULATIONS ---
 def calculate_metrics(df: pd.DataFrame):
     df = df.tail(100).copy()
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
     
@@ -294,12 +292,13 @@ def check_divergence(df: pd.DataFrame):
     s_now = float(df["stoch_k"].iloc[-1])
     s_prev = float(df["stoch_k"].iloc[-5:-1].min())
     
-    if p_now < p_prev and s_now > s_prev and s_now < 40:
+    # Require Stoch RSI to actually bounce (>15) to avoid micro-tick fake divergence during selloffs
+    if p_now < p_prev and s_now > (s_prev + 5.0) and 15.0 < s_now < 40.0:
         return "Bullish Divergence (Lower Price Low + Higher Stoch Low)"
         
     p_prev_max = float(df["close"].iloc[-5:-1].max())
     s_prev_max = float(df["stoch_k"].iloc[-5:-1].max())
-    if p_now > p_prev_max and s_now < s_prev_max and s_now > 60:
+    if p_now > p_prev_max and s_now < (s_prev_max - 5.0) and 60.0 < s_now < 85.0:
         return "Bearish Divergence (Higher Price High + Lower Stoch High)"
         
     return "None"
@@ -329,20 +328,21 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
         logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
 # --- AI ANALYST EVALUATION ---
-async def analyze_signal_with_ai(proposed_action: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, divergence: str):
+async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, divergence: str):
     prompt = f"""
 Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
-A technical trigger suggests a {proposed_action} entry at ${current_price:.2f}.
+A technical trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
+1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 20=${float(df_5m['ema_20'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
 2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, EMA 50=${float(df_15m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_15m['ema_200'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
 3. Divergence State: {divergence}.
 
 CRITICAL VETO RULES:
-- VETO if proposed BUY is below 5M EMA 200 or proposed SELL is above 5M EMA 200 (counter-trend trap).
-- VETO if 15M ADX is below 15.0 indicating extreme horizontal chop.
-- ALLOW BUY entries during strong momentum (15M ADX > 30.0) even if Stoch RSI is above 50, provided price is cleanly aligned above 5M & 15M EMA 200.
+- STRICTLY VETO any counter-trend BUY if price is below 5M EMA 50 and 15M ADX > 25 (strong bearish drop).
+- FOR TREND CONTINUATION SETUPS ("High Trend Continuation" / "Trend Setup"): VETO if proposed BUY is below 5M EMA 200 or proposed SELL is above 5M EMA 200.
+- FOR DIVERGENCE REVERSAL SETUPS: ALLOW counter-trend entries ONLY IF ADX < 25 (weak/range market). If ADX > 25, VETO counter-trend entries.
+- ALLOW BREAKOUT / MOMENTUM SHIFT trades if price breaches key EMAs (EMA 20 & EMA 50) with high volume/ADX.
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -403,14 +403,20 @@ async def background_scanning_loop():
                 stoch_15m = float(df_15m["stoch_k"].iloc[-1])
 
                 c_5m = float(df_5m["close"].iloc[-1])
+                ema_20_5m = float(df_5m["ema_20"].iloc[-1])
                 ema_50_5m = float(df_5m["ema_50"].iloc[-1])
                 ema_200_5m = float(df_5m["ema_200"].iloc[-1])
+                vwap_5m = float(df_5m["vwap"].iloc[-1])
 
                 c_15m = float(df_15m["close"].iloc[-1])
                 ema_200_15m = float(df_15m["ema_200"].iloc[-1])
 
-                is_uptrend = (c_5m > ema_200_5m) and (ema_50_5m > ema_200_5m) and (c_15m > ema_200_15m)
-                is_downtrend = (c_5m < ema_200_5m) and (ema_50_5m < ema_200_5m) and (c_15m < ema_200_15m)
+                # FAST TREND DEFINITION (Uses short EMA 20 & 50 cross to react instantly)
+                is_fast_downtrend = (c_5m < ema_50_5m) and (ema_20_5m < ema_50_5m)
+                is_fast_uptrend = (c_5m > ema_50_5m) and (ema_20_5m > ema_50_5m)
+
+                is_macro_uptrend = (c_5m > ema_200_5m) and (ema_50_5m > ema_200_5m) and (c_15m > ema_200_15m)
+                is_macro_downtrend = (c_5m < ema_200_5m) and (ema_50_5m < ema_200_5m) and (c_15m < ema_200_15m)
 
                 divergence = check_divergence(df_5m)
 
@@ -432,19 +438,31 @@ async def background_scanning_loop():
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
-                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)":
+                # 1. DIVERGENCE REVERSALS (Blocked if strong trend momentum is present)
+                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)" and not is_fast_downtrend:
                     proposed_action = "BUY"
                     trigger_type = "Divergence Reversal"
-                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)":
+                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)" and not is_fast_uptrend:
                     proposed_action = "SELL"
                     trigger_type = "Divergence Reversal"
-                elif is_uptrend and stoch_buy_cross:
+
+                # 2. FAST TREND BREAKOUT / MOMENTUM SHIFT (Triggers immediate SELL on sharp breakdowns)
+                elif is_fast_downtrend and (c_5m < vwap_5m) and (stoch_k_curr < 50.0) and (adx_15m > 20.0):
+                    proposed_action = "SELL"
+                    trigger_type = "Bearish Breakdown"
+                elif is_fast_uptrend and (c_5m > vwap_5m) and (stoch_k_curr > 50.0) and (adx_15m > 20.0):
+                    proposed_action = "BUY"
+                    trigger_type = "Bullish Breakout"
+
+                # 3. MACRO TREND CONTINUATION
+                elif is_macro_uptrend and stoch_buy_cross:
                     proposed_action = "BUY"
                     trigger_type = "High Trend Continuation" if adx_15m > 30.0 else "Trend Setup"
-                elif is_downtrend and stoch_sell_cross:
+                elif is_macro_downtrend and stoch_sell_cross:
                     proposed_action = "SELL"
                     trigger_type = "High Trend Continuation" if adx_15m > 30.0 else "Trend Setup"
 
+                # State-Aware Cooldown
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -473,7 +491,7 @@ async def background_scanning_loop():
                     logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M EMA 200: ${ema_200_5m:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, curr_price, df_5m, df_15m, divergence)
+                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, df_15m, divergence)
 
                     atr_5m = float(df_5m["atr"].iloc[-1])
                     sl_dist = float(max(4.50, min(8.00, atr_5m * 2.0)))

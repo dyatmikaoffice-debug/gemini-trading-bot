@@ -241,9 +241,21 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
             df[col] = df[col].astype(float)
     return df
 
-# --- INDICATORS & ATR CALCULATIONS ---
+# --- INDICATORS CALCULATIONS FOR M1 VWAP STANDARD DEVIATION BANDS ---
 def calculate_metrics_m1(df: pd.DataFrame):
     df = df.tail(100).copy()
+    
+    # 20-period Rolling VWAP & Standard Deviation Bands
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["pv"] = typical_price * df["close"]
+    df["vwap"] = df["pv"].rolling(window=20).sum() / df["close"].rolling(window=20).sum()
+    df["std"] = df["close"].rolling(window=20).std()
+    
+    # +2.0 SD Upper Band and -2.0 SD Lower Band
+    df["vwap_upper_2"] = df["vwap"] + (2.0 * df["std"])
+    df["vwap_lower_2"] = df["vwap"] - (2.0 * df["std"])
+    
+    # ATR Calculation on M1
     df["tr"] = np.maximum(
         df["high"] - df["low"],
         np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
@@ -269,55 +281,6 @@ def calculate_metrics_5m(df: pd.DataFrame):
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
     df["adx"] = dx.rolling(14).mean()
     return df
-
-# --- PURE PRICE ACTION ENGINE: LIQUIDITY SWEEP + MSS + FVG ---
-def evaluate_price_action_setup(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
-    """
-    Detects Liquidity Sweeps on 5M and Market Structure Shifts (MSS) with Fair Value Gaps (FVG) on 1M.
-    """
-    # 1. Detect 5M Major Liquidity Pools
-    swing_low_5m = float(df_5m['low'].iloc[-15:-2].min())
-    swing_high_5m = float(df_5m['high'].iloc[-15:-2].max())
-
-    # 2. Check 1M Wicks / Candle Sweeps
-    m1_lows_recent = df_1m['low'].iloc[-4:-1].values
-    m1_highs_recent = df_1m['high'].iloc[-4:-1].values
-
-    is_sell_liquidity_swept = any(l < swing_low_5m for l in m1_lows_recent)
-    is_buy_liquidity_swept = any(h > swing_high_5m for h in m1_highs_recent)
-
-    # 3. Detect Internal 1M Market Structure Shift (MSS) with Displacement
-    internal_swing_high_1m = float(df_1m['high'].iloc[-8:-3].max())
-    internal_swing_low_1m = float(df_1m['low'].iloc[-8:-3].min())
-
-    curr_close_1m = float(df_1m['close'].iloc[-1])
-    curr_open_1m = float(df_1m['open'].iloc[-1])
-
-    # Displacement Body Close Criteria
-    bullish_mss = (curr_close_1m > internal_swing_high_1m) and (curr_close_1m > curr_open_1m)
-    bearish_mss = (curr_close_1m < internal_swing_low_1m) and (curr_close_1m < curr_open_1m)
-
-    # 4. Check 3-Candle Imbalance (Fair Value Gap / FVG)
-    # Bullish FVG: Low of candle 3 is higher than High of candle 1
-    bullish_fvg = float(df_1m['low'].iloc[-1]) > float(df_1m['high'].iloc[-3])
-    # Bearish FVG: High of candle 3 is lower than Low of candle 1
-    bearish_fvg = float(df_1m['high'].iloc[-1]) < float(df_1m['low'].iloc[-3])
-
-    action = "HOLD"
-    trigger_type = "None"
-    invalidation_level = None
-
-    if is_sell_liquidity_swept and bullish_mss and bullish_fvg:
-        action = "BUY"
-        trigger_type = "Liquidity Sweep + MSS + FVG"
-        invalidation_level = float(min(m1_lows_recent))
-
-    elif is_buy_liquidity_swept and bearish_mss and bearish_fvg:
-        action = "SELL"
-        trigger_type = "Liquidity Sweep + MSS + FVG"
-        invalidation_level = float(max(m1_highs_recent))
-
-    return action, trigger_type, invalidation_level
 
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
@@ -346,16 +309,16 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) Pure Price Action Trading.
-A institutional setup ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) M1 VWAP Mean-Reversion Scalping.
+A technical scalp trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, High=${float(df_1m['high'].iloc[-1]):.2f}, Low=${float(df_1m['low'].iloc[-1]):.2f}.
+1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, VWAP Center=${float(df_1m['vwap'].iloc[-1]):.2f}, +2SD Upper Band=${float(df_1m['vwap_upper_2'].iloc[-1]):.2f}, -2SD Lower Band=${float(df_1m['vwap_lower_2'].iloc[-1]):.2f}.
 2. 5-Minute: ADX Volatility Strength=${float(df_5m['adx'].iloc[-1]):.1f}.
 
-CRITICAL PRICE ACTION VETO RULES:
-- VETO if 5M ADX is below 12.0 indicating complete market freeze / zero volatility.
-- VETO if entry candle has an excessively long wick against the trade direction (>60% wick ratio).
+CRITICAL SCALP VETO RULES:
+- VETO if 5M ADX is above 45.0 (indicating an extreme unstoppable runaway trend that destroys mean-reversion setups).
+- VETO if 5M ADX is below 12.0 (indicating dead market liquidity).
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -388,9 +351,9 @@ Respond strictly in valid JSON matching schema:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure price action alignment.")
+    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure VWAP band mean-reversion alignment.")
 
-# --- BACKGROUND SCANNING LOOP (LIQUIDITY SWEEP & MSS ENGINE) ---
+# --- BACKGROUND SCANNING LOOP (M1 VWAP SD BAND MEAN-REVERSION) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
@@ -404,7 +367,7 @@ async def background_scanning_loop():
                     await asyncio.sleep(300)
                     continue
 
-                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning Liquidity Sweeps & MSS...")
+                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning M1 VWAP SD Band Mean-Reversion...")
                 df_1m = await fetch_timeframe_data(client, "1min")
                 df_5m = await fetch_timeframe_data(client, "5min")
 
@@ -420,13 +383,38 @@ async def background_scanning_loop():
                 curr_low = float(df_1m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
+                # M1 Candle Parameters
                 curr_price = float(df_1m["close"].iloc[-1])
+                curr_open = float(df_1m["open"].iloc[-1])
+                vwap_1m = float(df_1m["vwap"].iloc[-1])
+                vwap_upper2 = float(df_1m["vwap_upper_2"].iloc[-1])
+                vwap_lower2 = float(df_1m["vwap_lower_2"].iloc[-1])
+
+                low_1m_prev = float(df_1m["low"].iloc[-2])
+                high_1m_prev = float(df_1m["high"].iloc[-2])
+                vwap_lower2_prev = float(df_1m["vwap_lower_2"].iloc[-2])
+                vwap_upper2_prev = float(df_1m["vwap_upper_2"].iloc[-2])
+
                 adx_5m = float(df_5m["adx"].iloc[-1])
 
-                # EVALUATE PURE PRICE ACTION ENGINE
-                proposed_action, trigger_type, invalidation_level = evaluate_price_action_setup(df_1m, df_5m)
+                # MEAN REVERSION TRIGGER CONDITIONS
+                # BUY: Previous candle touched/dipped below -2.0 SD Band, and current candle closes bullish above previous high
+                bullish_band_fade = (low_1m_prev <= vwap_lower2_prev) and (curr_price > curr_open) and (curr_price > high_1m_prev)
 
-                # State-Aware Cooldown Distance Check ($5.00 pending / $3.00 closed)
+                # SELL: Previous candle touched/pierced above +2.0 SD Band, and current candle closes bearish below previous low
+                bearish_band_fade = (high_1m_prev >= vwap_upper2_prev) and (curr_price < curr_open) and (curr_price < low_1m_prev)
+
+                proposed_action = "HOLD"
+                trigger_type = "None"
+
+                if bullish_band_fade:
+                    proposed_action = "BUY"
+                    trigger_type = "M1 VWAP -2SD Band Fade"
+                elif bearish_band_fade:
+                    proposed_action = "SELL"
+                    trigger_type = "M1 VWAP +2SD Band Fade"
+
+                # Cooldown Distance Check ($3.00 pending / $2.00 closed)
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -443,7 +431,7 @@ async def background_scanning_loop():
                         if last_trade:
                             last_entry_price = float(last_trade['entry_p'])
                             last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
-                            required_distance = 5.00 if last_outcome == "PENDING" else 3.00
+                            required_distance = 3.00 if last_outcome == "PENDING" else 2.00
 
                             if abs(curr_price - last_entry_price) < required_distance:
                                 logging.info(f"[SCALP COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f}.")
@@ -452,48 +440,45 @@ async def background_scanning_loop():
                         logging.error(f"[COOLDOWN ERROR] {cd_err}")
 
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M ADX: {adx_5m:.1f} | Status: HOLD")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | VWAP: ${vwap_1m:.2f} | Upper +2SD: ${vwap_upper2:.2f} | Lower -2SD: ${vwap_lower2:.2f} | Status: HOLD")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
 
-                    # DYNAMIC STRUCTURAL STOP LOSS (Placed 1.5 Pips Behind Liquidity Sweep Invalidation Level)
-                    if invalidation_level is not None:
-                        if proposed_action == "BUY":
-                            sl_dist = max(3.50, min(8.50, abs(curr_price - (invalidation_level - 1.50))))
-                        else:
-                            sl_dist = max(3.50, min(8.50, abs((invalidation_level + 1.50) - curr_price)))
-                    else:
-                        atr_1m = float(df_1m["atr"].iloc[-1])
-                        sl_dist = float(max(4.50, min(8.50, atr_1m * 3.5)))
+                    # TARGETING MEAN-REVERSION TO CENTRAL VWAP
+                    dist_to_vwap = float(abs(curr_price - vwap_1m))
+                    tp1_dist = float(max(2.50, min(5.50, dist_to_vwap)))
+                    sl_dist = float(max(3.00, min(5.00, tp1_dist * 1.2)))  # Moderate risk buffer
 
-                    tp1_mult = 1.5
-                    tp2_mult = 3.0
+                    tp1_mult = 1.0
+                    tp2_mult = 1.8
 
                     if proposed_action == "BUY":
                         sl_price = float(curr_price - sl_dist)
-                        tp1_price = float(curr_price + (sl_dist * tp1_mult))
-                        tp2_price = float(curr_price + (sl_dist * tp2_mult))
+                        tp1_price = float(curr_price + (tp1_dist * tp1_mult))
+                        tp2_price = float(curr_price + (tp1_dist * tp2_mult))
                     else:
                         sl_price = float(curr_price + sl_dist)
-                        tp1_price = float(curr_price - (sl_dist * tp1_mult))
-                        tp2_price = float(curr_price - (sl_dist * tp2_mult))
+                        tp1_price = float(curr_price - (tp1_dist * tp1_mult))
+                        tp2_price = float(curr_price - (tp1_dist * tp2_mult))
 
                     if ai_decision.action == proposed_action:
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
                         id_tag = f" #{new_id}" if new_id else ""
                         msg = (
-                            f"⚡ *PURE PRICE ACTION SIGNAL{id_tag}*\n\n"
+                            f"⚡ *M1 VWAP MEAN-REVERSION SIGNAL{id_tag}*\n\n"
                             f"Asset: *XAUUSD (Gold Spot)*\n"
                             f"Action: *{proposed_action}*\n"
                             f"Type: *{trigger_type}*\n"
                             f"Entry Price: *${curr_price:.2f}*\n\n"
-                            f"Stop Loss (SL): *${sl_price:.2f}* (Structural Wick Anchor)\n"
-                            f"Take Profit 1 (TP1): *${tp1_price:.2f}* (1:{tp1_mult:.1f} RRR)\n"
-                            f"Take Profit 2 (TP2): *${tp2_price:.2f}* (1:{tp2_mult:.1f} RRR)\n\n"
+                            f"Stop Loss (SL): *${sl_price:.2f}*\n"
+                            f"Take Profit 1 (VWAP Target): *${tp1_price:.2f}*\n"
+                            f"Take Profit 2 (Extended Target): *${tp2_price:.2f}*\n\n"
                             f"INDICATOR METRICS:\n"
-                            f"- Model: Liquidity Sweep + Displacement MSS + FVG\n"
-                            f"- Invalidation Level: ${invalidation_level:.2f}\n"
+                            f"- Model: VWAP Standard Deviation Band Fade\n"
+                            f"- Central VWAP Anchor: ${vwap_1m:.2f}\n"
+                            f"- Upper Band (+2SD): ${vwap_upper2:.2f}\n"
+                            f"- Lower Band (-2SD): ${vwap_lower2:.2f}\n"
                             f"- 5M ADX Volatility: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"
                         )

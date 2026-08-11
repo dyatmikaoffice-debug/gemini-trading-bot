@@ -241,29 +241,26 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
             df[col] = df[col].astype(float)
     return df
 
-# --- INDICATORS CALCULATIONS ---
-def calculate_metrics(df: pd.DataFrame):
+# --- INDICATORS CALCULATIONS FOR M1 SCALPING ---
+def calculate_metrics_m1(df: pd.DataFrame):
     df = df.tail(100).copy()
-    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
     
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     df["vwap"] = (typical_price * df["close"]).rolling(window=20).sum() / df["close"].rolling(window=20).sum()
     
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-10)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    
-    rsi_min = df["rsi"].rolling(window=14).min()
-    rsi_max = df["rsi"].rolling(window=14).max()
-    stoch_rsi = (df["rsi"] - rsi_min) / (rsi_max - rsi_min + 1e-10)
-    df["stoch_k"] = stoch_rsi.rolling(window=3).mean() * 100
-    df["stoch_d"] = df["stoch_k"].rolling(window=3).mean()
-    
-    # ADX Calculation
+    # ATR Calculation on M1
+    df["tr"] = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
+    )
+    df["atr"] = df["tr"].rolling(window=14).mean()
+    return df
+
+def calculate_metrics_5m(df: pd.DataFrame):
+    df = df.tail(100).copy()
     df["tr"] = np.maximum(
         df["high"] - df["low"],
         np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
@@ -279,29 +276,7 @@ def calculate_metrics(df: pd.DataFrame):
     minus_di = 100 * (df["minus_dm"].rolling(14).sum() / (tr14 + 1e-10))
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
     df["adx"] = dx.rolling(14).mean()
-    
-    # ATR Calculation
-    df["atr"] = df["tr"].rolling(window=14).mean()
     return df
-
-def check_divergence(df: pd.DataFrame):
-    if len(df) < 15:
-        return "None"
-    p_now = float(df["close"].iloc[-1])
-    p_prev = float(df["close"].iloc[-5:-1].min())
-    s_now = float(df["stoch_k"].iloc[-1])
-    s_prev = float(df["stoch_k"].iloc[-5:-1].min())
-    
-    # Require Stoch RSI to actually bounce (>15) to avoid micro-tick fake divergence during selloffs
-    if p_now < p_prev and s_now > (s_prev + 5.0) and 15.0 < s_now < 40.0:
-        return "Bullish Divergence (Lower Price Low + Higher Stoch Low)"
-        
-    p_prev_max = float(df["close"].iloc[-5:-1].max())
-    s_prev_max = float(df["stoch_k"].iloc[-5:-1].max())
-    if p_now > p_prev_max and s_now < (s_prev_max - 5.0) and 60.0 < s_now < 85.0:
-        return "Bearish Divergence (Higher Price High + Lower Stoch High)"
-        
-    return "None"
 
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
@@ -328,21 +303,18 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
         logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
 # --- AI ANALYST EVALUATION ---
-async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, df_15m: pd.DataFrame, divergence: str):
+async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD).
-A technical trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) M1 High-Frequency Scalping.
+A technical scalp trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 5-Minute: Close=${float(df_5m['close'].iloc[-1]):.2f}, EMA 20=${float(df_5m['ema_20'].iloc[-1]):.2f}, EMA 50=${float(df_5m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_5m['ema_200'].iloc[-1]):.2f}, VWAP=${float(df_5m['vwap'].iloc[-1]):.2f}, Stoch RSI %K=${float(df_5m['stoch_k'].iloc[-1]):.1f}.
-2. 15-Minute: Close=${float(df_15m['close'].iloc[-1]):.2f}, EMA 50=${float(df_15m['ema_50'].iloc[-1]):.2f}, EMA 200=${float(df_15m['ema_200'].iloc[-1]):.2f}, ADX Trend Strength=${float(df_15m['adx'].iloc[-1]):.1f}, Stoch RSI %K=${float(df_15m['stoch_k'].iloc[-1]):.1f}.
-3. Divergence State: {divergence}.
+1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, EMA 9=${float(df_1m['ema_9'].iloc[-1]):.2f}, EMA 21=${float(df_1m['ema_21'].iloc[-1]):.2f}, VWAP=${float(df_1m['vwap'].iloc[-1]):.2f}.
+2. 5-Minute: ADX Trend Strength=${float(df_5m['adx'].iloc[-1]):.1f}.
 
-CRITICAL VETO RULES:
-- STRICTLY VETO any counter-trend BUY if price is below 5M EMA 50 and 15M ADX > 25 (strong bearish drop).
-- FOR TREND CONTINUATION SETUPS ("High Trend Continuation" / "Trend Setup"): VETO if proposed BUY is below 5M EMA 200 or proposed SELL is above 5M EMA 200.
-- FOR DIVERGENCE REVERSAL SETUPS: ALLOW counter-trend entries ONLY IF ADX < 25 (weak/range market). If ADX > 25, VETO counter-trend entries.
-- ALLOW BREAKOUT / MOMENTUM SHIFT trades if price breaches key EMAs (EMA 20 & EMA 50) with high volume/ADX.
+CRITICAL SCALP VETO RULES:
+- VETO if proposed BUY is below M1 VWAP or proposed SELL is above M1 VWAP (fighting intraday balance).
+- VETO if 5M ADX is below 12.0 indicating complete market freeze / zero volatility.
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -377,92 +349,64 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP ---
+# --- BACKGROUND SCANNING LOOP (OPTIMIZED FOR FREE API LIMITS) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
-                logging.info("Checking Twelve Data Multi-Timeframe Spot Gold Data (5m & 15m)...")
-                df_5m = await fetch_timeframe_data(client, "5min")
-                df_15m = await fetch_timeframe_data(client, "15min")
+                # Calculate current time in WIB (UTC+7)
+                now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
+                current_hour_wib = now_wib.hour
 
-                if df_5m is None or df_15m is None:
-                    logging.warning("Failed to fetch complete timeframe candles. Retrying next cycle.")
-                    await asyncio.sleep(300)
+                # SESSION WINDOWING: Only scan during active London/NY trading hours (14:00 - 23:00 WIB)
+                if not (14 <= current_hour_wib < 23):
+                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session (14:00 - 23:00 WIB). Pausing API calls...")
+                    await asyncio.sleep(300)  # Sleep 5 minutes without making API requests
                     continue
 
-                df_5m = calculate_metrics(df_5m)
-                df_15m = calculate_metrics(df_15m)
+                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning M1 VWAP Scalper setups...")
+                df_1m = await fetch_timeframe_data(client, "1min")
+                df_5m = await fetch_timeframe_data(client, "5min")
 
-                curr_high = float(df_5m["high"].tail(3).max())
-                curr_low = float(df_5m["low"].tail(3).min())
+                if df_1m is None or df_5m is None:
+                    logging.warning("Failed to fetch M1/M5 candles. Retrying next cycle.")
+                    await asyncio.sleep(120)
+                    continue
+
+                df_1m = calculate_metrics_m1(df_1m)
+                df_5m = calculate_metrics_5m(df_5m)
+
+                curr_high = float(df_1m["high"].tail(3).max())
+                curr_low = float(df_1m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
-                curr_price = float(df_5m["close"].iloc[-1])
-                adx_15m = float(df_15m["adx"].iloc[-1])
-                stoch_15m = float(df_15m["stoch_k"].iloc[-1])
+                curr_price = float(df_1m["close"].iloc[-1])
+                vwap_1m = float(df_1m["vwap"].iloc[-1])
+                adx_5m = float(df_5m["adx"].iloc[-1])
 
-                c_5m = float(df_5m["close"].iloc[-1])
-                ema_20_5m = float(df_5m["ema_20"].iloc[-1])
-                ema_50_5m = float(df_5m["ema_50"].iloc[-1])
-                ema_200_5m = float(df_5m["ema_200"].iloc[-1])
-                vwap_5m = float(df_5m["vwap"].iloc[-1])
+                ema9_curr = float(df_1m["ema_9"].iloc[-1])
+                ema9_prev = float(df_1m["ema_9"].iloc[-2])
+                ema21_curr = float(df_1m["ema_21"].iloc[-1])
+                ema21_prev = float(df_1m["ema_21"].iloc[-2])
 
-                c_15m = float(df_15m["close"].iloc[-1])
-                ema_200_15m = float(df_15m["ema_200"].iloc[-1])
+                high_1m_prev = float(df_1m["high"].iloc[-2])
+                low_1m_prev = float(df_1m["low"].iloc[-2])
 
-                # FAST TREND DEFINITION (Uses short EMA 20 & 50 cross to react instantly)
-                is_fast_downtrend = (c_5m < ema_50_5m) and (ema_20_5m < ema_50_5m)
-                is_fast_uptrend = (c_5m > ema_50_5m) and (ema_20_5m > ema_50_5m)
-
-                is_macro_uptrend = (c_5m > ema_200_5m) and (ema_50_5m > ema_200_5m) and (c_15m > ema_200_15m)
-                is_macro_downtrend = (c_5m < ema_200_5m) and (ema_50_5m < ema_200_5m) and (c_15m < ema_200_15m)
-
-                divergence = check_divergence(df_5m)
-
-                stoch_k_curr = float(df_5m["stoch_k"].iloc[-1])
-                stoch_k_prev = float(df_5m["stoch_k"].iloc[-2])
-                stoch_d_curr = float(df_5m["stoch_d"].iloc[-1])
-                stoch_d_prev = float(df_5m["stoch_d"].iloc[-2])
-
-                if adx_15m > 30.0:
-                    buy_stoch_limit = 55.0
-                    sell_stoch_limit = 45.0
-                else:
-                    buy_stoch_limit = 40.0
-                    sell_stoch_limit = 60.0
-
-                stoch_buy_cross = (stoch_k_prev <= stoch_d_prev) and (stoch_k_curr > stoch_d_curr) and (stoch_k_curr < buy_stoch_limit)
-                stoch_sell_cross = (stoch_k_prev >= stoch_d_prev) and (stoch_k_curr < stoch_d_curr) and (stoch_k_curr > sell_stoch_limit)
+                bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
+                bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
-                # 1. DIVERGENCE REVERSALS (Blocked if strong trend momentum is present)
-                if divergence == "Bullish Divergence (Lower Price Low + Higher Stoch Low)" and not is_fast_downtrend:
+                # M1 VWAP + EMA CROSSOVER + MICRO STRUCTURE BREAKOUT
+                if bullish_cross and (curr_price > vwap_1m) and (curr_price > high_1m_prev):
                     proposed_action = "BUY"
-                    trigger_type = "Divergence Reversal"
-                elif divergence == "Bearish Divergence (Higher Price High + Lower Stoch High)" and not is_fast_uptrend:
+                    trigger_type = "M1 VWAP Micro-Scalp"
+                elif bearish_cross and (curr_price < vwap_1m) and (curr_price < low_1m_prev):
                     proposed_action = "SELL"
-                    trigger_type = "Divergence Reversal"
+                    trigger_type = "M1 VWAP Micro-Scalp"
 
-                # 2. FAST TREND BREAKOUT / MOMENTUM SHIFT (Triggers immediate SELL on sharp breakdowns)
-                elif is_fast_downtrend and (c_5m < vwap_5m) and (stoch_k_curr < 50.0) and (adx_15m > 20.0):
-                    proposed_action = "SELL"
-                    trigger_type = "Bearish Breakdown"
-                elif is_fast_uptrend and (c_5m > vwap_5m) and (stoch_k_curr > 50.0) and (adx_15m > 20.0):
-                    proposed_action = "BUY"
-                    trigger_type = "Bullish Breakout"
-
-                # 3. MACRO TREND CONTINUATION
-                elif is_macro_uptrend and stoch_buy_cross:
-                    proposed_action = "BUY"
-                    trigger_type = "High Trend Continuation" if adx_15m > 30.0 else "Trend Setup"
-                elif is_macro_downtrend and stoch_sell_cross:
-                    proposed_action = "SELL"
-                    trigger_type = "High Trend Continuation" if adx_15m > 30.0 else "Trend Setup"
-
-                # State-Aware Cooldown
+                # Fast Cooldown Distance ($1.50 buffer for M1 scalper)
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -479,24 +423,24 @@ async def background_scanning_loop():
                         if last_trade:
                             last_entry_price = float(last_trade['entry_p'])
                             last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
-                            required_distance = 6.0 if last_outcome == "PENDING" else 3.0
+                            required_distance = 1.50 if last_outcome == "PENDING" else 1.00
 
                             if abs(curr_price - last_entry_price) < required_distance:
-                                logging.info(f"[STATE-AWARE COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f} (Status: {last_outcome}).")
+                                logging.info(f"[SCALP COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f}.")
                                 proposed_action = "HOLD"
                     except Exception as cd_err:
-                        logging.error(f"[STATE-AWARE COOLDOWN ERROR] {cd_err}")
+                        logging.error(f"[COOLDOWN ERROR] {cd_err}")
 
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M EMA 200: ${ema_200_5m:.2f} | 15M ADX: {adx_15m:.1f} | Status: HOLD (No entry setup)")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | M1 VWAP: ${vwap_1m:.2f} | 5M ADX: {adx_5m:.1f} | Status: HOLD")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, df_15m, divergence)
+                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
 
-                    atr_5m = float(df_5m["atr"].iloc[-1])
-                    sl_dist = float(max(4.50, min(8.00, atr_5m * 2.0)))
-                    tp1_mult = 1.5
-                    tp2_mult = 3.0
+                    atr_1m = float(df_1m["atr"].iloc[-1])
+                    sl_dist = float(max(1.20, min(2.50, atr_1m * 1.5)))
+                    tp1_mult = 1.2
+                    tp2_mult = 2.5
 
                     if proposed_action == "BUY":
                         sl_price = float(curr_price - sl_dist)
@@ -508,10 +452,10 @@ async def background_scanning_loop():
                         tp2_price = float(curr_price - (sl_dist * tp2_mult))
 
                     if ai_decision.action == proposed_action:
-                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
                         id_tag = f" #{new_id}" if new_id else ""
                         msg = (
-                            f"⚡ *STOCH RSI TRADE SIGNAL{id_tag}*\n\n"
+                            f"⚡ *M1 VWAP MICRO-SCALP SIGNAL{id_tag}*\n\n"
                             f"Asset: *XAUUSD (Gold Spot)*\n"
                             f"Action: *{proposed_action}*\n"
                             f"Type: *{trigger_type}*\n"
@@ -520,23 +464,23 @@ async def background_scanning_loop():
                             f"Take Profit 1 (TP1): *${tp1_price:.2f}* (1:{tp1_mult:.1f} RRR)\n"
                             f"Take Profit 2 (TP2): *${tp2_price:.2f}* (1:{tp2_mult:.1f} RRR)\n\n"
                             f"INDICATOR METRICS:\n"
-                            f"- Setup Type: {trigger_type}\n"
-                            f"- Divergence Context: {divergence}\n"
-                            f"- 15M ADX Strength: {adx_15m:.1f}\n"
-                            f"- 15M Stoch RSI: {stoch_15m:.1f}\n\n"
+                            f"- Setup: M1 VWAP + EMA 9/21 Crossover\n"
+                            f"- M1 VWAP Anchor: ${vwap_1m:.2f}\n"
+                            f"- 5M ADX Volatility: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"
                         )
                         await send_telegram_alert(client, msg)
                     else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_15m, stoch_15m, divergence, ai_decision.reasoning)
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
 
-                del df_5m, df_15m
+                del df_1m, df_5m
                 gc.collect()
 
             except Exception as e:
                 logging.error(f"[SCAN LOOP ERROR] {e}")
 
-            await asyncio.sleep(300)
+            # 120-second interval = 30 scans/hour = 270 scans/day across 9 active hours (540 total API calls/day)
+            await asyncio.sleep(120)
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager

@@ -68,15 +68,15 @@ def init_db():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
-                timestamp TEXT,
                 status TEXT NOT NULL,
                 action TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
         
-        # 2. Dynamic Schema Migration: Ensure all optional and legacy columns exist without losing data
+        # 2. Complete Schema Migration: Ensures all historical and present columns exist without resetting DB
         migrations = [
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trigger_type TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_price REAL;",
@@ -102,7 +102,7 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info("[NEON DATABASE] Table structure and schema migration verified successfully.")
+        logging.info("[NEON DATABASE] Full schema verified and missing columns auto-migrated.")
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
 
@@ -162,7 +162,6 @@ def update_open_trades(current_high: float, current_low: float):
             trade_id = trade['id']
             action = trade['action']
             
-            # Hybrid fallback for column names
             entry_price = float(trade['entry_price'] if trade.get('entry_price') is not None else trade.get('price', 0.0))
             sl = float(trade['sl_price'] if trade.get('sl_price') is not None else trade.get('sl', 0.0))
             tp1 = float(trade['tp1_price'] if trade.get('tp1_price') is not None else trade.get('tp1', 0.0))
@@ -450,7 +449,7 @@ async def background_scanning_loop():
                         conn = get_db_connection()
                         cursor = conn.cursor()
                         cursor.execute("""
-                            SELECT entry_price, price, outcome FROM signals 
+                            SELECT COALESCE(entry_price, price, 0) as entry_p, outcome FROM signals 
                             WHERE status = 'EXECUTED' AND action = %s 
                             ORDER BY id DESC LIMIT 1
                         """, (str(proposed_action),))
@@ -459,8 +458,8 @@ async def background_scanning_loop():
                         conn.close()
 
                         if last_trade:
-                            last_entry_price = float(last_trade['entry_price'] if last_trade.get('entry_price') is not None else last_trade.get('price', 0.0))
-                            last_outcome = str(last_trade['outcome'])
+                            last_entry_price = float(last_trade['entry_p'])
+                            last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
                             required_distance = 6.0 if last_outcome == "PENDING" else 3.0
 
                             if abs(curr_price - last_entry_price) < required_distance:
@@ -592,7 +591,6 @@ async def telegram_webhook(request: Request):
                     cur.execute("SELECT COUNT(*) as losses FROM signals WHERE outcome LIKE 'LOSS%'")
                     losses = cur.fetchone()['losses'] or 0
 
-                    # Use safe fallbacks for price/entry_price selection
                     cur.execute("SELECT action, COALESCE(entry_price, price, 0) as entry_p, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
                     closed_trades = cur.fetchall()
 
@@ -710,8 +708,14 @@ async def telegram_webhook(request: Request):
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
+
+                    # Uses COALESCE to fallback across legacy column names cleanly
                     cur.execute("""
-                        SELECT id, action, COALESCE(entry_price, price, 0) as entry_p, exit_price, outcome, timestamp, created_at 
+                        SELECT id, action, 
+                               COALESCE(entry_price, price, 0) as entry_p, 
+                               exit_price, 
+                               COALESCE(outcome, 'PENDING') as outcome_val, 
+                               COALESCE(timestamp, created_at::text, 'N/A') as log_time 
                         FROM signals 
                         WHERE status = 'EXECUTED' 
                         ORDER BY id DESC LIMIT 10
@@ -729,13 +733,8 @@ async def telegram_webhook(request: Request):
                             action = l['action']
                             entry = float(l['entry_p'])
                             exit_p = float(l['exit_price']) if l.get('exit_price') is not None else None
-                            outcome = l['outcome']
-                            date_val = l.get('created_at') or l.get('timestamp')
-
-                            if isinstance(date_val, datetime):
-                                date_str = date_val.strftime("%m-%d %H:%M")
-                            else:
-                                date_str = str(date_val) if date_val else "N/A"
+                            outcome = l['outcome_val']
+                            date_str = str(l['log_time'])
 
                             if exit_p is not None:
                                 diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)

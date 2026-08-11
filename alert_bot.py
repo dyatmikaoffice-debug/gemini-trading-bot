@@ -64,24 +64,30 @@ def init_db():
         return
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
-                action TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                sl_price REAL,
-                tp1_price REAL,
-                tp2_price REAL,
+                timestamp TEXT,
                 status TEXT NOT NULL,
-                outcome TEXT DEFAULT 'PENDING',
-                exit_price REAL,
+                action TEXT NOT NULL,
                 trigger_type TEXT,
+                price REAL,
+                entry_price REAL,
+                sl REAL,
+                sl_price REAL,
+                tp1 REAL,
+                tp1_price REAL,
+                tp2 REAL,
+                tp2_price REAL,
                 confidence REAL,
                 adx_15m REAL,
                 stoch_rsi_15m REAL,
                 divergence_type TEXT,
                 reasoning TEXT,
+                outcome TEXT DEFAULT 'PENDING',
+                exit_price REAL,
+                outcome_timestamp TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
@@ -97,7 +103,8 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         return None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
+        wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
@@ -107,15 +114,16 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         adx_val = float(adx_15m) if adx_15m is not None else 0.0
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
 
+        # Populate both 'price' and 'entry_price' columns to prevent schema mismatch errors
         cursor.execute("""
             INSERT INTO signals 
-            (action, entry_price, sl_price, tp1_price, tp2_price, status, outcome, trigger_type, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', %s, %s, %s, %s, %s, %s, NOW())
+            (timestamp, status, action, trigger_type, price, entry_price, sl, sl_price, tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m, divergence_type, reasoning, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             RETURNING id;
-        """, (str(action), price_val, sl_val, tp1_val, tp2_val, str(status), str(trigger_type), conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
+        """, (str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val, sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning)))
         
-        row = cursor.fetchone()
-        new_id = row['id'] if row else None
+        inserted_row = cursor.fetchone()
+        new_id = inserted_row['id'] if inserted_row and 'id' in inserted_row else None
         conn.commit()
         cursor.close()
         conn.close()
@@ -125,13 +133,13 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         logging.error(f"[NEON DB ERROR] Failed to log signal: {e}")
         return None
 
-# --- TWO-STAGE TP TRACKING FUNCTION ---
+# --- TWO-STAGE TP TRACKING FUNCTION (HYBRID COLUMN SUPPORT) ---
 def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')")
         open_trades = cursor.fetchall()
 
@@ -140,16 +148,19 @@ def update_open_trades(current_high: float, current_low: float):
             conn.close()
             return
 
+        wib_now = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         c_high = float(current_high)
         c_low = float(current_low)
 
         for trade in open_trades:
             trade_id = trade['id']
             action = trade['action']
-            entry_price = float(trade['entry_price'])
-            sl = float(trade['sl_price']) if trade['sl_price'] is not None else None
-            tp1 = float(trade['tp1_price']) if trade['tp1_price'] is not None else None
-            tp2 = float(trade['tp2_price']) if trade['tp2_price'] is not None else None
+            
+            # Support both 'entry_price' and 'price' column names safely
+            entry_price = float(trade['entry_price'] if trade.get('entry_price') is not None else trade.get('price', 0.0))
+            sl = float(trade['sl_price'] if trade.get('sl_price') is not None else trade.get('sl', 0.0))
+            tp1 = float(trade['tp1_price'] if trade.get('tp1_price') is not None else trade.get('tp1', 0.0))
+            tp2 = float(trade['tp2_price'] if trade.get('tp2_price') is not None else trade.get('tp2', 0.0))
             current_outcome = trade['outcome']
 
             new_outcome = None
@@ -157,46 +168,46 @@ def update_open_trades(current_high: float, current_low: float):
 
             if action == "BUY":
                 if current_outcome == "WIN (TP1 HIT)":
-                    if tp2 is not None and c_high >= tp2:
+                    if tp2 > 0 and c_high >= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
                     elif c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = tp1
-                elif sl is not None and c_low <= sl:
+                elif sl > 0 and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-                elif tp2 is not None and c_high >= tp2:
+                elif tp2 > 0 and c_high >= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                elif tp1 is not None and c_high >= tp1:
+                elif tp1 > 0 and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
 
             elif action == "SELL":
                 if current_outcome == "WIN (TP1 HIT)":
-                    if tp2 is not None and c_low <= tp2:
+                    if tp2 > 0 and c_low <= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
                     elif c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = tp1
-                elif sl is not None and c_high >= sl:
+                elif sl > 0 and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-                elif tp2 is not None and c_low <= tp2:
+                elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-                elif tp1 is not None and c_low <= tp1:
+                elif tp1 > 0 and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
                     UPDATE signals 
-                    SET outcome = %s, exit_price = %s 
+                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s
                     WHERE id = %s
-                """, (new_outcome, float(exit_price), trade_id))
+                """, (new_outcome, float(exit_price), wib_now, trade_id))
                 conn.commit()
                 logging.info(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f}")
 
@@ -436,9 +447,9 @@ async def background_scanning_loop():
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
-                        cursor = conn.cursor(cursor_factory=RealDictCursor)
+                        cursor = conn.cursor()
                         cursor.execute("""
-                            SELECT entry_price, outcome FROM signals 
+                            SELECT entry_price, price, outcome FROM signals 
                             WHERE status = 'EXECUTED' AND action = %s 
                             ORDER BY id DESC LIMIT 1
                         """, (str(proposed_action),))
@@ -447,7 +458,7 @@ async def background_scanning_loop():
                         conn.close()
 
                         if last_trade:
-                            last_entry_price = float(last_trade['entry_price'])
+                            last_entry_price = float(last_trade['entry_price'] if last_trade.get('entry_price') is not None else last_trade.get('price', 0.0))
                             last_outcome = str(last_trade['outcome'])
                             
                             required_distance = 6.0 if last_outcome == "PENDING" else 3.0
@@ -564,7 +575,7 @@ async def telegram_webhook(request: Request):
             elif raw_text == "/stats":
                 try:
                     conn = get_db_connection()
-                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    cur = conn.cursor()
                     
                     cur.execute("SELECT COUNT(*) as total FROM signals WHERE status = 'EXECUTED'")
                     total_executed = cur.fetchone()['total'] or 0
@@ -584,7 +595,7 @@ async def telegram_webhook(request: Request):
                     cur.execute("SELECT COUNT(*) as losses FROM signals WHERE outcome LIKE 'LOSS%'")
                     losses = cur.fetchone()['losses'] or 0
 
-                    cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                    cur.execute("SELECT action, entry_price, price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
                     closed_trades = cur.fetchall()
 
                     total_pips = 0.0
@@ -593,7 +604,7 @@ async def telegram_webhook(request: Request):
                     total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
-                        entry = float(t['entry_price'])
+                        entry = float(t['entry_price'] if t.get('entry_price') is not None else t.get('price', 0.0))
                         exit_p = float(t['exit_price'])
                         action = t['action']
                         
@@ -644,8 +655,8 @@ async def telegram_webhook(request: Request):
             elif raw_text == "/pips":
                 try:
                     conn = get_db_connection()
-                    cur = conn.cursor(cursor_factory=RealDictCursor)
-                    cur.execute("SELECT action, entry_price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                    cur = conn.cursor()
+                    cur.execute("SELECT action, entry_price, price, exit_price FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
                     trades = cur.fetchall()
 
                     total_pips = 0.0
@@ -655,7 +666,7 @@ async def telegram_webhook(request: Request):
                     losing_trades_count = 0
 
                     for t in trades:
-                        entry = float(t['entry_price'])
+                        entry = float(t['entry_price'] if t.get('entry_price') is not None else t.get('price', 0.0))
                         exit_p = float(t['exit_price'])
                         action = t['action']
                         
@@ -701,9 +712,9 @@ async def telegram_webhook(request: Request):
             elif raw_text == "/logs":
                 try:
                     conn = get_db_connection()
-                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    cur = conn.cursor()
                     cur.execute("""
-                        SELECT id, action, entry_price, exit_price, outcome, created_at 
+                        SELECT id, action, entry_price, price, exit_price, outcome, timestamp, created_at 
                         FROM signals 
                         WHERE status = 'EXECUTED' 
                         ORDER BY id DESC 
@@ -720,10 +731,10 @@ async def telegram_webhook(request: Request):
                         for l in logs:
                             trade_id = l['id']
                             action = l['action']
-                            entry = float(l['entry_price'])
-                            exit_p = float(l['exit_price']) if l['exit_price'] else None
+                            entry = float(l['entry_price'] if l.get('entry_price') is not None else l.get('price', 0.0))
+                            exit_p = float(l['exit_price']) if l.get('exit_price') is not None else None
                             outcome = l['outcome']
-                            date_val = l['created_at']
+                            date_val = l.get('created_at') or l.get('timestamp')
                             
                             if isinstance(date_val, datetime):
                                 date_str = date_val.strftime("%m-%d %H:%M")

@@ -349,7 +349,7 @@ Respond strictly in valid JSON matching schema:
 
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure quantitative indicator alignment.")
 
-# --- BACKGROUND SCANNING LOOP (CROSSOVER + PULLBACK TRIGGERS) ---
+# --- BACKGROUND SCANNING LOOP (2-CANDLE REVERSAL & NO-CUT VWAP RULES) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
@@ -357,9 +357,9 @@ async def background_scanning_loop():
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
-                # SESSION WINDOWING: Only scan during active London/NY trading hours (14:00 - 23:00 WIB)
+                # SESSION WINDOWING: Active London/NY hours (14:00 - 23:00 WIB)
                 if not (14 <= current_hour_wib < 23):
-                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session (14:00 - 23:00 WIB). Pausing API calls...")
+                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session. Pausing API calls...")
                     await asyncio.sleep(300)
                     continue
 
@@ -379,7 +379,9 @@ async def background_scanning_loop():
                 curr_low = float(df_1m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
+                # Current Candle (Candle t)
                 curr_price = float(df_1m["close"].iloc[-1])
+                curr_open = float(df_1m["open"].iloc[-1])
                 vwap_1m = float(df_1m["vwap"].iloc[-1])
                 adx_5m = float(df_5m["adx"].iloc[-1])
 
@@ -388,30 +390,52 @@ async def background_scanning_loop():
                 ema21_curr = float(df_1m["ema_21"].iloc[-1])
                 ema21_prev = float(df_1m["ema_21"].iloc[-2])
 
+                # Previous Candle (Candle t-1)
+                open_1m_prev = float(df_1m["open"].iloc[-2])
+                close_1m_prev = float(df_1m["close"].iloc[-2])
                 high_1m_prev = float(df_1m["high"].iloc[-2])
                 low_1m_prev = float(df_1m["low"].iloc[-2])
+                vwap_prev = float(df_1m["vwap"].iloc[-2])
 
-                # 1. INITIAL MOMENTUM CROSSOVER TRIGGERS
-                bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
-                bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
+                # RULE 1: Detect Candle Piercing/Cut Through VWAP (Blocks Bounce Signals)
+                bullish_cut_vwap = (open_1m_prev < vwap_prev) and (close_1m_prev > vwap_prev)  # Upward slice
+                bearish_cut_vwap = (open_1m_prev > vwap_prev) and (close_1m_prev < vwap_prev)  # Downward slice
 
-                # 2. TREND PULLBACK REJECTION TRIGGERS
-                bullish_pullback = (ema9_curr > ema21_curr) and (low_1m_prev <= ema9_prev) and (curr_price > ema9_curr)
-                bearish_pullback = (ema9_curr < ema21_curr) and (high_1m_prev >= ema9_prev) and (curr_price < ema9_curr)
+                # RULE 2: 2-Candle Touch & Reversal Confirmation Rules
+                # Touch previous candle low on EMA9 or VWAP, but did NOT close slicing below VWAP, AND current candle closes bullish
+                bullish_reversal = (
+                    (low_1m_prev <= max(ema9_prev, vwap_prev)) and 
+                    (close_1m_prev >= vwap_prev) and 
+                    not bearish_cut_vwap and 
+                    (curr_price > curr_open) and 
+                    (curr_price > high_1m_prev)
+                )
+
+                # Touch previous candle high on EMA9 or VWAP, but did NOT close slicing above VWAP, AND current candle closes bearish
+                bearish_reversal = (
+                    (high_1m_prev >= min(ema9_prev, vwap_prev)) and 
+                    (close_1m_prev <= vwap_prev) and 
+                    not bullish_cut_vwap and 
+                    (curr_price < curr_open) and 
+                    (curr_price < low_1m_prev)
+                )
+
+                # Crossover Triggers
+                bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr) and not bearish_cut_vwap
+                bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr) and not bullish_cut_vwap
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
 
-                # COMBINED SETUP EVALUATION
-                if (bullish_cross or bullish_pullback) and (curr_price > vwap_1m) and (curr_price > high_1m_prev):
+                if (bullish_cross or bullish_reversal) and (curr_price > vwap_1m):
                     proposed_action = "BUY"
-                    trigger_type = "M1 VWAP Pullback" if bullish_pullback else "M1 VWAP Crossover"
+                    trigger_type = "M1 VWAP Reversal" if bullish_reversal else "M1 VWAP Crossover"
 
-                elif (bearish_cross or bearish_pullback) and (curr_price < vwap_1m) and (curr_price < low_1m_prev):
+                elif (bearish_cross or bearish_reversal) and (curr_price < vwap_1m):
                     proposed_action = "SELL"
-                    trigger_type = "M1 VWAP Pullback" if bearish_pullback else "M1 VWAP Crossover"
+                    trigger_type = "M1 VWAP Reversal" if bearish_reversal else "M1 VWAP Crossover"
 
-                # Fast Cooldown Distance ($1.50 buffer for M1 scalper)
+                # State-Aware Cooldown Distance Check
                 if proposed_action != "HOLD":
                     try:
                         conn = get_db_connection()
@@ -428,7 +452,7 @@ async def background_scanning_loop():
                         if last_trade:
                             last_entry_price = float(last_trade['entry_p'])
                             last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
-                            required_distance = 1.50 if last_outcome == "PENDING" else 1.00
+                            required_distance = 3.00 if last_outcome == "PENDING" else 2.00
 
                             if abs(curr_price - last_entry_price) < required_distance:
                                 logging.info(f"[SCALP COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f}.")
@@ -443,9 +467,9 @@ async def background_scanning_loop():
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
 
                     atr_1m = float(df_1m["atr"].iloc[-1])
-                    sl_dist = float(max(1.20, min(2.50, atr_1m * 1.5)))
-                    tp1_mult = 1.2
-                    tp2_mult = 2.5
+                    sl_dist = float(max(2.50, min(4.50, atr_1m * 2.0)))
+                    tp1_mult = 1.5
+                    tp2_mult = 3.0
 
                     if proposed_action == "BUY":
                         sl_price = float(curr_price - sl_dist)

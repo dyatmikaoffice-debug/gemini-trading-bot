@@ -368,11 +368,13 @@ def bucket_session(timestamp_str: str) -> str:
         hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
     except Exception:
         return "Unknown"
-    if 14 <= hour < 17:
-        return "London (14-17 WIB)"
-    if 19 <= hour < 22:
-        return "NY (19-22 WIB)"
-    return "Outside core session"
+    if 9 <= hour < 14:
+        return "Early (09-14 WIB)"
+    if 14 <= hour < 18:
+        return "Mid (14-18 WIB)"
+    if 18 <= hour < 22:
+        return "Late (18-22 WIB)"
+    return "Outside session"
 
 def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag: int = 8) -> str:
     lines = [f"*{dim_name}:*"]
@@ -522,14 +524,14 @@ async def background_scanning_loop():
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
-                # SESSION WINDOWING: London open (14:00-17:00 WIB) and NY open (19:00-22:00 WIB)
-                # These are the two highest-quality windows for this strategy.
-                # NOTE: this narrows the trading window vs. the previous 14:00-23:00 range.
-                active_session = (14 <= current_hour_wib < 17) or (19 <= current_hour_wib < 22)
+                # SESSION WINDOWING: 09:00-22:00 WIB (13h active window).
+                # At 2 calls/cycle every 120s (~1 call/min avg), this uses ~780 calls/day --
+                # close to the Twelve Data free-tier 800/day cap, with a ~20-call safety buffer.
+                active_session = (9 <= current_hour_wib < 22)
 
                 if not active_session:
-                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside London/NY open window. Pausing API calls...")
-                    await asyncio.sleep(120)
+                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session. Pausing API calls...")
+                    await asyncio.sleep(300)
                     continue
 
                 logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning for Liquidity Sweep + Structure Break...")

@@ -336,6 +336,60 @@ def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
         return "SELL", "Breakout Continuation (Bearish)", recent_high, recent_low
     return "HOLD", "No setup", recent_high, recent_low
 
+# --- FORWARD-TEST ANALYTICS: turns closed trades into segment-level performance stats ---
+def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float) -> float:
+    """
+    R multiple = profit/loss expressed in units of the original risk (entry-to-SL distance).
+    +1.0R means the trade made exactly as much as it risked; -1.0R is a full stop-out.
+    """
+    risk_dist = abs(entry - sl)
+    if risk_dist <= 0:
+        return 0.0
+    if action == "BUY":
+        return (exit_price - entry) / risk_dist
+    return (entry - exit_price) / risk_dist
+
+def bucket_adx(adx: float) -> str:
+    if adx < 20:
+        return "ADX <20"
+    if adx < 30:
+        return "ADX 20-30"
+    if adx < 40:
+        return "ADX 30-40"
+    if adx < 50:
+        return "ADX 40-50"
+    return "ADX 50+"
+
+def bucket_strategy(trigger_type: str) -> str:
+    return "Breakout Continuation" if "Breakout" in (trigger_type or "") else "Sweep + BOS"
+
+def bucket_session(timestamp_str: str) -> str:
+    try:
+        hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
+    except Exception:
+        return "Unknown"
+    if 14 <= hour < 17:
+        return "London (14-17 WIB)"
+    if 19 <= hour < 22:
+        return "NY (19-22 WIB)"
+    return "Outside core session"
+
+def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag: int = 8) -> str:
+    lines = [f"*{dim_name}:*"]
+    for label, r_values in sorted(buckets.items(), key=lambda item: -len(item[1])):
+        n = len(r_values)
+        wins = sum(1 for r in r_values if r > 0)
+        win_rate = (wins / n * 100) if n else 0.0
+        avg_r = (sum(r_values) / n) if n else 0.0
+        flag = ""
+        if n >= min_sample_to_flag:
+            if win_rate < 35:
+                flag = " ⚠️ underperforming"
+            elif win_rate > 65:
+                flag = " ✅ strong"
+        lines.append(f"• {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
+    return "\n".join(lines)
+
 def compute_pullback_zone(action: str, swing_high: float, swing_low: float):
     """
     Given the impulse leg of a sweep+BOS move, returns the (zone_lower, zone_upper)
@@ -699,6 +753,7 @@ async def telegram_webhook(request: Request):
                     "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
                     "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
                     "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
+                    "• `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
                     "• `/help` - Display Command Menu"
                 )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
@@ -897,6 +952,74 @@ async def telegram_webhook(request: Request):
                 except Exception as log_err:
                     logging.error(f"[WEBHOOK ERROR /logs] {log_err}")
                     await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/analyze":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, trigger_type,
+                               COALESCE(entry_price, price, 0) as entry_p,
+                               sl_price, exit_price,
+                               COALESCE(adx_15m, 0) as adx_val,
+                               COALESCE(timestamp, created_at::text, '') as ts
+                        FROM signals
+                        WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
+                    """)
+                    rows = cur.fetchall()
+                    cur.close()
+                    conn.close()
+
+                    if not rows:
+                        reply = "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n_Not enough closed trades yet to analyze. Check back after more signals complete._"
+                    else:
+                        segments = {"Strategy": {}, "ADX Regime": {}, "Session": {}}
+                        overall_r = []
+
+                        for r in rows:
+                            entry = float(r['entry_p'])
+                            exit_p = float(r['exit_price'])
+                            sl = float(r['sl_price']) if r.get('sl_price') is not None else 0.0
+                            action = r['action']
+                            adx_val = float(r['adx_val'])
+                            trigger = r['trigger_type'] or ""
+                            ts = r['ts'] or ""
+
+                            r_mult = compute_r_multiple(action, entry, exit_p, sl)
+                            overall_r.append(r_mult)
+
+                            segments["Strategy"].setdefault(bucket_strategy(trigger), []).append(r_mult)
+                            segments["ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["Session"].setdefault(bucket_session(ts), []).append(r_mult)
+
+                        n_total = len(overall_r)
+                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
+                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
+
+                        reply_parts = [
+                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*",
+                            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                            f"Sample: *{n_total} closed trades*",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
+                            "",
+                        ]
+                        for dim in ["Strategy", "ADX Regime", "Session"]:
+                            reply_parts.append(format_performance_segment(dim, segments[dim]))
+                            reply_parts.append("")
+
+                        reply_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        reply_parts.append(
+                            "💡 Segments need n≥8 to be flagged ⚠️/✅ (smaller samples are shown but noisy). "
+                            "This does not auto-adjust the bot — use it to decide whether to retune the ADX veto "
+                            "thresholds, fib pullback zone, or session windows in code."
+                        )
+                        reply = "\n".join(reply_parts)
+
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+
+                except Exception as an_err:
+                    logging.error(f"[WEBHOOK ERROR /analyze] {an_err}")
+                    await send_telegram_alert(client, f"⚠️ Error running analysis: {an_err}", target_chat_id=sender_chat_id)
 
     except Exception as e:
         logging.error(f"[WEBHOOK ERROR] {e}")

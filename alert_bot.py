@@ -50,9 +50,10 @@ SYMBOL = "XAU/USD"
 # price to retrace into the fib zone and reject before actually entering.
 # This lives in process memory (single background task), so it resets on redeploy.
 pending_setup = None
-PULLBACK_EXPIRY_MINUTES = 6
+PULLBACK_EXPIRY_MINUTES = 10  # widened from 6: more time for a valid pullback to land before the setup is discarded
 FIB_RETRACE_MIN = 0.382
 FIB_RETRACE_MAX = 0.618
+LEVEL_LOOKBACK_CANDLES = 4  # narrowed from 5: fresher 5M liquidity levels reset more often -> more sweep/breakout opportunities
 
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
@@ -289,8 +290,8 @@ def detect_liquidity_sweep_structure(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
 
     Returns: (action, trigger_type, recent_high, recent_low)
     """
-    recent_high = float(df_5m["high"].iloc[-6:-1].max())
-    recent_low = float(df_5m["low"].iloc[-6:-1].min())
+    recent_high = float(df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max())
+    recent_low = float(df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min())
 
     prev = df_1m.iloc[-2]
     curr = df_1m.iloc[-1]
@@ -321,8 +322,8 @@ def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
 
     Returns: (action, trigger_type, recent_high, recent_low)
     """
-    recent_high = float(df_5m["high"].iloc[-6:-1].max())
-    recent_low = float(df_5m["low"].iloc[-6:-1].min())
+    recent_high = float(df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max())
+    recent_low = float(df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min())
 
     prev = df_1m.iloc[-2]
     curr = df_1m.iloc[-1]
@@ -524,10 +525,11 @@ async def background_scanning_loop():
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
-                # SESSION WINDOWING: 09:00-22:00 WIB (13h active window).
-                # At 2 calls/cycle every 120s (~1 call/min avg), this uses ~780 calls/day --
-                # close to the Twelve Data free-tier 800/day cap, with a ~20-call safety buffer.
-                active_session = (9 <= current_hour_wib < 22)
+                # SESSION WINDOWING: 10:00-22:00 WIB (12h active window).
+                # At 2 calls/cycle every 120s, 12 active hours = 720 calls/day = 90% of the
+                # Twelve Data free-tier 800/day cap, leaving ~80 calls/day (10%) spare for
+                # manual testing/redeploys without risking a rate-limit hit.
+                active_session = (10 <= current_hour_wib < 22)
 
                 if not active_session:
                     logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session. Pausing API calls...")
@@ -643,7 +645,7 @@ async def background_scanning_loop():
                         if last_trade:
                             last_entry_price = float(last_trade['entry_p'])
                             last_outcome = str(last_trade['outcome']) if last_trade.get('outcome') else "PENDING"
-                            required_distance = 3.00 if last_outcome == "PENDING" else 2.00
+                            required_distance = 2.00 if last_outcome == "PENDING" else 1.50
 
                             if abs(curr_price - last_entry_price) < required_distance:
                                 logging.info(f"[SCALP COOLDOWN] Skipping {proposed_action}: Price within ${required_distance:.2f} of previous trade at ${last_entry_price:.2f}.")

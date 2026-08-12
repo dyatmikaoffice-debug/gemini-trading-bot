@@ -310,6 +310,32 @@ def detect_liquidity_sweep_structure(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
         return "BUY", "Liquidity Sweep + Bullish BOS", recent_high, recent_low
     return "HOLD", "No setup", recent_high, recent_low
 
+# --- STRATEGY: BREAKOUT CONTINUATION (trend-following, sits alongside the sweep strategy) ---
+def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    """
+    Detects a clean momentum breakout of a recent 5M high/low that is NOT a
+    sweep-and-reject: both the previous AND current 1M candle close beyond the
+    level, and the current close extends further than the previous one. That
+    sustained follow-through (rather than a snap-back) is what separates a
+    continuation trade from a liquidity sweep fakeout.
+
+    Returns: (action, trigger_type, recent_high, recent_low)
+    """
+    recent_high = float(df_5m["high"].iloc[-6:-1].max())
+    recent_low = float(df_5m["low"].iloc[-6:-1].min())
+
+    prev = df_1m.iloc[-2]
+    curr = df_1m.iloc[-1]
+
+    bullish_breakout = bool(prev["close"] > recent_high and curr["close"] > recent_high and curr["close"] > prev["close"])
+    bearish_breakout = bool(prev["close"] < recent_low and curr["close"] < recent_low and curr["close"] < prev["close"])
+
+    if bullish_breakout:
+        return "BUY", "Breakout Continuation (Bullish)", recent_high, recent_low
+    if bearish_breakout:
+        return "SELL", "Breakout Continuation (Bearish)", recent_high, recent_low
+    return "HOLD", "No setup", recent_high, recent_low
+
 def compute_pullback_zone(action: str, swing_high: float, swing_low: float):
     """
     Given the impulse leg of a sweep+BOS move, returns the (zone_lower, zone_upper)
@@ -373,19 +399,33 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame, recent_high: float, recent_low: float):
+    is_breakout = "Breakout" in trigger_type
+
+    if is_breakout:
+        strategy_label = "Breakout Continuation (trend-following momentum entry)"
+        veto_rules_text = (
+            "- VETO if 5M ADX is below 20.0 (trend too weak to sustain a breakout; high risk of a false break/fakeout).\n"
+            "- VETO if 5M ADX is above 70.0 (parabolic/overextended move, high risk of an imminent sharp pullback)."
+        )
+    else:
+        strategy_label = "Liquidity Sweep + Break-of-Structure (reversal entry)"
+        veto_rules_text = (
+            "- VETO if 5M ADX is above 45.0 (indicating an extreme unstoppable runaway trend that destroys mean-reversion setups).\n"
+            "- VETO if 5M ADX is below 12.0 (indicating dead market liquidity)."
+        )
+
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping using a
-Liquidity Sweep + Break-of-Structure methodology (5M liquidity/structure, 1M trigger).
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping.
+Strategy in play: {strategy_label}.
 A technical scalp trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
 1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, Prior Candle High=${float(df_1m['high'].iloc[-2]):.2f}, Prior Candle Low=${float(df_1m['low'].iloc[-2]):.2f}.
-2. 5-Minute Liquidity Levels: Recent Swept High=${recent_high:.2f}, Recent Swept Low=${recent_low:.2f}.
+2. 5-Minute Reference Levels: Recent High=${recent_high:.2f}, Recent Low=${recent_low:.2f}.
 3. 5-Minute: ADX Trend Strength={float(df_5m['adx'].iloc[-1]):.1f}.
 
 CRITICAL SCALP VETO RULES:
-- VETO if 5M ADX is above 45.0 (indicating an extreme unstoppable runaway trend where a reversal-style sweep entry is unsafe).
-- VETO if 5M ADX is below 12.0 (indicating dead market liquidity, sweep may be noise not real structure).
+{veto_rules_text}
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -517,6 +557,19 @@ async def background_scanning_loop():
                             }
                             status_note = f" | New {new_action} setup ({new_trigger_type}) armed, awaiting pullback into ${zone_lower:.2f}-${zone_upper:.2f}"
 
+                # STAGE 1b: No sweep setup found either -> check for a momentum breakout continuation.
+                # This is a trend-following entry (not a reversal), so it enters immediately rather
+                # than waiting for a pullback -- a strong continuation move may not retrace at all.
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    b_action, b_trigger_type, b_recent_high, b_recent_low = detect_breakout_continuation(df_1m, df_5m)
+                    if b_action != "HOLD":
+                        if adx_5m >= 20.0:
+                            proposed_action = b_action
+                            trigger_type = b_trigger_type
+                            recent_high, recent_low = b_recent_high, b_recent_low
+                        else:
+                            status_note = f" | Breakout seen but 5M ADX {adx_5m:.1f} too weak to confirm continuation"
+
                 # Cooldown Distance Check ($3.00 pending / $2.00 closed)
                 if proposed_action != "HOLD":
                     try:
@@ -553,31 +606,38 @@ async def background_scanning_loop():
                     atr_1m = float(raw_atr) if not pd.isna(raw_atr) else 3.0
                     risk = max(2.5, atr_1m * 1.2)
 
+                    is_breakout_trigger = "Breakout" in trigger_type
+                    tp1_r_mult = 1.5
+                    tp2_r_mult = 3.0 if is_breakout_trigger else 2.5  # let continuation trades run further
+
                     if proposed_action == "BUY":
                         sl_price = float(curr_price - risk)
-                        tp1_price = float(curr_price + risk * 1.5)
-                        tp2_price = float(curr_price + risk * 2.5)
+                        tp1_price = float(curr_price + risk * tp1_r_mult)
+                        tp2_price = float(curr_price + risk * tp2_r_mult)
                     else:
                         sl_price = float(curr_price + risk)
-                        tp1_price = float(curr_price - risk * 1.5)
-                        tp2_price = float(curr_price - risk * 2.5)
+                        tp1_price = float(curr_price - risk * tp1_r_mult)
+                        tp2_price = float(curr_price - risk * tp2_r_mult)
 
                     if ai_decision.action == proposed_action:
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
                         id_tag = f" #{new_id}" if new_id else ""
+                        header_icon = "🚀" if is_breakout_trigger else "⚡"
+                        header_label = "BREAKOUT CONTINUATION SIGNAL" if is_breakout_trigger else "LIQUIDITY SWEEP + BOS SIGNAL"
+                        model_label = "5M/1M Momentum Breakout Continuation" if is_breakout_trigger else "5M Liquidity Sweep + 1M Break of Structure"
                         msg = (
-                            f"⚡ *LIQUIDITY SWEEP + BOS SIGNAL{id_tag}*\n\n"
+                            f"{header_icon} *{header_label}{id_tag}*\n\n"
                             f"Asset: *XAUUSD (Gold Spot)*\n"
                             f"Action: *{proposed_action}*\n"
                             f"Type: *{trigger_type}*\n"
                             f"Entry Price: *${curr_price:.2f}*\n\n"
                             f"Stop Loss (SL): *${sl_price:.2f}*\n"
-                            f"Take Profit 1 (1.5R): *${tp1_price:.2f}*\n"
-                            f"Take Profit 2 (2.5R): *${tp2_price:.2f}*\n\n"
+                            f"Take Profit 1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\n"
+                            f"Take Profit 2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\n"
                             f"INDICATOR METRICS:\n"
-                            f"- Model: 5M Liquidity Sweep + 1M Break of Structure\n"
-                            f"- Swept 5M High: ${recent_high:.2f}\n"
-                            f"- Swept 5M Low: ${recent_low:.2f}\n"
+                            f"- Model: {model_label}\n"
+                            f"- Reference 5M High: ${recent_high:.2f}\n"
+                            f"- Reference 5M Low: ${recent_low:.2f}\n"
                             f"- 1M ATR (risk unit): ${atr_1m:.2f}\n"
                             f"- 5M ADX Trend Strength: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"

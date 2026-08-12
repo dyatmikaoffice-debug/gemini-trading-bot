@@ -45,6 +45,15 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 
+# --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
+# In-memory pending setup: a sweep+BOS was detected and we are waiting for
+# price to retrace into the fib zone and reject before actually entering.
+# This lives in process memory (single background task), so it resets on redeploy.
+pending_setup = None
+PULLBACK_EXPIRY_MINUTES = 6
+FIB_RETRACE_MIN = 0.382
+FIB_RETRACE_MAX = 0.618
+
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
@@ -63,7 +72,7 @@ def init_db():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
@@ -72,7 +81,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        
+
         migrations = [
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trigger_type TEXT;",
@@ -93,10 +102,10 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS exit_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome_timestamp TEXT;"
         ]
-        
+
         for query in migrations:
             cursor.execute(query)
-            
+
         conn.commit()
         cursor.close()
         conn.close()
@@ -111,7 +120,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         conn = get_db_connection()
         cursor = conn.cursor()
         wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
-        
+
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -125,7 +134,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             RETURNING id;
         """, (str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val, sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val, str(divergence_type), str(reasoning), "PENDING", ""))
-        
+
         inserted_row = cursor.fetchone()
         new_id = inserted_row['id'] if inserted_row and 'id' in inserted_row else None
         conn.commit()
@@ -146,7 +155,7 @@ def update_open_trades(current_high: float, current_low: float):
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM signals WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')")
         open_trades = cursor.fetchall()
-        
+
         if not open_trades:
             cursor.close()
             conn.close()
@@ -159,12 +168,12 @@ def update_open_trades(current_high: float, current_low: float):
         for trade in open_trades:
             trade_id = trade['id']
             action = trade['action']
-            
+
             entry_price = float(trade['entry_price'] if trade.get('entry_price') is not None else trade.get('price', 0.0))
             sl = float(trade['sl_price'] if trade.get('sl_price') is not None else trade.get('sl', 0.0))
             tp1 = float(trade['tp1_price'] if trade.get('tp1_price') is not None else trade.get('tp1', 0.0))
             tp2 = float(trade['tp2_price'] if trade.get('tp2_price') is not None else trade.get('tp2', 0.0))
-            
+
             current_outcome = trade['outcome']
             new_outcome = None
             exit_price = None
@@ -207,8 +216,8 @@ def update_open_trades(current_high: float, current_low: float):
 
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
-                    UPDATE signals 
-                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s 
+                    UPDATE signals
+                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s
                     WHERE id = %s
                 """, (new_outcome, float(exit_price), wib_now, trade_id))
                 conn.commit()
@@ -229,10 +238,10 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
         data = res.json()
     except Exception:
         return None
-    
+
     if "values" not in data:
         return None
-        
+
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
@@ -241,21 +250,11 @@ async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, output
             df[col] = df[col].astype(float)
     return df
 
-# --- INDICATORS CALCULATIONS FOR M1 VWAP STANDARD DEVIATION BANDS ---
+# --- INDICATOR CALCULATIONS (M1): ATR only (VWAP bands no longer used for entries) ---
 def calculate_metrics_m1(df: pd.DataFrame):
     df = df.tail(100).copy()
-    
-    # 20-period Rolling VWAP & Standard Deviation Bands
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    df["pv"] = typical_price * df["close"]
-    df["vwap"] = df["pv"].rolling(window=20).sum() / df["close"].rolling(window=20).sum()
-    df["std"] = df["close"].rolling(window=20).std()
-    
-    # +2.0 SD Upper Band and -2.0 SD Lower Band
-    df["vwap_upper_2"] = df["vwap"] + (2.0 * df["std"])
-    df["vwap_lower_2"] = df["vwap"] - (2.0 * df["std"])
-    
-    # ATR Calculation on M1
+
+    # ATR Calculation on M1 (used for volatility-based SL/TP sizing)
     df["tr"] = np.maximum(
         df["high"] - df["low"],
         np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
@@ -271,10 +270,10 @@ def calculate_metrics_5m(df: pd.DataFrame):
     )
     df["up_move"] = df["high"] - df["high"].shift(1)
     df["down_move"] = df["low"].shift(1) - df["low"]
-    
+
     df["plus_dm"] = np.where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), df["up_move"], 0.0)
     df["minus_dm"] = np.where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), df["down_move"], 0.0)
-    
+
     tr14 = df["tr"].rolling(14).sum()
     plus_di = 100 * (df["plus_dm"].rolling(14).sum() / (tr14 + 1e-10))
     minus_di = 100 * (df["minus_dm"].rolling(14).sum() / (tr14 + 1e-10))
@@ -282,16 +281,82 @@ def calculate_metrics_5m(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     return df
 
+# --- STRATEGY: LIQUIDITY SWEEP + STRUCTURE BREAK (5M liquidity/structure, 1M trigger) ---
+def detect_liquidity_sweep_structure(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    """
+    Looks at the last completed 5 x 5M candles for the swept liquidity level,
+    then checks the last two 1M candles for a sweep-and-reject + break of structure.
+
+    Returns: (action, trigger_type, recent_high, recent_low)
+    """
+    recent_high = float(df_5m["high"].iloc[-6:-1].max())
+    recent_low = float(df_5m["low"].iloc[-6:-1].min())
+
+    prev = df_1m.iloc[-2]
+    curr = df_1m.iloc[-1]
+
+    # SELL setup: price sweeps above the recent 5M high, then closes back below it
+    sweep_high = bool(prev["high"] > recent_high and curr["close"] < recent_high)
+    # BUY setup: price sweeps below the recent 5M low, then closes back above it
+    sweep_low = bool(prev["low"] < recent_low and curr["close"] > recent_low)
+
+    # Structure confirmation on the 1M candle
+    bearish_bos = bool(curr["close"] < prev["low"])
+    bullish_bos = bool(curr["close"] > prev["high"])
+
+    if sweep_high and bearish_bos:
+        return "SELL", "Liquidity Sweep + Bearish BOS", recent_high, recent_low
+    if sweep_low and bullish_bos:
+        return "BUY", "Liquidity Sweep + Bullish BOS", recent_high, recent_low
+    return "HOLD", "No setup", recent_high, recent_low
+
+def compute_pullback_zone(action: str, swing_high: float, swing_low: float):
+    """
+    Given the impulse leg of a sweep+BOS move, returns the (zone_lower, zone_upper)
+    fib retracement band price should pull back into before we enter.
+    """
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return None, None
+    if action == "BUY":
+        # Impulse moved up from swing_low to swing_high; pullback retraces down into the zone.
+        zone_upper = swing_high - (FIB_RETRACE_MIN * rng)
+        zone_lower = swing_high - (FIB_RETRACE_MAX * rng)
+    else:
+        # Impulse moved down from swing_high to swing_low; pullback retraces up into the zone.
+        zone_lower = swing_low + (FIB_RETRACE_MIN * rng)
+        zone_upper = swing_low + (FIB_RETRACE_MAX * rng)
+    return float(zone_lower), float(zone_upper)
+
+def check_pullback_entry(action: str, zone_lower: float, zone_upper: float, curr_candle) -> bool:
+    """
+    True if the current 1M candle's range overlaps the fib pullback zone
+    AND the candle closes back in the direction of the original trade (a rejection candle).
+    """
+    candle_low = float(curr_candle["low"])
+    candle_high = float(curr_candle["high"])
+    candle_open = float(curr_candle["open"])
+    candle_close = float(curr_candle["close"])
+
+    overlaps_zone = candle_high >= zone_lower and candle_low <= zone_upper
+    if not overlaps_zone:
+        return False
+
+    if action == "BUY":
+        return candle_close > candle_open
+    else:
+        return candle_close < candle_open
+
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
     chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         logging.error("[TELEGRAM ERROR] Missing token or chat_id")
         return
-        
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    
+
     try:
         res = await client.post(url, json=payload)
         if res.status_code != 200:
@@ -307,18 +372,20 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
         logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
 # --- AI ANALYST EVALUATION ---
-async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+async def analyze_signal_with_ai(proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame, recent_high: float, recent_low: float):
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) M1 VWAP Mean-Reversion Scalping.
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping using a
+Liquidity Sweep + Break-of-Structure methodology (5M liquidity/structure, 1M trigger).
 A technical scalp trigger ({trigger_type}) suggests a {proposed_action} entry at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
-1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, VWAP Center=${float(df_1m['vwap'].iloc[-1]):.2f}, +2SD Upper Band=${float(df_1m['vwap_upper_2'].iloc[-1]):.2f}, -2SD Lower Band=${float(df_1m['vwap_lower_2'].iloc[-1]):.2f}.
-2. 5-Minute: ADX Volatility Strength=${float(df_5m['adx'].iloc[-1]):.1f}.
+1. 1-Minute: Close=${float(df_1m['close'].iloc[-1]):.2f}, Prior Candle High=${float(df_1m['high'].iloc[-2]):.2f}, Prior Candle Low=${float(df_1m['low'].iloc[-2]):.2f}.
+2. 5-Minute Liquidity Levels: Recent Swept High=${recent_high:.2f}, Recent Swept Low=${recent_low:.2f}.
+3. 5-Minute: ADX Trend Strength={float(df_5m['adx'].iloc[-1]):.1f}.
 
 CRITICAL SCALP VETO RULES:
-- VETO if 5M ADX is above 45.0 (indicating an extreme unstoppable runaway trend that destroys mean-reversion setups).
-- VETO if 5M ADX is below 12.0 (indicating dead market liquidity).
+- VETO if 5M ADX is above 45.0 (indicating an extreme unstoppable runaway trend where a reversal-style sweep entry is unsafe).
+- VETO if 5M ADX is below 12.0 (indicating dead market liquidity, sweep may be noise not real structure).
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -351,9 +418,9 @@ Respond strictly in valid JSON matching schema:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure VWAP band mean-reversion alignment.")
+    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure liquidity sweep + structure break alignment.")
 
-# --- BACKGROUND SCANNING LOOP (M1 VWAP SD BAND MEAN-REVERSION) ---
+# --- BACKGROUND SCANNING LOOP (LIQUIDITY SWEEP + STRUCTURE BREAK) ---
 async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
@@ -361,18 +428,27 @@ async def background_scanning_loop():
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
-                # SESSION WINDOWING: Active London/NY hours (14:00 - 23:00 WIB)
-                if not (14 <= current_hour_wib < 23):
-                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside active trading session. Pausing API calls...")
-                    await asyncio.sleep(300)
+                # SESSION WINDOWING: London open (14:00-17:00 WIB) and NY open (19:00-22:00 WIB)
+                # These are the two highest-quality windows for this strategy.
+                # NOTE: this narrows the trading window vs. the previous 14:00-23:00 range.
+                active_session = (14 <= current_hour_wib < 17) or (19 <= current_hour_wib < 22)
+
+                if not active_session:
+                    logging.info(f"[SLEEP MODE] WIB Time: {now_wib.strftime('%H:%M')} | Outside London/NY open window. Pausing API calls...")
+                    await asyncio.sleep(120)
                     continue
 
-                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning M1 VWAP SD Band Mean-Reversion...")
+                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning for Liquidity Sweep + Structure Break...")
                 df_1m = await fetch_timeframe_data(client, "1min")
                 df_5m = await fetch_timeframe_data(client, "5min")
 
                 if df_1m is None or df_5m is None:
                     logging.warning("Failed to fetch M1/M5 candles. Retrying next cycle.")
+                    await asyncio.sleep(120)
+                    continue
+
+                if len(df_1m) < 3 or len(df_5m) < 6:
+                    logging.warning("Insufficient candle history for sweep/BOS detection. Retrying next cycle.")
                     await asyncio.sleep(120)
                     continue
 
@@ -383,36 +459,63 @@ async def background_scanning_loop():
                 curr_low = float(df_1m["low"].tail(3).min())
                 update_open_trades(curr_high, curr_low)
 
-                # M1 Candle Parameters
                 curr_price = float(df_1m["close"].iloc[-1])
-                curr_open = float(df_1m["open"].iloc[-1])
-                vwap_1m = float(df_1m["vwap"].iloc[-1])
-                vwap_upper2 = float(df_1m["vwap_upper_2"].iloc[-1])
-                vwap_lower2 = float(df_1m["vwap_lower_2"].iloc[-1])
+                adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
 
-                low_1m_prev = float(df_1m["low"].iloc[-2])
-                high_1m_prev = float(df_1m["high"].iloc[-2])
-                vwap_lower2_prev = float(df_1m["vwap_lower_2"].iloc[-2])
-                vwap_upper2_prev = float(df_1m["vwap_upper_2"].iloc[-2])
-
-                adx_5m = float(df_5m["adx"].iloc[-1])
-
-                # MEAN REVERSION TRIGGER CONDITIONS
-                # BUY: Previous candle touched/dipped below -2.0 SD Band, and current candle closes bullish above previous high
-                bullish_band_fade = (low_1m_prev <= vwap_lower2_prev) and (curr_price > curr_open) and (curr_price > high_1m_prev)
-
-                # SELL: Previous candle touched/pierced above +2.0 SD Band, and current candle closes bearish below previous low
-                bearish_band_fade = (high_1m_prev >= vwap_upper2_prev) and (curr_price < curr_open) and (curr_price < low_1m_prev)
-
+                global pending_setup
                 proposed_action = "HOLD"
                 trigger_type = "None"
+                recent_high = 0.0
+                recent_low = 0.0
+                status_note = ""
 
-                if bullish_band_fade:
-                    proposed_action = "BUY"
-                    trigger_type = "M1 VWAP -2SD Band Fade"
-                elif bearish_band_fade:
-                    proposed_action = "SELL"
-                    trigger_type = "M1 VWAP +2SD Band Fade"
+                # STAGE 2: If a setup is already pending, check for pullback confirmation first.
+                if pending_setup is not None:
+                    if datetime.now(timezone.utc) > pending_setup["expires"]:
+                        logging.info(f"[PULLBACK EXPIRED] {pending_setup['action']} setup from ${pending_setup['trigger_price']:.2f} expired without a pullback entry.")
+                        pending_setup = None
+                    else:
+                        curr_candle = df_1m.iloc[-1]
+                        confirmed = check_pullback_entry(
+                            pending_setup["action"], pending_setup["zone_lower"], pending_setup["zone_upper"], curr_candle
+                        )
+                        recent_high = pending_setup["recent_high"]
+                        recent_low = pending_setup["recent_low"]
+                        if confirmed:
+                            proposed_action = pending_setup["action"]
+                            trigger_type = pending_setup["trigger_type"] + " + Pullback Confirmed"
+                            pending_setup = None
+                        else:
+                            status_note = f" | Awaiting pullback into ${pending_setup['zone_lower']:.2f}-${pending_setup['zone_upper']:.2f}"
+
+                # STAGE 1: No pending setup and nothing just confirmed -> look for a fresh sweep+BOS.
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    new_action, new_trigger_type, new_recent_high, new_recent_low = detect_liquidity_sweep_structure(df_1m, df_5m)
+                    recent_high, recent_low = new_recent_high, new_recent_low
+
+                    if new_action != "HOLD":
+                        prev_candle = df_1m.iloc[-2]
+                        curr_candle = df_1m.iloc[-1]
+                        if new_action == "BUY":
+                            swing_low = float(prev_candle["low"])
+                            swing_high = float(curr_candle["close"])
+                        else:
+                            swing_high = float(prev_candle["high"])
+                            swing_low = float(curr_candle["close"])
+
+                        zone_lower, zone_upper = compute_pullback_zone(new_action, swing_high, swing_low)
+                        if zone_lower is not None:
+                            pending_setup = {
+                                "action": new_action,
+                                "trigger_type": new_trigger_type,
+                                "trigger_price": float(curr_price),
+                                "recent_high": new_recent_high,
+                                "recent_low": new_recent_low,
+                                "zone_lower": zone_lower,
+                                "zone_upper": zone_upper,
+                                "expires": datetime.now(timezone.utc) + timedelta(minutes=PULLBACK_EXPIRY_MINUTES),
+                            }
+                            status_note = f" | New {new_action} setup ({new_trigger_type}) armed, awaiting pullback into ${zone_lower:.2f}-${zone_upper:.2f}"
 
                 # Cooldown Distance Check ($3.00 pending / $2.00 closed)
                 if proposed_action != "HOLD":
@@ -420,8 +523,8 @@ async def background_scanning_loop():
                         conn = get_db_connection()
                         cursor = conn.cursor()
                         cursor.execute("""
-                            SELECT COALESCE(entry_price, price, 0) as entry_p, outcome FROM signals 
-                            WHERE status = 'EXECUTED' AND action = %s 
+                            SELECT COALESCE(entry_price, price, 0) as entry_p, outcome FROM signals
+                            WHERE status = 'EXECUTED' AND action = %s
                             ORDER BY id DESC LIMIT 1
                         """, (str(proposed_action),))
                         last_trade = cursor.fetchone()
@@ -440,46 +543,43 @@ async def background_scanning_loop():
                         logging.error(f"[COOLDOWN ERROR] {cd_err}")
 
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | VWAP: ${vwap_1m:.2f} | Upper +2SD: ${vwap_upper2:.2f} | Lower -2SD: ${vwap_lower2:.2f} | Status: HOLD")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | 5M Swept High: ${recent_high:.2f} | 5M Swept Low: ${recent_low:.2f} | Status: HOLD{status_note}")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI Analysis...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m)
+                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m, recent_high, recent_low)
 
-                    # TARGETING MEAN-REVERSION TO CENTRAL VWAP
-                    dist_to_vwap = float(abs(curr_price - vwap_1m))
-                    tp1_dist = float(max(2.50, min(5.50, dist_to_vwap)))
-                    sl_dist = float(max(3.00, min(5.00, tp1_dist * 1.2)))  # Moderate risk buffer
-
-                    tp1_mult = 1.0
-                    tp2_mult = 1.8
+                    # ATR-BASED RISK SIZING (replaces fixed $2.5-5.5 VWAP-distance TP)
+                    raw_atr = df_1m["atr"].iloc[-1]
+                    atr_1m = float(raw_atr) if not pd.isna(raw_atr) else 3.0
+                    risk = max(2.5, atr_1m * 1.2)
 
                     if proposed_action == "BUY":
-                        sl_price = float(curr_price - sl_dist)
-                        tp1_price = float(curr_price + (tp1_dist * tp1_mult))
-                        tp2_price = float(curr_price + (tp1_dist * tp2_mult))
+                        sl_price = float(curr_price - risk)
+                        tp1_price = float(curr_price + risk * 1.5)
+                        tp2_price = float(curr_price + risk * 2.5)
                     else:
-                        sl_price = float(curr_price + sl_dist)
-                        tp1_price = float(curr_price - (tp1_dist * tp1_mult))
-                        tp2_price = float(curr_price - (tp1_dist * tp2_mult))
+                        sl_price = float(curr_price + risk)
+                        tp1_price = float(curr_price - risk * 1.5)
+                        tp2_price = float(curr_price - risk * 2.5)
 
                     if ai_decision.action == proposed_action:
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning)
                         id_tag = f" #{new_id}" if new_id else ""
                         msg = (
-                            f"⚡ *M1 VWAP MEAN-REVERSION SIGNAL{id_tag}*\n\n"
+                            f"⚡ *LIQUIDITY SWEEP + BOS SIGNAL{id_tag}*\n\n"
                             f"Asset: *XAUUSD (Gold Spot)*\n"
                             f"Action: *{proposed_action}*\n"
                             f"Type: *{trigger_type}*\n"
                             f"Entry Price: *${curr_price:.2f}*\n\n"
                             f"Stop Loss (SL): *${sl_price:.2f}*\n"
-                            f"Take Profit 1 (VWAP Target): *${tp1_price:.2f}*\n"
-                            f"Take Profit 2 (Extended Target): *${tp2_price:.2f}*\n\n"
+                            f"Take Profit 1 (1.5R): *${tp1_price:.2f}*\n"
+                            f"Take Profit 2 (2.5R): *${tp2_price:.2f}*\n\n"
                             f"INDICATOR METRICS:\n"
-                            f"- Model: VWAP Standard Deviation Band Fade\n"
-                            f"- Central VWAP Anchor: ${vwap_1m:.2f}\n"
-                            f"- Upper Band (+2SD): ${vwap_upper2:.2f}\n"
-                            f"- Lower Band (-2SD): ${vwap_lower2:.2f}\n"
-                            f"- 5M ADX Volatility: {adx_5m:.1f}\n\n"
+                            f"- Model: 5M Liquidity Sweep + 1M Break of Structure\n"
+                            f"- Swept 5M High: ${recent_high:.2f}\n"
+                            f"- Swept 5M Low: ${recent_low:.2f}\n"
+                            f"- 1M ATR (risk unit): ${atr_1m:.2f}\n"
+                            f"- 5M ADX Trend Strength: {adx_5m:.1f}\n\n"
                             f"Reasoning: {ai_decision.reasoning}"
                         )
                         await send_telegram_alert(client, msg)
@@ -507,7 +607,7 @@ async def lifespan(app: FastAPI):
                 logging.info(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
         except Exception as e:
             logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
-            
+
     scan_task = asyncio.create_task(background_scanning_loop())
     yield
     scan_task.cancel()
@@ -685,13 +785,13 @@ async def telegram_webhook(request: Request):
                     cur = conn.cursor()
 
                     cur.execute("""
-                        SELECT id, action, 
-                               COALESCE(entry_price, price, 0) as entry_p, 
-                               exit_price, 
-                               COALESCE(outcome, 'PENDING') as outcome_val, 
-                               COALESCE(timestamp, created_at::text, 'N/A') as log_time 
-                        FROM signals 
-                        WHERE status = 'EXECUTED' 
+                        SELECT id, action,
+                               COALESCE(entry_price, price, 0) as entry_p,
+                               exit_price,
+                               COALESCE(outcome, 'PENDING') as outcome_val,
+                               COALESCE(timestamp, created_at::text, 'N/A') as log_time
+                        FROM signals
+                        WHERE status = 'EXECUTED'
                         ORDER BY id DESC LIMIT 10
                     """)
                     logs = cur.fetchall()

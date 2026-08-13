@@ -280,6 +280,7 @@ def calculate_metrics_5m(df: pd.DataFrame):
     minus_di = 100 * (df["minus_dm"].rolling(14).sum() / (tr14 + 1e-10))
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
     df["adx"] = dx.rolling(14).mean()
+    df["atr"] = df["tr"].rolling(window=14).mean()
     return df
 
 # --- STRATEGY: LIQUIDITY SWEEP + STRUCTURE BREAK (5M liquidity/structure, 1M trigger) ---
@@ -337,6 +338,51 @@ def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
         return "SELL", "Breakout Continuation (Bearish)", recent_high, recent_low
     return "HOLD", "No setup", recent_high, recent_low
 
+# --- STRATEGY: CONSOLIDATION BRACKET BREAKOUT (squeeze first, then a decisive break of it) ---
+CONSOLIDATION_LOOKBACK_5M = 8       # 5M candles used to define the bracket (40 min of range)
+CONSOLIDATION_MAX_RANGE_ATR_MULT = 1.5  # bracket must be tighter than 1.5x the 5M ATR to count as a real squeeze
+BREAKOUT_MIN_BODY_ATR_MULT = 0.5    # the breaking 1M candle's body must be a real push, not a doji poke
+
+def detect_consolidation_breakout(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    """
+    Unlike detect_breakout_continuation (which just breaks a recent high/low),
+    this requires price to have actually been RANGING first: the high-low range
+    over the last CONSOLIDATION_LOOKBACK_5M candles must be compressed relative
+    to average volatility (a "bracket"/squeeze), and only THEN does a decisive,
+    strong-bodied close outside that bracket count as a breakout signal.
+
+    Returns: (action, trigger_type, bracket_high, bracket_low)
+    """
+    if len(df_5m) < CONSOLIDATION_LOOKBACK_5M + 1 or "atr" not in df_5m.columns:
+        return "HOLD", "No setup", 0.0, 0.0
+
+    bracket = df_5m.iloc[-(CONSOLIDATION_LOOKBACK_5M + 1):-1]
+    bracket_high = float(bracket["high"].max())
+    bracket_low = float(bracket["low"].min())
+    bracket_range = bracket_high - bracket_low
+
+    atr_5m = df_5m["atr"].iloc[-1]
+    if pd.isna(atr_5m) or atr_5m <= 0:
+        return "HOLD", "No setup", bracket_high, bracket_low
+
+    is_consolidating = bracket_range <= (CONSOLIDATION_MAX_RANGE_ATR_MULT * atr_5m)
+    if not is_consolidating:
+        return "HOLD", "No setup", bracket_high, bracket_low
+
+    curr = df_1m.iloc[-1]
+    candle_body = abs(float(curr["close"]) - float(curr["open"]))
+    atr_1m = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else None
+    strong_candle = bool(candle_body >= (BREAKOUT_MIN_BODY_ATR_MULT * atr_1m)) if atr_1m and not pd.isna(atr_1m) else True
+
+    bullish_break = bool(curr["close"] > bracket_high and curr["close"] > curr["open"] and strong_candle)
+    bearish_break = bool(curr["close"] < bracket_low and curr["close"] < curr["open"] and strong_candle)
+
+    if bullish_break:
+        return "BUY", "Consolidation Bracket Breakout (Bullish)", bracket_high, bracket_low
+    if bearish_break:
+        return "SELL", "Consolidation Bracket Breakout (Bearish)", bracket_high, bracket_low
+    return "HOLD", "No setup", bracket_high, bracket_low
+
 # --- FORWARD-TEST ANALYTICS: turns closed trades into segment-level performance stats ---
 def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float) -> float:
     """
@@ -365,8 +411,10 @@ def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
     if "Converted" in t:
         return "No-Pullback Conversion"
+    if "Consolidation" in t:
+        return "Consolidation Bracket Breakout"
     if "Breakout" in t:
-        return "Breakout Continuation"
+        return "Momentum Breakout"
     return "Sweep + BOS"
 
 def bucket_session(timestamp_str: str) -> str:
@@ -631,7 +679,21 @@ async def background_scanning_loop():
                             }
                             status_note = f" | New {new_action} setup ({new_trigger_type}) armed, awaiting pullback into ${zone_lower:.2f}-${zone_upper:.2f}"
 
-                # STAGE 1b: No sweep setup found either -> check for a momentum breakout continuation.
+                # STAGE 1b: No sweep setup found -> check for a consolidation bracket breakout.
+                # This is the more selective breakout flavor: it requires price to have actually
+                # been ranging tightly first (a real squeeze), so it's checked before the looser
+                # momentum-breakout fallback below.
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    c_action, c_trigger_type, c_bracket_high, c_bracket_low = detect_consolidation_breakout(df_1m, df_5m)
+                    if c_action != "HOLD":
+                        if adx_5m >= 20.0:
+                            proposed_action = c_action
+                            trigger_type = c_trigger_type
+                            recent_high, recent_low = c_bracket_high, c_bracket_low
+                        else:
+                            status_note = f" | Bracket breakout seen but 5M ADX {adx_5m:.1f} too weak to confirm"
+
+                # STAGE 1c: No sweep or bracket breakout -> check for a plain momentum breakout continuation.
                 # This is a trend-following entry (not a reversal), so it enters immediately rather
                 # than waiting for a pullback -- a strong continuation move may not retrace at all.
                 if pending_setup is None and proposed_action == "HOLD" and not status_note:

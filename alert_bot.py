@@ -584,7 +584,18 @@ async def background_scanning_loop():
                             trigger_type = pending_setup["trigger_type"] + " + Pullback Confirmed"
                             pending_setup = None
                         else:
-                            status_note = f" | Awaiting pullback into ${pending_setup['zone_lower']:.2f}-${pending_setup['zone_upper']:.2f}"
+                            # No pullback yet -- check if price instead kept running straight through
+                            # in the SAME direction the setup expected. If so, the reversal-via-pullback
+                            # thesis isn't going to happen; convert this into an immediate breakout
+                            # continuation entry instead of leaving it stuck waiting and missing the move.
+                            b_action, b_trigger_type, b_recent_high, b_recent_low = detect_breakout_continuation(df_1m, df_5m)
+                            if b_action == pending_setup["action"] and adx_5m >= 20.0:
+                                proposed_action = b_action
+                                trigger_type = f"No Pullback -> Converted to {b_trigger_type}"
+                                recent_high, recent_low = b_recent_high, b_recent_low
+                                pending_setup = None
+                            else:
+                                status_note = f" | Awaiting pullback into ${pending_setup['zone_lower']:.2f}-${pending_setup['zone_upper']:.2f}"
 
                 # STAGE 1: No pending setup and nothing just confirmed -> look for a fresh sweep+BOS.
                 if pending_setup is None and proposed_action == "HOLD" and not status_note:

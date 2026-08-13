@@ -362,7 +362,12 @@ def bucket_adx(adx: float) -> str:
     return "ADX 50+"
 
 def bucket_strategy(trigger_type: str) -> str:
-    return "Breakout Continuation" if "Breakout" in (trigger_type or "") else "Sweep + BOS"
+    t = trigger_type or ""
+    if "Converted" in t:
+        return "No-Pullback Conversion"
+    if "Breakout" in t:
+        return "Breakout Continuation"
+    return "Sweep + BOS"
 
 def bucket_session(timestamp_str: str) -> str:
     try:

@@ -55,6 +55,47 @@ FIB_RETRACE_MIN = 0.382
 FIB_RETRACE_MAX = 0.618
 LEVEL_LOOKBACK_CANDLES = 4  # narrowed from 5: fresher 5M liquidity levels reset more often -> more sweep/breakout opportunities
 
+# --- STAT-BASED VETOES (added from /analyze forward-test results, 69-trade sample) ---
+# These are hard, non-AI vetoes based on segments that were flagged as underperforming
+# with a large-enough sample (n>=15) to be trusted:
+#   - ADX 50+:            n=15, WR=27%, AvgR=-0.27  (blow-off/exhaustion regime, not "more trend = better")
+#   - Mid session 14-18 WIB: n=17, WR=29%, AvgR=-0.18
+# Re-check with /analyze after another ~30-40 trades post-veto to confirm these
+# actually lift overall AvgR rather than just cutting volume. If they do, this
+# is where to also consider retuning the AI veto rules in analyze_signal_with_ai
+# (currently the breakout ADX veto only fires above 70.0, well past this line).
+STAT_VETO_ADX_THRESHOLD = 50.0
+STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
+STAT_VETO_MID_SESSION_END_HOUR = 18    # WIB
+
+# --- LOSS-COOLDOWN (any direction) ---
+# Added after inspecting the real trade list: losing sequences (e.g. BUY loss ->
+# BUY loss -> SELL loss -> BUY loss) tended to cluster within 30-60 minutes of
+# each other, typical of choppy microstructure rather than independent setups.
+# This is direction-agnostic and separate from the existing same-direction/price-
+# distance cooldown below -- it fires even on a SELL signal right after a BUY loss.
+LOSS_COOLDOWN_MINUTES = 10
+
+
+def check_stat_veto(adx_5m: float, current_hour_wib: int):
+    """
+    Hard pre-AI veto based on forward-tested underperforming segments.
+    Returns (is_vetoed: bool, reason: str). Checked before calling the AI
+    analyst so we also skip the API call entirely on a stat-veto.
+    """
+    if adx_5m >= STAT_VETO_ADX_THRESHOLD:
+        return True, (
+            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
+            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27 -- likely exhaustion/blow-off, not sustained trend)"
+        )
+    if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
+        return True, (
+            f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
+            f"forward-tested as underperforming (n=17, WR=29%, AvgR=-0.18)"
+        )
+    return False, ""
+
+
 class SignalOutput(BaseModel):
     action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
@@ -186,7 +227,14 @@ def update_open_trades(current_high: float, current_low: float):
                         exit_price = tp2
                     elif c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1
+                        # BLENDED EXIT (bugfix): this outcome means half the conceptual position
+                        # banked TP1 and the other half rode the runner back to breakeven (0R).
+                        # Recording exit_price = tp1 credited the FULL TP1 gain to the whole
+                        # position, overstating every downstream pips/R/PF calculation in
+                        # /stats, /pips, and /analyze. The blended price below is the midpoint
+                        # between entry and TP1, so (exit_price - entry_price) correctly equals
+                        # 0.5R at TP1 + 0.5R at breakeven = 0.5x the full TP1 move.
+                        exit_price = entry_price + 0.5 * (tp1 - entry_price)
                 elif sl > 0 and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
@@ -204,7 +252,9 @@ def update_open_trades(current_high: float, current_low: float):
                         exit_price = tp2
                     elif c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = tp1
+                        # BLENDED EXIT (bugfix): same reasoning as the BUY branch above, mirrored
+                        # for a short position (TP1 is below entry for a SELL).
+                        exit_price = entry_price - 0.5 * (entry_price - tp1)
                 elif sl > 0 and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
@@ -637,16 +687,39 @@ async def background_scanning_loop():
                             trigger_type = pending_setup["trigger_type"] + " + Pullback Confirmed"
                             pending_setup = None
                         else:
-                            # No pullback yet -- check if price instead kept running straight through
-                            # in the SAME direction the setup expected. If so, the reversal-via-pullback
-                            # thesis isn't going to happen; convert this into an immediate breakout
-                            # continuation entry instead of leaving it stuck waiting and missing the move.
+                            # No pullback yet -- check if price is breaking out strongly in either
+                            # direction while we wait.
                             b_action, b_trigger_type, b_recent_high, b_recent_low = detect_breakout_continuation(df_1m, df_5m)
-                            if b_action == pending_setup["action"] and adx_5m >= 20.0:
-                                proposed_action = b_action
-                                trigger_type = f"No Pullback -> Converted to {b_trigger_type}"
-                                recent_high, recent_low = b_recent_high, b_recent_low
-                                pending_setup = None
+                            if b_action != "HOLD" and adx_5m >= 20.0:
+                                if b_action == pending_setup["action"]:
+                                    # SAME direction: price kept running straight through instead of
+                                    # pulling back. The reversal-via-pullback thesis isn't going to
+                                    # happen; convert this into an immediate breakout continuation
+                                    # entry instead of leaving it stuck waiting and missing the move.
+                                    proposed_action = b_action
+                                    trigger_type = f"No Pullback -> Converted to {b_trigger_type}"
+                                    recent_high, recent_low = b_recent_high, b_recent_low
+                                    pending_setup = None
+                                else:
+                                    # OPPOSITE direction: a real breakout is running against the
+                                    # pending reversal setup (e.g. a SELL sweep+BOS armed mid-uptrend
+                                    # while price keeps making new highs). Waiting up to
+                                    # PULLBACK_EXPIRY_MINUTES for a pullback that contradicts the
+                                    # live trend just means the bot sits blind through the move -- and
+                                    # once the setup expires, Stage 1 can immediately re-arm another
+                                    # setup in the same losing direction. Cancel the stale setup now
+                                    # and take the real breakout instead.
+                                    invalidated_action = pending_setup["action"]
+                                    invalidated_trigger = pending_setup["trigger_type"]
+                                    logging.info(
+                                        f"[SETUP INVALIDATED] {invalidated_action} setup ({invalidated_trigger}) "
+                                        f"from ${pending_setup['trigger_price']:.2f} invalidated by opposite "
+                                        f"{b_action} breakout continuation."
+                                    )
+                                    proposed_action = b_action
+                                    trigger_type = f"{b_trigger_type} (Invalidated {invalidated_action} Sweep Setup)"
+                                    recent_high, recent_low = b_recent_high, b_recent_low
+                                    pending_setup = None
                             else:
                                 status_note = f" | Awaiting pullback into ${pending_setup['zone_lower']:.2f}-${pending_setup['zone_upper']:.2f}"
 
@@ -705,6 +778,48 @@ async def background_scanning_loop():
                             recent_high, recent_low = b_recent_high, b_recent_low
                         else:
                             status_note = f" | Breakout seen but 5M ADX {adx_5m:.1f} too weak to confirm continuation"
+
+                # --- STAT VETO CHECK (new) ---
+                # Hard veto based on the /analyze forward-test results, checked BEFORE the AI
+                # call so we also skip the (paid) AI request entirely on a stat-veto. Applies
+                # regardless of which strategy fired, since both flagged segments (ADX 50+ and
+                # Mid session) were underperforming across the whole trade sample, not just one
+                # strategy.
+                if proposed_action != "HOLD":
+                    stat_vetoed, stat_veto_reason = check_stat_veto(adx_5m, current_hour_wib)
+                    if stat_vetoed:
+                        logging.info(f"[STAT VETO] {stat_veto_reason}")
+                        log_trade_signal(
+                            "VETOED", proposed_action, f"{trigger_type} [STAT-VETO]",
+                            curr_price, 0.0, 0.0, 0.0, 1.0, adx_5m, 0.0, "None", stat_veto_reason
+                        )
+                        proposed_action = "HOLD"
+
+                # Loss-cooldown Check (any direction, {LOSS_COOLDOWN_MINUTES} min after any SL hit)
+                if proposed_action != "HOLD":
+                    try:
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT outcome_timestamp FROM signals
+                            WHERE status = 'EXECUTED' AND outcome = 'LOSS (SL HIT)' AND outcome_timestamp IS NOT NULL AND outcome_timestamp != ''
+                            ORDER BY id DESC LIMIT 1
+                        """)
+                        last_loss = cursor.fetchone()
+                        cursor.close()
+                        conn.close()
+
+                        if last_loss and last_loss.get('outcome_timestamp'):
+                            # outcome_timestamp is stored as "YYYY-MM-DD HH:MM:SS WIB"
+                            ts_str = str(last_loss['outcome_timestamp']).replace(" WIB", "")
+                            last_loss_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                            minutes_since_loss = (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0
+
+                            if 0 <= minutes_since_loss < LOSS_COOLDOWN_MINUTES:
+                                logging.info(f"[LOSS COOLDOWN] Skipping {proposed_action}: {minutes_since_loss:.1f} min since last SL hit (< {LOSS_COOLDOWN_MINUTES} min cooldown).")
+                                proposed_action = "HOLD"
+                    except Exception as lc_err:
+                        logging.error(f"[LOSS COOLDOWN ERROR] {lc_err}")
 
                 # Cooldown Distance Check ($3.00 pending / $2.00 closed)
                 if proposed_action != "HOLD":
@@ -836,7 +951,11 @@ async def telegram_webhook(request: Request):
                     "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
                     "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
                     "• `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
-                    "• `/help` - Display Command Menu"
+                    "• `/help` - Display Command Menu\n\n"
+                    f"⚠️ Active stat-vetoes: ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} and Mid session "
+                    f"({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) are auto-skipped "
+                    "based on forward-test underperformance.\n"
+                    f"⏱️ Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit (any direction) before a new signal can execute."
                 )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
@@ -1092,8 +1211,14 @@ async def telegram_webhook(request: Request):
                         reply_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
                         reply_parts.append(
                             "💡 Segments need n≥8 to be flagged ⚠️/✅ (smaller samples are shown but noisy). "
-                            "This does not auto-adjust the bot — use it to decide whether to retune the ADX veto "
-                            "thresholds, fib pullback zone, or session windows in code."
+                            "This does not auto-adjust the bot -- use it to decide whether to retune the ADX veto "
+                            "thresholds, fib pullback zone, or session windows in code.\n\n"
+                            f"🚫 Active stat-vetoes: ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} and Mid session "
+                            f"({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) are being "
+                            "auto-skipped -- re-check this report after ~30-40 more trades to confirm they're "
+                            "actually lifting AvgR.\n"
+                            f"⏱️ Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active -- "
+                            "added after spotting clustered same-session losing sequences in the raw trade list."
                         )
                         reply = "\n".join(reply_parts)
 

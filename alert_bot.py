@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# Logging Configuration
+# --- LOGGING CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # --- ENVIRONMENT VARIABLES & SANITIZATION ---
@@ -45,6 +45,9 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 
+# --- GLOBAL EMERGENCY KILL SWITCH STATE ---
+SYSTEM_TRADING_ENABLED = True
+
 # --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
 pending_setup = None
 PULLBACK_EXPIRY_MINUTES = 10
@@ -66,9 +69,7 @@ LOSS_COOLDOWN_MINUTES = 10
 
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    """
-    Hard pre-AI veto based on forward-tested underperforming segments.
-    """
+    """Hard pre-AI veto based on forward-tested underperforming segments."""
     if adx_5m >= STAT_VETO_ADX_THRESHOLD:
         return True, (
             f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
@@ -604,9 +605,15 @@ Respond strictly in valid JSON matching schema:
 
 # --- BACKGROUND SCANNING LOOP ---
 async def background_scanning_loop():
+    global SYSTEM_TRADING_ENABLED
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         while True:
             try:
+                if not SYSTEM_TRADING_ENABLED:
+                    logging.info("[PAUSED] System trading currently paused via kill-switch. Skipping scan.")
+                    await asyncio.sleep(60)
+                    continue
+
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                 current_hour_wib = now_wib.hour
 
@@ -909,11 +916,20 @@ def home():
 @app.get("/get-latest-signal")
 async def get_latest_signal():
     """
-    Returns the most recent EXECUTED signal for the MT5 Expert Advisor.
-    Uses COALESCE across schema columns so it is robust to any table format.
+    Returns the most recent EXECUTED signal along with the kill-switch state.
+    Uses COALESCE across schema columns for robust querying.
     """
+    global SYSTEM_TRADING_ENABLED
+
+    if not SYSTEM_TRADING_ENABLED:
+        return {
+            "signal": None,
+            "trading_enabled": False,
+            "status": "PAUSED"
+        }
+
     if not DATABASE_URL:
-        return {"signal": None, "error": "DATABASE_URL not set"}
+        return {"signal": None, "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -940,17 +956,19 @@ async def get_latest_signal():
                 "sl": float(row["sl_p"]),
                 "tp1": float(row["tp1_p"]),
                 "tp2": float(row["tp2_p"]),
-                "timestamp": str(row["log_time"])
+                "timestamp": str(row["log_time"]),
+                "trading_enabled": True
             }
-        return {"signal": None}
+        return {"signal": None, "trading_enabled": True}
     except Exception as e:
         logging.error(f"[MT5 BRIDGE ERROR /get-latest-signal] {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
 
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
+    global SYSTEM_TRADING_ENABLED
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -970,11 +988,34 @@ async def telegram_webhook(request: Request):
                     "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
                     "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
                     "• `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
+                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
+                    "• `/resume` - 🟢 Re-enable Auto-Trading Execution\n"
                     "• `/help` - Display Command Menu\n\n"
                     f"⚠️ Active stat-vetoes: ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} and Mid session "
                     f"({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) are auto-skipped "
                     "based on forward-test underperformance.\n"
                     f"⏱️ Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit (any direction) before a new signal can execute."
+                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+
+            elif raw_text == "/pause":
+                SYSTEM_TRADING_ENABLED = False
+                reply = (
+                    "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "• Market scanner loop has been **PAUSED**.\n"
+                    "• MT5 Signal Copier will **IGNORE** all new signals.\n\n"
+                    "👉 Send `/resume` to reactivate trading."
+                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+
+            elif raw_text == "/resume":
+                SYSTEM_TRADING_ENABLED = True
+                reply = (
+                    "🟢 *AUTO-TRADING SYSTEM RESUMED*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "• Scanner loop is now **ACTIVE**.\n"
+                    "• MT5 bridge is listening for live setups."
                 )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 

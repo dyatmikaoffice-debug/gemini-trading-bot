@@ -1351,19 +1351,6 @@ def detect_consolidation_breakout(
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     """
     Calculate the trade result using the bot's two-stage TP model.
-
-    This intentionally uses the stored TP1/TP2 levels when available,
-    and reconstructs missing legacy SL/TP values when older database rows
-    have NULL/zero price fields.
-
-    Accounting model:
-      - TP1 hit = +1.5R on the TP1 leg
-      - TP2 hit = TP1 leg + TP2 runner leg = 1.5R + 3.0R
-      - SL hit  = -2R (two 0.01-lot legs)
-
-    For legacy rows with missing SL/TP values, the standard minimum risk
-    of 2.5 XAU price points is used. Therefore a legacy TP1-only result
-    reconstructs to +37.5 pips (2.5 * 1.5 * 10).
     """
     action = str(trade.get("action") or "BUY").upper()
 
@@ -1401,7 +1388,7 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
         trade.get("outcome")
         or trade.get("outcome_val")
         or "PENDING"
-    )
+    ).upper()
 
     # Legacy fallback: reconstruct missing risk from the actual exit when
     # possible; otherwise use the bot's standard minimum risk of 2.5 points.
@@ -1412,15 +1399,17 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
 
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        total_pips = tp1_dist * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif outcome == "WIN (TP1 HIT)":
-        total_pips = tp1_dist * 10.0
-    elif "LOSS" in outcome:
+    if "LOSS" in outcome:
+        # Full loss on both legs
         total_pips = -(sl_dist * 10.0 * 2.0)
+    elif "TP2" in outcome:
+        # TP1 Hit + TP2 Hit
+        total_pips = (tp1_dist + tp2_dist) * 10.0
+    elif "TP1" in outcome or "SL BE" in outcome:
+        # TP1 Hit + Runner stopped at BE (0 pips for runner)
+        total_pips = tp1_dist * 10.0
     else:
+        # Manual close or other unexpected outcome
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
         total_pips = diff * 10.0 * 2.0
 
@@ -1438,6 +1427,7 @@ def compute_r_multiple(
     outcome: str = "PENDING"
 ) -> float:
     """Calculate R using the same two-stage TP accounting as pips."""
+    outcome = outcome.upper()
     risk_dist = abs(entry - sl)
 
     # Legacy fallback.
@@ -1446,21 +1436,18 @@ def compute_r_multiple(
         if risk_dist == 0:
             risk_dist = 2.5
 
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        return tp1_dist / risk_dist
-
-    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+    if "LOSS" in outcome:
+        return -2.0
+        
+    if "TP2" in outcome:
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
         return (tp1_dist + tp2_dist) / risk_dist
 
-    if outcome == "WIN (TP1 HIT)":
+    if "TP1" in outcome or "SL BE" in outcome:
+        # +1.5R on first half, 0R on runner = +1.50R total
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         return tp1_dist / risk_dist
-
-    if "LOSS" in outcome:
-        return -2.0
 
     single_r = (
         (exit_price - entry) / risk_dist
@@ -4071,3 +4058,4 @@ async def telegram_webhook(
     return {
         "status": "ok"
     }
+

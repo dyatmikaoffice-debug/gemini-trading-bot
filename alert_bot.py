@@ -1044,7 +1044,7 @@ async def telegram_webhook(request: Request):
                     total_vetoes = cur.fetchone()["vetoes"] or 0
                     cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
                     total_pending = cur.fetchone()["pending"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome = 'CLOSED (TP1 HIT / SL BE)' OR outcome = 'WIN (TP1 HIT)'")
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome LIKE 'CLOSED%' OR outcome LIKE 'WIN (TP1%'")
                     tp1_wins = cur.fetchone()["tp1_wins"] or 0
                     cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
                     tp2_wins = cur.fetchone()["tp2_wins"] or 0

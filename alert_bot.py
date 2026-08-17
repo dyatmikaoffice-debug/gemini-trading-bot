@@ -196,31 +196,6 @@ def init_db():
         for query in migrations:
             cursor.execute(query)
 
-        # Backfill existing historical trades in DB so old rows show accurate pips
-        cursor.execute("""
-            UPDATE signals
-            SET realized_pips = ROUND(CAST(ABS(COALESCE(tp1_price, tp1) - COALESCE(entry_price, price)) * 10.0 AS NUMERIC), 2),
-                realized_usd  = ROUND(CAST(ABS(COALESCE(tp1_price, tp1) - COALESCE(entry_price, price)) * 1.0 AS NUMERIC), 2)
-            WHERE outcome IN ('CLOSED (TP1 HIT / SL BE)', 'WIN (TP1 HIT)')
-              AND (realized_pips IS NULL OR realized_pips = 0);
-        """)
-
-        cursor.execute("""
-            UPDATE signals
-            SET realized_pips = ROUND(CAST((ABS(COALESCE(tp1_price, tp1) - COALESCE(entry_price, price)) + ABS(COALESCE(tp2_price, tp2) - COALESCE(entry_price, price))) * 10.0 AS NUMERIC), 2),
-                realized_usd  = ROUND(CAST((ABS(COALESCE(tp1_price, tp1) - COALESCE(entry_price, price)) + ABS(COALESCE(tp2_price, tp2) - COALESCE(entry_price, price))) * 1.0 AS NUMERIC), 2)
-            WHERE outcome LIKE 'WIN (TP2%'
-              AND (realized_pips IS NULL OR realized_pips = 0);
-        """)
-
-        cursor.execute("""
-            UPDATE signals
-            SET realized_pips = -ROUND(CAST(ABS(COALESCE(entry_price, price) - COALESCE(sl_price, sl)) * 10.0 * 2.0 AS NUMERIC), 2),
-                realized_usd  = -ROUND(CAST(ABS(COALESCE(entry_price, price) - COALESCE(sl_price, sl)) * 1.0 * 2.0 AS NUMERIC), 2)
-            WHERE outcome LIKE 'LOSS%'
-              AND realized_pips IS NULL;
-        """)
-
         conn.commit()
         cursor.close()
         conn.close()
@@ -347,7 +322,7 @@ def log_trade_signal(status: str, action: str, trigger_type: str, price: float, 
         return None
 
 # =====================================================================
-# TWO-POSITION (2 x 0.01 LOT) REVISED PIP CALCULATOR
+# TWO-POSITION (2 x 0.01 LOT) REVISED PIP CALCULATOR (WITH AUTO-FIX)
 # =====================================================================
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     """
@@ -364,9 +339,13 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     exit_p = float(trade.get("exit_price") or entry)
     outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
 
-    tp1_dist = abs(tp1 - entry) if tp1 > 0 else 0.0
-    tp2_dist = abs(tp2 - entry) if tp2 > 0 else 0.0
+    # Fallback for old legacy trades missing SL/TP data in DB
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
+    if sl_dist == 0: 
+        sl_dist = 2.5  # Assume standard minimum 2.5 risk if data is missing
+        
+    tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
+    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
 
     if outcome == "CLOSED (TP1 HIT / SL BE)":
         total_pips = tp1_dist * 10.0
@@ -385,7 +364,11 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
 
 def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
     risk_dist = abs(entry - sl)
-    if risk_dist <= 0: return 0.0
+    
+    # Fallback for old legacy trades
+    if risk_dist <= 0: 
+        risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
+        if risk_dist == 0: risk_dist = 2.5
 
     if outcome == "CLOSED (TP1 HIT / SL BE)":
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
@@ -1078,7 +1061,7 @@ async def telegram_webhook(request: Request):
                     total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
-                        if t.get("realized_pips") is not None:
+                        if t.get("realized_pips") is not None and float(t["realized_pips"]) != 0.0:
                             p = float(t["realized_pips"])
                         else:
                             p, _ = compute_trade_pips(t)
@@ -1112,7 +1095,7 @@ async def telegram_webhook(request: Request):
                     losing_trades_count = 0
 
                     for t in trades:
-                        if t.get("realized_pips") is not None:
+                        if t.get("realized_pips") is not None and float(t["realized_pips"]) != 0.0:
                             p = float(t["realized_pips"])
                         else:
                             p, _ = compute_trade_pips(t)
@@ -1153,7 +1136,7 @@ async def telegram_webhook(request: Request):
                             date_str = str(l["log_time"])
 
                             if exit_p is not None and outcome != "PENDING":
-                                if l.get("realized_pips") is not None:
+                                if l.get("realized_pips") is not None and float(l["realized_pips"]) != 0.0:
                                     pips, usd = float(l["realized_pips"]), float(l["realized_usd"])
                                 else:
                                     pips, usd = compute_trade_pips(l)

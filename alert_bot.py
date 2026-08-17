@@ -60,31 +60,32 @@ FIB_RETRACE_MAX = 0.618
 
 # --- 15M CONFLUENCE CACHE ---
 cached_15m = {"df": None, "fetched_at": None}
-FIFTEEN_M_REFRESH_MINUTES = 10
+FIFTEEN_M_REFRESH_MINUTES = 15
+
+# --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
+SCAN_INTERVAL_SECONDS = 120  # M1 + M5 refresh every 2 minutes
+ACTIVE_SESSION_START_HOUR = 10  # WIB
+ACTIVE_SESSION_END_HOUR = 22    # WIB
+MID_SESSION_START_HOUR = 14     # WIB
+MID_SESSION_END_HOUR = 18       # WIB
+
+TWELVE_DATA_DAILY_LIMIT = 800
 LEVEL_LOOKBACK_CANDLES = 4
 
 # ==========================================================
 # MOMENTUM BREAKOUT QUALITY FILTERS
 # ==========================================================
-# Normal breakout quality filters.
 BREAKOUT_MIN_BODY_ATR_MULT = 0.50
 BREAKOUT_MIN_CLOSE_LOCATION = 0.65
-
-# Fresh breakout entries are intentionally conservative.
-# A fresh breakout above this extension is NOT chased.
 BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
 
 # ----------------------------------------------------------
 # MOMENTUM CONTINUATION MODE
 # ----------------------------------------------------------
-# Used ONLY when an existing setup has failed to pull back
-# and price continues to run in the same direction.
 MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
 MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
 MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
 MOMENTUM_CONTINUATION_MIN_ADX = 20.0
-
-# Require the current candle to continue in the breakout direction.
 BREAKOUT_REQUIRE_BODY_DIRECTION = True
 
 # --- STAT-BASED VETOES ---
@@ -353,7 +354,6 @@ def logged_breakout_check(
         elif action == "SELL":
             extension_atr = (recent_low - curr_close) / atr
         else:
-            # Estimate directional extension for rejected breakout candidates.
             extension_atr = max(
                 (curr_close - recent_high) / atr,
                 (recent_low - curr_close) / atr
@@ -631,9 +631,48 @@ def update_open_trades(current_high: float, current_low: float):
 
                 conn.commit()
 
+                trade_for_calc = {
+                    "action": action,
+                    "entry_price": entry_price,
+                    "sl_price": sl,
+                    "tp1_price": tp1,
+                    "tp2_price": tp2,
+                    "exit_price": float(exit_price),
+                    "outcome": new_outcome,
+                }
+                result_pips, result_usd = compute_trade_pips(trade_for_calc)
+                result_r = compute_r_multiple(
+                    action, entry_price, float(exit_price), sl,
+                    tp1, tp2, new_outcome
+                )
+
+                log_bot_event(
+                    "TRADE_OUTCOME",
+                    stage="TRADE_MANAGEMENT",
+                    action=action,
+                    price=float(exit_price),
+                    decision=new_outcome,
+                    reason="Two-stage TP/SL outcome detected",
+                    details={
+                        "signal_id": trade_id,
+                        "entry": entry_price,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "exit": float(exit_price),
+                        "outcome": new_outcome,
+                        "pips": result_pips,
+                        "profit_usd": result_usd,
+                        "r_multiple": result_r,
+                        "legacy_fallback_used": not bool(sl > 0 and tp1 > 0)
+                    }
+                )
+
                 logging.info(
                     f"[TRADE UPDATE] Signal ID {trade_id} "
-                    f"-> {new_outcome} at ${exit_price:.2f}"
+                    f"-> {new_outcome} at ${exit_price:.2f} | "
+                    f"Result: {result_pips:+.1f} pips | "
+                    f"{result_r:+.2f}R | ${result_usd:+.2f}"
                 )
 
         cursor.close()
@@ -883,30 +922,6 @@ def detect_breakout_continuation(
     df_5m: pd.DataFrame,
     allow_momentum_continuation: bool = False
 ):
-    """
-    Momentum breakout detector.
-
-    NORMAL MODE (fresh breakout):
-        - Two consecutive M1 closes beyond the 5M reference level.
-        - Current candle continues in breakout direction.
-        - Body >= 0.50 ATR.
-        - Strong close location >= 0.65.
-        - Extension <= 1.20 ATR.
-
-    MOMENTUM CONTINUATION MODE (pending setup):
-        - Same structural breakout requirement.
-        - Used only when an existing setup failed to pull back.
-        - Extension must be > 1.20 ATR and <= 1.80 ATR.
-        - Body >= 0.35 ATR.
-        - Stronger-than-neutral close location >= 0.60.
-        - ADX is checked by the caller using
-          MOMENTUM_CONTINUATION_MIN_ADX.
-
-    This prevents the original failure mode where a breakout that
-    ran beyond 1.20 ATR was rejected forever even though the move
-    remained strong and the pending setup was still alive.
-    """
-
     recent_high = float(
         df_5m[
             "high"
@@ -922,9 +937,6 @@ def detect_breakout_continuation(
     prev = df_1m.iloc[-2]
     curr = df_1m.iloc[-1]
 
-    # ------------------------------------------------------
-    # Current M1 ATR
-    # ------------------------------------------------------
     raw_atr = (
         df_1m["atr"].iloc[-1]
         if "atr" in df_1m.columns
@@ -941,9 +953,6 @@ def detect_breakout_continuation(
 
     atr_1m = float(raw_atr)
 
-    # ------------------------------------------------------
-    # Candle measurements
-    # ------------------------------------------------------
     curr_open = float(curr["open"])
     curr_high = float(curr["high"])
     curr_low = float(curr["low"])
@@ -962,9 +971,6 @@ def detect_breakout_continuation(
     else:
         close_location = 0.5
 
-    # ------------------------------------------------------
-    # Structural breakout
-    # ------------------------------------------------------
     bullish_breakout_structure = bool(
         prev_close > recent_high
         and curr_close > recent_high
@@ -988,9 +994,6 @@ def detect_breakout_continuation(
             recent_low
         )
 
-    # ------------------------------------------------------
-    # Common quality thresholds depend on mode.
-    # ------------------------------------------------------
     if allow_momentum_continuation:
         min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
         min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
@@ -1000,9 +1003,6 @@ def detect_breakout_continuation(
         min_close_location = BREAKOUT_MIN_CLOSE_LOCATION
         max_extension_atr = BREAKOUT_MAX_EXTENSION_ATR_MULT
 
-    # ======================================================
-    # BULLISH BREAKOUT
-    # ======================================================
     if bullish_breakout_structure:
 
         body_direction_ok = (
@@ -1020,32 +1020,13 @@ def detect_breakout_continuation(
             )
 
         body_ratio = candle_body / atr_1m
+        body_strength_ok = (body_ratio >= min_body_atr)
+        close_quality_ok = (close_location >= min_close_location)
+        extension_from_level = (curr_close - recent_high)
+        extension_atr = (extension_from_level / atr_1m)
 
-        body_strength_ok = (
-            body_ratio >= min_body_atr
-        )
-
-        close_quality_ok = (
-            close_location >= min_close_location
-        )
-
-        extension_from_level = (
-            curr_close - recent_high
-        )
-
-        extension_atr = (
-            extension_from_level / atr_1m
-        )
-
-        # Fresh breakout: extension must stay <= 1.20 ATR.
         if not allow_momentum_continuation:
-
             if not body_strength_ok:
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
-                    f"body/ATR {body_ratio:.2f} < "
-                    f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}"
-                )
                 return (
                     "HOLD",
                     "Breakout rejected: insufficient displacement",
@@ -1054,11 +1035,6 @@ def detect_breakout_continuation(
                 )
 
             if not close_quality_ok:
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
-                    f"close location {close_location:.2f} < "
-                    f"{BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
-                )
                 return (
                     "HOLD",
                     "Breakout rejected: weak candle close",
@@ -1069,28 +1045,12 @@ def detect_breakout_continuation(
             if extension_from_level > (
                 BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
             ):
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bullish breakout extended: "
-                    f"${extension_from_level:.2f} "
-                    f"({extension_atr:.2f}x ATR) > "
-                    f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR. "
-                    f"Pending setups may use continuation mode."
-                )
                 return (
                     "HOLD",
                     "Breakout overextended - continuation check required",
                     recent_high,
                     recent_low
                 )
-
-            logging.info(
-                f"[MOMENTUM BREAKOUT] VALID BUY | "
-                f"Level ${recent_high:.2f} | "
-                f"Close ${curr_close:.2f} | "
-                f"Body/ATR {body_ratio:.2f} | "
-                f"CloseLocation {close_location:.2f} | "
-                f"Extension {extension_atr:.2f}x ATR"
-            )
 
             return (
                 "BUY",
@@ -1099,10 +1059,6 @@ def detect_breakout_continuation(
                 recent_low
             )
 
-        # --------------------------------------------------
-        # Pending-setup momentum continuation.
-        # Only 1.20-1.80 ATR is eligible.
-        # --------------------------------------------------
         if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
             return (
                 "HOLD",
@@ -1112,11 +1068,6 @@ def detect_breakout_continuation(
             )
 
         if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bullish rejected: "
-                f"extension {extension_atr:.2f}x ATR > "
-                f"{MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:.2f}x ATR"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: excessively extended",
@@ -1125,11 +1076,6 @@ def detect_breakout_continuation(
             )
 
         if not body_strength_ok:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bullish rejected: "
-                f"body/ATR {body_ratio:.2f} < "
-                f"{MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT:.2f}"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: momentum weakening",
@@ -1138,26 +1084,12 @@ def detect_breakout_continuation(
             )
 
         if not close_quality_ok:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bullish rejected: "
-                f"close location {close_location:.2f} < "
-                f"{MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION:.2f}"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: weak close",
                 recent_high,
                 recent_low
             )
-
-        logging.info(
-            f"[MOMENTUM CONTINUATION] VALID BUY | "
-            f"Level ${recent_high:.2f} | "
-            f"Close ${curr_close:.2f} | "
-            f"Extension {extension_atr:.2f}x ATR | "
-            f"Body/ATR {body_ratio:.2f} | "
-            f"CloseLocation {close_location:.2f}"
-        )
 
         return (
             "BUY",
@@ -1166,9 +1098,6 @@ def detect_breakout_continuation(
             recent_low
         )
 
-    # ======================================================
-    # BEARISH BREAKOUT
-    # ======================================================
     if bearish_breakout_structure:
 
         body_direction_ok = (
@@ -1186,32 +1115,13 @@ def detect_breakout_continuation(
             )
 
         body_ratio = candle_body / atr_1m
+        body_strength_ok = (body_ratio >= min_body_atr)
+        close_quality_ok = (close_location <= (1.0 - min_close_location))
+        extension_from_level = (recent_low - curr_close)
+        extension_atr = (extension_from_level / atr_1m)
 
-        body_strength_ok = (
-            body_ratio >= min_body_atr
-        )
-
-        close_quality_ok = (
-            close_location <= (1.0 - min_close_location)
-        )
-
-        extension_from_level = (
-            recent_low - curr_close
-        )
-
-        extension_atr = (
-            extension_from_level / atr_1m
-        )
-
-        # Fresh breakout: extension must stay <= 1.20 ATR.
         if not allow_momentum_continuation:
-
             if not body_strength_ok:
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
-                    f"body/ATR {body_ratio:.2f} < "
-                    f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}"
-                )
                 return (
                     "HOLD",
                     "Breakout rejected: insufficient displacement",
@@ -1220,11 +1130,6 @@ def detect_breakout_continuation(
                 )
 
             if not close_quality_ok:
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
-                    f"close location {close_location:.2f} > "
-                    f"{1.0 - BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
-                )
                 return (
                     "HOLD",
                     "Breakout rejected: weak candle close",
@@ -1235,28 +1140,12 @@ def detect_breakout_continuation(
             if extension_from_level > (
                 BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
             ):
-                logging.info(
-                    f"[MOMENTUM BREAKOUT] Bearish breakout extended: "
-                    f"${extension_from_level:.2f} "
-                    f"({extension_atr:.2f}x ATR) > "
-                    f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR. "
-                    f"Pending setups may use continuation mode."
-                )
                 return (
                     "HOLD",
                     "Breakout overextended - continuation check required",
                     recent_high,
                     recent_low
                 )
-
-            logging.info(
-                f"[MOMENTUM BREAKOUT] VALID SELL | "
-                f"Level ${recent_low:.2f} | "
-                f"Close ${curr_close:.2f} | "
-                f"Body/ATR {body_ratio:.2f} | "
-                f"CloseLocation {close_location:.2f} | "
-                f"Extension {extension_atr:.2f}x ATR"
-            )
 
             return (
                 "SELL",
@@ -1265,10 +1154,6 @@ def detect_breakout_continuation(
                 recent_low
             )
 
-        # --------------------------------------------------
-        # Pending-setup momentum continuation.
-        # Only 1.20-1.80 ATR is eligible.
-        # --------------------------------------------------
         if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
             return (
                 "HOLD",
@@ -1278,11 +1163,6 @@ def detect_breakout_continuation(
             )
 
         if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bearish rejected: "
-                f"extension {extension_atr:.2f}x ATR > "
-                f"{MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:.2f}x ATR"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: excessively extended",
@@ -1291,11 +1171,6 @@ def detect_breakout_continuation(
             )
 
         if not body_strength_ok:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bearish rejected: "
-                f"body/ATR {body_ratio:.2f} < "
-                f"{MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT:.2f}"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: momentum weakening",
@@ -1304,26 +1179,12 @@ def detect_breakout_continuation(
             )
 
         if not close_quality_ok:
-            logging.info(
-                f"[MOMENTUM CONTINUATION] Bearish rejected: "
-                f"close location {close_location:.2f} > "
-                f"{1.0 - MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION:.2f}"
-            )
             return (
                 "HOLD",
                 "Continuation rejected: weak close",
                 recent_high,
                 recent_low
             )
-
-        logging.info(
-            f"[MOMENTUM CONTINUATION] VALID SELL | "
-            f"Level ${recent_low:.2f} | "
-            f"Close ${curr_close:.2f} | "
-            f"Extension {extension_atr:.2f}x ATR | "
-            f"Body/ATR {body_ratio:.2f} | "
-            f"CloseLocation {close_location:.2f}"
-        )
 
         return (
             "SELL",
@@ -1449,63 +1310,110 @@ def detect_consolidation_breakout(
     )
 
 
-# =====================================================================
-# TWO-POSITION (2 x 0.01 LOT) REVISED PIP CALCULATOR
-# =====================================================================
+# --- FORWARD-TEST ANALYTICS HELPERS ---
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
-    """2x 0.01 Lot calculator with fallback for old missing DB data"""
-    action = trade.get("action", "BUY")
-    entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
-    sl = float(trade.get("sl_price") or trade.get("sl") or 0.0)
-    tp1 = float(trade.get("tp1_price") or trade.get("tp1") or 0.0)
-    tp2 = float(trade.get("tp2_price") or trade.get("tp2") or 0.0)
-    exit_p = float(trade.get("exit_price") or entry)
-    outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
+    """
+    Calculate the trade result using the bot's two-stage TP model.
+    """
+    action = str(trade.get("action") or "BUY").upper()
 
-    # Fallback for old legacy trades missing SL data in DB
+    entry = float(
+        trade.get("entry_price")
+        or trade.get("entry_p")
+        or trade.get("price")
+        or 0.0
+    )
+
+    sl = float(
+        trade.get("sl_price")
+        or trade.get("sl")
+        or 0.0
+    )
+
+    tp1 = float(
+        trade.get("tp1_price")
+        or trade.get("tp1")
+        or 0.0
+    )
+
+    tp2 = float(
+        trade.get("tp2_price")
+        or trade.get("tp2")
+        or 0.0
+    )
+
+    exit_p = float(
+        trade.get("exit_price")
+        or entry
+    )
+
+    outcome = str(
+        trade.get("outcome")
+        or trade.get("outcome_val")
+        or "PENDING"
+    )
+
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
-    if sl_dist == 0: 
-        sl_dist = 2.5  # Standard minimum 2.5 risk
-        
+    if sl_dist == 0:
+        sl_dist = 2.5
+
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
 
-    if outcome == "CLOSED (TP1 HIT / SL BE)": 
+    if outcome == "CLOSED (TP1 HIT / SL BE)":
         total_pips = tp1_dist * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: 
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
         total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif outcome == "WIN (TP1 HIT)": 
+    elif outcome == "WIN (TP1 HIT)":
         total_pips = tp1_dist * 10.0
-    elif "LOSS" in outcome: 
+    elif "LOSS" in outcome:
         total_pips = -(sl_dist * 10.0 * 2.0)
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
         total_pips = diff * 10.0 * 2.0
 
-    return total_pips, (total_pips * 0.10)
+    profit_usd = total_pips * 0.10
+    return total_pips, profit_usd
 
 
-def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
+def compute_r_multiple(
+    action: str,
+    entry: float,
+    exit_price: float,
+    sl: float,
+    tp1: float = 0.0,
+    tp2: float = 0.0,
+    outcome: str = "PENDING"
+) -> float:
+    """Calculate R using the same two-stage TP accounting as pips."""
     risk_dist = abs(entry - sl)
-    
-    # Fallback for old legacy trades
-    if risk_dist <= 0: 
+
+    if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
-        if risk_dist == 0: risk_dist = 2.5
+        if risk_dist == 0:
+            risk_dist = 2.5
 
     if outcome == "CLOSED (TP1 HIT / SL BE)":
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         return tp1_dist / risk_dist
+
     if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
         return (tp1_dist + tp2_dist) / risk_dist
+
     if outcome == "WIN (TP1 HIT)":
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         return tp1_dist / risk_dist
-    if "LOSS" in outcome: return -2.0
 
-    single_r = ((exit_price - entry) / risk_dist) if action == "BUY" else ((entry - exit_price) / risk_dist)
+    if "LOSS" in outcome:
+        return -2.0
+
+    single_r = (
+        (exit_price - entry) / risk_dist
+        if action == "BUY"
+        else (entry - exit_price) / risk_dist
+    )
     return single_r * 2.0
 
 
@@ -1946,7 +1854,7 @@ async def background_scanning_loop():
                 )
 
                 active_session = (
-                    10 <= current_hour_wib < 22
+                    ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
                 )
 
                 if not active_session:
@@ -1992,7 +1900,7 @@ async def background_scanning_loop():
                         "Retrying next cycle."
                     )
 
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
                     continue
 
                 if len(df_1m) < 3 or len(df_5m) < 6:
@@ -2006,7 +1914,7 @@ async def background_scanning_loop():
                         "sweep/BOS detection. Retrying next cycle."
                     )
 
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
                     continue
 
                 df_1m = calculate_metrics_m1(df_1m)
@@ -2051,7 +1959,22 @@ async def background_scanning_loop():
                     )
                 )
 
-                if need_refresh:
+                in_mid_session_veto = (
+                    MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR
+                )
+
+                if in_mid_session_veto:
+                    if cached_15m["df"] is not None:
+                        logging.info(
+                            f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | "
+                            "Scanning M1/M5 normally; 15M API refresh skipped and cached."
+                        )
+                    else:
+                        logging.info(
+                            f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | "
+                            "Scanning M1/M5; no 15M cache available."
+                        )
+                elif need_refresh:
                     df_15m_raw = await fetch_timeframe_data(
                         client,
                         "15min"
@@ -2113,11 +2036,6 @@ async def background_scanning_loop():
                 # ==================================================
                 if pending_setup is not None:
 
-                    # --------------------------------------------------
-                    # If the 10-minute pullback window expires, give the
-                    # original setup ONE FINAL momentum-continuation check
-                    # before discarding it.
-                    # --------------------------------------------------
                     if (
                         datetime.now(timezone.utc)
                         > pending_setup["expires"]
@@ -2240,12 +2158,6 @@ async def background_scanning_loop():
                             pending_setup = None
 
                         else:
-                            # --------------------------------------------------
-                            # No pullback yet. If price is already running,
-                            # allow the controlled 1.20-1.80 ATR continuation
-                            # path. This is the key recovery path for runaway
-                            # moves that refuse to retrace.
-                            # --------------------------------------------------
                             (
                                 b_action,
                                 b_trigger_type,
@@ -2984,7 +2896,7 @@ async def background_scanning_loop():
                     f"[SCAN LOOP ERROR] {e}"
                 )
 
-            await asyncio.sleep(120)
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
@@ -3340,8 +3252,8 @@ async def telegram_webhook(
                     cur.execute("""
                         SELECT COUNT(*) AS tp1_wins
                         FROM signals
-                        WHERE outcome LIKE 'CLOSED%'
-                           OR outcome LIKE 'WIN (TP1%'
+                        WHERE outcome LIKE 'WIN (TP1%'
+                           OR outcome LIKE 'CLOSED%'
                     """)
 
                     tp1_wins = (
@@ -3374,58 +3286,42 @@ async def telegram_webhook(
                     cur.execute("""
                         SELECT
                             action,
-                            COALESCE(
-                                entry_price,
-                                price,
-                                0
-                            ) AS entry_p,
-                            COALESCE(
-                                sl_price,
-                                sl,
-                                0
-                            ) AS sl_price,
-                            COALESCE(
-                                tp1_price,
-                                tp1,
-                                0
-                            ) AS tp1_price,
-                            COALESCE(
-                                tp2_price,
-                                tp2,
-                                0
-                            ) AS tp2_price,
+                            COALESCE(entry_price, price, 0) AS entry_p,
+                            COALESCE(sl_price, sl, 0) AS sl_p,
+                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
                             exit_price,
-                            COALESCE(
-                                outcome,
-                                'PENDING'
-                            ) AS outcome_val
+                            COALESCE(outcome, 'PENDING') AS outcome_val
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
                     """)
 
-                    closed_trades = (
-                        cur.fetchall()
-                    )
+                    closed_trades = cur.fetchall()
 
                     total_pips = 0.0
                     win_pips = 0.0
                     loss_pips = 0.0
 
-                    total_wins_count = (
-                        tp1_wins
-                        + tp2_wins
-                    )
+                    total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
-                        pips, usd = compute_trade_pips(t)
-                        total_pips += pips
+                        trade_pips, _trade_usd = compute_trade_pips({
+                            "action": t["action"],
+                            "entry_price": t["entry_p"],
+                            "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"],
+                            "tp2_price": t["tp2_p"],
+                            "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"]
+                        })
 
-                        if pips > 0:
-                            win_pips += pips
+                        total_pips += trade_pips
 
-                        else:
-                            loss_pips += abs(pips)
+                        if trade_pips > 0:
+                            win_pips += trade_pips
+                        elif trade_pips < 0:
+                            loss_pips += abs(trade_pips)
 
                     win_rate = (
                         total_wins_count
@@ -3551,31 +3447,12 @@ async def telegram_webhook(
                     cur.execute("""
                         SELECT
                             action,
-                            COALESCE(
-                                entry_price,
-                                price,
-                                0
-                            ) AS entry_p,
-                            COALESCE(
-                                sl_price,
-                                sl,
-                                0
-                            ) AS sl_price,
-                            COALESCE(
-                                tp1_price,
-                                tp1,
-                                0
-                            ) AS tp1_price,
-                            COALESCE(
-                                tp2_price,
-                                tp2,
-                                0
-                            ) AS tp2_price,
+                            COALESCE(entry_price, price, 0) AS entry_p,
+                            COALESCE(sl_price, sl, 0) AS sl_p,
+                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
                             exit_price,
-                            COALESCE(
-                                outcome,
-                                'PENDING'
-                            ) AS outcome_val
+                            COALESCE(outcome, 'PENDING') AS outcome_val
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
@@ -3591,13 +3468,21 @@ async def telegram_webhook(
                     losing_trades_count = 0
 
                     for t in trades:
-                        pips, _ = compute_trade_pips(t)
+                        pips, _profit_usd = compute_trade_pips({
+                            "action": t["action"],
+                            "entry_price": t["entry_p"],
+                            "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"],
+                            "tp2_price": t["tp2_p"],
+                            "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"]
+                        })
+
                         total_pips += pips
 
                         if pips > 0:
                             gross_win_pips += pips
                             winning_trades_count += 1
-
                         elif pips < 0:
                             gross_loss_pips += abs(pips)
                             losing_trades_count += 1
@@ -3694,36 +3579,13 @@ async def telegram_webhook(
                         SELECT
                             id,
                             action,
-                            COALESCE(
-                                entry_price,
-                                price,
-                                0
-                            ) AS entry_p,
-                            COALESCE(
-                                sl_price,
-                                sl,
-                                0
-                            ) AS sl_price,
-                            COALESCE(
-                                tp1_price,
-                                tp1,
-                                0
-                            ) AS tp1_price,
-                            COALESCE(
-                                tp2_price,
-                                tp2,
-                                0
-                            ) AS tp2_price,
+                            COALESCE(entry_price, price, 0) AS entry_p,
+                            COALESCE(sl_price, sl, 0) AS sl_p,
+                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
                             exit_price,
-                            COALESCE(
-                                outcome,
-                                'PENDING'
-                            ) AS outcome_val,
-                            COALESCE(
-                                timestamp,
-                                created_at::text,
-                                'N/A'
-                            ) AS log_time
+                            COALESCE(outcome, 'PENDING') AS outcome_val,
+                            COALESCE(timestamp, created_at::text, 'N/A') AS log_time
                         FROM signals
                         WHERE status = 'EXECUTED'
                         ORDER BY id DESC
@@ -3774,8 +3636,33 @@ async def telegram_webhook(
                             )
 
                             if exit_p is not None:
-                                pips, usd = compute_trade_pips(l)
-                                pip_str = f"*{pips:+.1f} pips* (${usd:+.2f})"
+
+                                pips, profit_usd = compute_trade_pips({
+                                    "action": action,
+                                    "entry_price": entry,
+                                    "sl_price": l["sl_p"],
+                                    "tp1_price": l["tp1_p"],
+                                    "tp2_price": l["tp2_p"],
+                                    "exit_price": exit_p,
+                                    "outcome": outcome
+                                })
+
+                                r_multiple = compute_r_multiple(
+                                    action,
+                                    entry,
+                                    exit_p,
+                                    float(l["sl_p"] or 0.0),
+                                    float(l["tp1_p"] or 0.0),
+                                    float(l["tp2_p"] or 0.0),
+                                    outcome
+                                )
+
+                                pip_str = (
+                                    f"*{pips:+.1f} pips* | "
+                                    f"{r_multiple:+.2f}R | "
+                                    f"${profit_usd:+.2f}"
+                                )
+
                             else:
                                 pip_str = (
                                     "*ACTIVE / IN PROGRESS*"
@@ -3846,41 +3733,15 @@ async def telegram_webhook(
                         SELECT
                             action,
                             trigger_type,
-                            COALESCE(
-                                entry_price,
-                                price,
-                                0
-                            ) AS entry_p,
-                            COALESCE(
-                                sl_price,
-                                sl,
-                                0
-                            ) AS sl_price,
-                            COALESCE(
-                                tp1_price,
-                                tp1,
-                                0
-                            ) AS tp1_price,
-                            COALESCE(
-                                tp2_price,
-                                tp2,
-                                0
-                            ) AS tp2_price,
+                            COALESCE(entry_price, price, 0) AS entry_p,
+                            COALESCE(sl_price, sl, 0) AS sl_p,
+                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
                             exit_price,
-                            COALESCE(
-                                adx_15m,
-                                0
-                            ) AS adx_val,
+                            COALESCE(outcome, 'PENDING') AS outcome_val,
+                            COALESCE(adx_15m, 0) AS adx_val,
                             trend_15m,
-                            COALESCE(
-                                outcome,
-                                'PENDING'
-                            ) AS outcome_val,
-                            COALESCE(
-                                timestamp,
-                                created_at::text,
-                                ''
-                            ) AS ts
+                            COALESCE(timestamp, created_at::text, '') AS ts
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
@@ -3921,56 +3782,28 @@ async def telegram_webhook(
                                 r["exit_price"]
                             )
 
-                            sl = (
-                                float(
-                                    r["sl_price"]
-                                )
-                                if r.get(
-                                    "sl_price"
-                                ) is not None
-                                else 0.0
-                            )
-
-                            tp1 = float(
-                                r["tp1_price"]
-                            )
-
-                            tp2 = float(
-                                r["tp2_price"]
-                            )
+                            sl = float(r["sl_p"] or 0.0)
+                            tp1 = float(r["tp1_p"] or 0.0)
+                            tp2 = float(r["tp2_p"] or 0.0)
+                            outcome = str(r["outcome_val"] or "PENDING")
 
                             action = r["action"]
 
-                            adx_val = float(
-                                r["adx_val"]
-                            )
+                            adx_val = float(r["adx_val"])
 
-                            trigger = (
-                                r["trigger_type"]
-                                or ""
-                            )
+                            trigger = r["trigger_type"] or ""
 
-                            trend_15m_val = (
-                                r.get("trend_15m")
-                            )
+                            trend_15m_val = r.get("trend_15m")
+                            ts = r["ts"] or ""
 
-                            outcome = r["outcome_val"]
-
-                            ts = (
-                                r["ts"]
-                                or ""
-                            )
-
-                            r_mult = (
-                                compute_r_multiple(
-                                    action,
-                                    entry,
-                                    exit_p,
-                                    sl,
-                                    tp1,
-                                    tp2,
-                                    outcome
-                                )
+                            r_mult = compute_r_multiple(
+                                action,
+                                entry,
+                                exit_p,
+                                sl,
+                                tp1,
+                                tp2,
+                                outcome
                             )
 
                             overall_r.append(

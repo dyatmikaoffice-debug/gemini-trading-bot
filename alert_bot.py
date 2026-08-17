@@ -4,6 +4,7 @@ import asyncio
 import psycopg2
 import gc
 import logging
+import uuid
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
@@ -49,6 +50,7 @@ SYMBOL = "XAU/USD"
 
 # --- GLOBAL EMERGENCY KILL SWITCH STATE ---
 SYSTEM_TRADING_ENABLED = True
+CURRENT_SCAN_CYCLE_ID = None
 
 # --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
 pending_setup = None
@@ -67,17 +69,31 @@ LEVEL_LOOKBACK_CANDLES = 4
 # These filters apply ONLY to the Momentum Breakout system.
 # Sweep + BOS logic is left unchanged.
 
+# ==========================================================
+# MOMENTUM BREAKOUT QUALITY FILTERS
+# ==========================================================
+# Normal breakout quality filters.
 BREAKOUT_MIN_BODY_ATR_MULT = 0.50
-
-# Candle must close sufficiently close to the breakout direction.
-# BUY: close location measured from low -> high.
-# SELL: close location measured from low -> high as well,
-#       but requires the close to be near the low.
 BREAKOUT_MIN_CLOSE_LOCATION = 0.65
 
-# Prevent chasing a breakout after it has already travelled too far
-# beyond the original 5M breakout level.
+# Fresh breakout entries are intentionally conservative.
+# A fresh breakout above this extension is NOT chased.
 BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
+
+# ----------------------------------------------------------
+# MOMENTUM CONTINUATION MODE
+# ----------------------------------------------------------
+# Used ONLY when an existing setup has failed to pull back
+# and price continues to run in the same direction.
+#
+# Zone:
+#   <= 1.20 ATR  -> normal breakout territory / pullback path
+#   1.20-1.80 ATR -> controlled continuation entry allowed
+#   > 1.80 ATR  -> too extended, reject
+MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
+MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
+MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
+MOMENTUM_CONTINUATION_MIN_ADX = 20.0
 
 # Require the current candle to continue in the breakout direction.
 BREAKOUT_REQUIRE_BODY_DIRECTION = True
@@ -146,6 +162,42 @@ def init_db():
             );
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_time TIMESTAMP DEFAULT NOW(),
+                timestamp TEXT,
+                cycle_id TEXT,
+                event_type TEXT,
+                stage TEXT,
+                action TEXT,
+                trigger_type TEXT,
+                price REAL,
+                recent_high REAL,
+                recent_low REAL,
+                adx_5m REAL,
+                adx_15m REAL,
+                trend_15m TEXT,
+                pending_action TEXT,
+                pending_trigger TEXT,
+                pending_trigger_price REAL,
+                pending_zone_lower REAL,
+                pending_zone_upper REAL,
+                pending_expires TEXT,
+                extension_atr REAL,
+                body_atr REAL,
+                close_location REAL,
+                decision TEXT,
+                reason TEXT,
+                details JSONB
+            );
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_time ON bot_events(event_time DESC);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_cycle ON bot_events(cycle_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_type ON bot_events(event_type);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_action ON bot_events(action);")
+
         migrations = [
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trigger_type TEXT;",
@@ -166,7 +218,10 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS exit_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome_timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_15m TEXT;",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;"
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;",
+            "ALTER TABLE bot_events ADD COLUMN IF NOT EXISTS extension_atr REAL;",
+            "ALTER TABLE bot_events ADD COLUMN IF NOT EXISTS body_atr REAL;",
+            "ALTER TABLE bot_events ADD COLUMN IF NOT EXISTS close_location REAL;"
         ]
 
         for query in migrations:
@@ -184,6 +239,154 @@ def init_db():
         logging.error(
             f"[NEON DB ERROR] Failed to initialize database schema: {e}"
         )
+
+
+
+def log_bot_event(
+    event_type: str,
+    stage: str = None,
+    action: str = None,
+    trigger_type: str = None,
+    price: float = None,
+    recent_high: float = None,
+    recent_low: float = None,
+    adx_5m: float = None,
+    adx_15m: float = None,
+    trend_15m: str = None,
+    pending: dict = None,
+    extension_atr: float = None,
+    body_atr: float = None,
+    close_location: float = None,
+    decision: str = None,
+    reason: str = None,
+    details: dict = None,
+    cycle_id: str = None
+):
+    """Best-effort structured audit logging. Never stops the scanner."""
+    if not DATABASE_URL:
+        return None
+
+    conn = None
+    cursor = None
+    try:
+        now_utc = datetime.now(timezone.utc)
+        wib_time = (now_utc + timedelta(hours=7)).strftime(
+            "%Y-%m-%d %H:%M:%S WIB"
+        )
+        pending = pending or {}
+
+        def f(value):
+            try:
+                return float(value) if value is not None else None
+            except Exception:
+                return None
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bot_events (
+                timestamp, cycle_id, event_type, stage, action, trigger_type,
+                price, recent_high, recent_low, adx_5m, adx_15m, trend_15m,
+                pending_action, pending_trigger, pending_trigger_price,
+                pending_zone_lower, pending_zone_upper, pending_expires,
+                extension_atr, body_atr, close_location,
+                decision, reason, details
+            )
+            VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            )
+        """, (
+            wib_time,
+            cycle_id or CURRENT_SCAN_CYCLE_ID,
+            str(event_type),
+            str(stage) if stage is not None else None,
+            str(action) if action is not None else None,
+            str(trigger_type) if trigger_type is not None else None,
+            f(price), f(recent_high), f(recent_low), f(adx_5m), f(adx_15m),
+            str(trend_15m) if trend_15m is not None else None,
+            str(pending.get("action")) if pending.get("action") is not None else None,
+            str(pending.get("trigger_type")) if pending.get("trigger_type") is not None else None,
+            f(pending.get("trigger_price")),
+            f(pending.get("zone_lower")),
+            f(pending.get("zone_upper")),
+            str(pending.get("expires")) if pending.get("expires") is not None else None,
+            f(extension_atr),
+            f(body_atr),
+            f(close_location),
+            str(decision) if decision is not None else None,
+            str(reason) if reason is not None else None,
+            json.dumps(details or {}, default=str)
+        ))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"[BOT EVENT LOG ERROR] {event_type}: {e}")
+        return None
+    finally:
+        try:
+            if cursor: cursor.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+def log_scan_event(event_type: str, **kwargs):
+    return log_bot_event(event_type=event_type, **kwargs)
+
+
+def logged_breakout_check(
+    df_1m: pd.DataFrame,
+    df_5m: pd.DataFrame,
+    allow_momentum_continuation: bool = False
+):
+    """Run the existing detector unchanged, then persist its result."""
+    result = detect_breakout_continuation(
+        df_1m,
+        df_5m,
+        allow_momentum_continuation=allow_momentum_continuation
+    )
+    action, trigger_type, recent_high, recent_low = result
+
+    curr = df_1m.iloc[-1]
+    curr_open = float(curr["open"])
+    curr_high = float(curr["high"])
+    curr_low = float(curr["low"])
+    curr_close = float(curr["close"])
+    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else None
+    atr = float(raw_atr) if raw_atr is not None and not pd.isna(raw_atr) and float(raw_atr) > 0 else None
+    body_atr = abs(curr_close - curr_open) / atr if atr else None
+    candle_range = curr_high - curr_low
+    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
+    extension_atr = None
+    if atr:
+        if action == "BUY":
+            extension_atr = (curr_close - recent_high) / atr
+        elif action == "SELL":
+            extension_atr = (recent_low - curr_close) / atr
+        else:
+            # Estimate directional extension for rejected breakout candidates.
+            extension_atr = max(
+                (curr_close - recent_high) / atr,
+                (recent_low - curr_close) / atr
+            )
+
+    log_bot_event(
+        event_type="BREAKOUT_EVALUATION",
+        stage="MOMENTUM_CONTINUATION" if allow_momentum_continuation else "FRESH_BREAKOUT",
+        action=action,
+        trigger_type=trigger_type,
+        price=float(df_1m["close"].iloc[-1]),
+        recent_high=recent_high,
+        recent_low=recent_low,
+        extension_atr=extension_atr,
+        body_atr=body_atr,
+        close_location=close_location,
+        decision="VALID" if action != "HOLD" else "REJECTED_OR_NONE",
+        reason=trigger_type,
+        details={"continuation_mode": allow_momentum_continuation}
+    )
+    return result
 
 
 def log_trade_signal(
@@ -689,26 +892,31 @@ def detect_liquidity_sweep_structure(
 # ==========================================================
 def detect_breakout_continuation(
     df_1m: pd.DataFrame,
-    df_5m: pd.DataFrame
+    df_5m: pd.DataFrame,
+    allow_momentum_continuation: bool = False
 ):
     """
     Momentum breakout detector.
 
-    Improvements over the original version:
-    1. Requires two consecutive closes beyond the 5M level.
-    2. Requires meaningful M1 body displacement relative to ATR.
-    3. Requires the breakout candle to close strongly in the
-       breakout direction.
-    4. Prevents chasing an already-overextended breakout.
-    5. Keeps the existing 5M reference-level logic intact.
+    NORMAL MODE (fresh breakout):
+        - Two consecutive M1 closes beyond the 5M reference level.
+        - Current candle continues in breakout direction.
+        - Body >= 0.50 ATR.
+        - Strong close location >= 0.65.
+        - Extension <= 1.20 ATR.
 
-    This function does NOT change:
-    - Sweep + BOS
-    - Pullback system
-    - 15M bias
-    - AI filtering
-    - Stat vetoes
-    - API frequency
+    MOMENTUM CONTINUATION MODE (pending setup):
+        - Same structural breakout requirement.
+        - Used only when an existing setup failed to pull back.
+        - Extension must be > 1.20 ATR and <= 1.80 ATR.
+        - Body >= 0.35 ATR.
+        - Stronger-than-neutral close location >= 0.60.
+        - ADX is checked by the caller using
+          MOMENTUM_CONTINUATION_MIN_ADX.
+
+    This prevents the original failure mode where a breakout that
+    ran beyond 1.20 ATR was rejected forever even though the move
+    remained strong and the pending setup was still alive.
     """
 
     recent_high = float(
@@ -736,9 +944,14 @@ def detect_breakout_continuation(
     )
 
     if pd.isna(raw_atr) or float(raw_atr) <= 0:
-        atr_1m = None
-    else:
-        atr_1m = float(raw_atr)
+        return (
+            "HOLD",
+            "Breakout rejected: M1 ATR unavailable",
+            recent_high,
+            recent_low
+        )
+
+    atr_1m = float(raw_atr)
 
     # ------------------------------------------------------
     # Candle measurements
@@ -747,6 +960,8 @@ def detect_breakout_continuation(
     curr_high = float(curr["high"])
     curr_low = float(curr["low"])
     curr_close = float(curr["close"])
+
+    prev_close = float(prev["close"])
 
     candle_range = curr_high - curr_low
     candle_body = abs(curr_close - curr_open)
@@ -760,24 +975,24 @@ def detect_breakout_continuation(
         close_location = 0.5
 
     # ------------------------------------------------------
-    # Breakout direction
+    # Structural breakout
     # ------------------------------------------------------
     bullish_breakout_structure = bool(
-        prev["close"] > recent_high
-        and curr["close"] > recent_high
-        and curr["close"] > prev["close"]
+        prev_close > recent_high
+        and curr_close > recent_high
+        and curr_close > prev_close
     )
 
     bearish_breakout_structure = bool(
-        prev["close"] < recent_low
-        and curr["close"] < recent_low
-        and curr["close"] < prev["close"]
+        prev_close < recent_low
+        and curr_close < recent_low
+        and curr_close < prev_close
     )
 
-    # ------------------------------------------------------
-    # If neither structural breakout exists, stop here.
-    # ------------------------------------------------------
-    if not bullish_breakout_structure and not bearish_breakout_structure:
+    if (
+        not bullish_breakout_structure
+        and not bearish_breakout_structure
+    ):
         return (
             "HOLD",
             "No setup",
@@ -786,56 +1001,26 @@ def detect_breakout_continuation(
         )
 
     # ------------------------------------------------------
-    # ATR must be available for quality validation.
-    # If unavailable, do not manufacture a breakout.
+    # Common quality thresholds depend on mode.
     # ------------------------------------------------------
-    if atr_1m is None:
-        logging.info(
-            "[MOMENTUM BREAKOUT] Breakout structure detected "
-            "but M1 ATR unavailable. Waiting for valid ATR."
-        )
-
-        return (
-            "HOLD",
-            "Breakout rejected: M1 ATR unavailable",
-            recent_high,
-            recent_low
-        )
+    if allow_momentum_continuation:
+        min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
+        min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
+        max_extension_atr = MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT
+    else:
+        min_body_atr = BREAKOUT_MIN_BODY_ATR_MULT
+        min_close_location = BREAKOUT_MIN_CLOSE_LOCATION
+        max_extension_atr = BREAKOUT_MAX_EXTENSION_ATR_MULT
 
     # ======================================================
     # BULLISH BREAKOUT
     # ======================================================
     if bullish_breakout_structure:
 
-        # 1. Candle must actually be bullish.
         body_direction_ok = (
             curr_close > curr_open
             if BREAKOUT_REQUIRE_BODY_DIRECTION
             else True
-        )
-
-        # 2. Body displacement must be meaningful.
-        body_strength_ok = (
-            candle_body
-            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
-        )
-
-        # 3. Close must be toward the upper portion
-        #    of the breakout candle.
-        close_quality_ok = (
-            close_location
-            >= BREAKOUT_MIN_CLOSE_LOCATION
-        )
-
-        # 4. Prevent chasing a breakout that has already
-        #    travelled too far above the original level.
-        extension_from_level = (
-            curr_close - recent_high
-        )
-
-        extension_ok = (
-            extension_from_level
-            <= BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
         )
 
         if not body_direction_ok:
@@ -846,64 +1031,149 @@ def detect_breakout_continuation(
                 recent_low
             )
 
-        if not body_strength_ok:
+        body_ratio = candle_body / atr_1m
+
+        body_strength_ok = (
+            body_ratio >= min_body_atr
+        )
+
+        close_quality_ok = (
+            close_location >= min_close_location
+        )
+
+        extension_from_level = (
+            curr_close - recent_high
+        )
+
+        extension_atr = (
+            extension_from_level / atr_1m
+        )
+
+        # Fresh breakout: extension must stay <= 1.20 ATR.
+        if not allow_momentum_continuation:
+
+            if not body_strength_ok:
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
+                    f"body/ATR {body_ratio:.2f} < "
+                    f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}"
+                )
+                return (
+                    "HOLD",
+                    "Breakout rejected: insufficient displacement",
+                    recent_high,
+                    recent_low
+                )
+
+            if not close_quality_ok:
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
+                    f"close location {close_location:.2f} < "
+                    f"{BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
+                )
+                return (
+                    "HOLD",
+                    "Breakout rejected: weak candle close",
+                    recent_high,
+                    recent_low
+                )
+
+            if extension_from_level > (
+                BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
+            ):
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bullish breakout extended: "
+                    f"${extension_from_level:.2f} "
+                    f"({extension_atr:.2f}x ATR) > "
+                    f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR. "
+                    f"Pending setups may use continuation mode."
+                )
+                return (
+                    "HOLD",
+                    "Breakout overextended - continuation check required",
+                    recent_high,
+                    recent_low
+                )
+
             logging.info(
-                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
-                f"body ${candle_body:.2f} < "
-                f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}x ATR "
-                f"(${atr_1m:.2f})"
+                f"[MOMENTUM BREAKOUT] VALID BUY | "
+                f"Level ${recent_high:.2f} | "
+                f"Close ${curr_close:.2f} | "
+                f"Body/ATR {body_ratio:.2f} | "
+                f"CloseLocation {close_location:.2f} | "
+                f"Extension {extension_atr:.2f}x ATR"
             )
 
             return (
+                "BUY",
+                "Momentum Breakout Continuation (Bullish)",
+                recent_high,
+                recent_low
+            )
+
+        # --------------------------------------------------
+        # Pending-setup momentum continuation.
+        # Only 1.20-1.80 ATR is eligible.
+        # --------------------------------------------------
+        if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
+            return (
                 "HOLD",
-                "Breakout rejected: insufficient displacement",
+                "Continuation not active: extension <= normal breakout limit",
+                recent_high,
+                recent_low
+            )
+
+        if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
+            logging.info(
+                f"[MOMENTUM CONTINUATION] Bullish rejected: "
+                f"extension {extension_atr:.2f}x ATR > "
+                f"{MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:.2f}x ATR"
+            )
+            return (
+                "HOLD",
+                "Continuation rejected: excessively extended",
+                recent_high,
+                recent_low
+            )
+
+        if not body_strength_ok:
+            logging.info(
+                f"[MOMENTUM CONTINUATION] Bullish rejected: "
+                f"body/ATR {body_ratio:.2f} < "
+                f"{MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT:.2f}"
+            )
+            return (
+                "HOLD",
+                "Continuation rejected: momentum weakening",
                 recent_high,
                 recent_low
             )
 
         if not close_quality_ok:
             logging.info(
-                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
-                f"close location {close_location:.2f} "
-                f"< {BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
+                f"[MOMENTUM CONTINUATION] Bullish rejected: "
+                f"close location {close_location:.2f} < "
+                f"{MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION:.2f}"
             )
-
             return (
                 "HOLD",
-                "Breakout rejected: weak candle close",
-                recent_high,
-                recent_low
-            )
-
-        if not extension_ok:
-            logging.info(
-                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
-                f"extension ${extension_from_level:.2f} > "
-                f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR "
-                f"(${atr_1m:.2f})"
-            )
-
-            return (
-                "HOLD",
-                "Breakout rejected: overextended",
+                "Continuation rejected: weak close",
                 recent_high,
                 recent_low
             )
 
         logging.info(
-            f"[MOMENTUM BREAKOUT] VALID BUY | "
+            f"[MOMENTUM CONTINUATION] VALID BUY | "
             f"Level ${recent_high:.2f} | "
             f"Close ${curr_close:.2f} | "
-            f"Body ${candle_body:.2f} | "
-            f"ATR ${atr_1m:.2f} | "
-            f"Body/ATR {(candle_body / atr_1m):.2f} | "
-            f"CloseLocation {close_location:.2f} | "
-            f"Extension ${extension_from_level:.2f}"
+            f"Extension {extension_atr:.2f}x ATR | "
+            f"Body/ATR {body_ratio:.2f} | "
+            f"CloseLocation {close_location:.2f}"
         )
 
         return (
             "BUY",
-            "Momentum Breakout Continuation (Bullish)",
+            "Momentum Continuation - No Pullback (Bullish)",
             recent_high,
             recent_low
         )
@@ -913,35 +1183,10 @@ def detect_breakout_continuation(
     # ======================================================
     if bearish_breakout_structure:
 
-        # 1. Candle must actually be bearish.
         body_direction_ok = (
             curr_close < curr_open
             if BREAKOUT_REQUIRE_BODY_DIRECTION
             else True
-        )
-
-        # 2. Body displacement must be meaningful.
-        body_strength_ok = (
-            candle_body
-            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
-        )
-
-        # 3. Close must be toward the lower portion
-        #    of the breakout candle.
-        close_quality_ok = (
-            close_location
-            <= (1.0 - BREAKOUT_MIN_CLOSE_LOCATION)
-        )
-
-        # 4. Prevent chasing a breakout that has already
-        #    travelled too far below the original level.
-        extension_from_level = (
-            recent_low - curr_close
-        )
-
-        extension_ok = (
-            extension_from_level
-            <= BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
         )
 
         if not body_direction_ok:
@@ -952,64 +1197,149 @@ def detect_breakout_continuation(
                 recent_low
             )
 
-        if not body_strength_ok:
+        body_ratio = candle_body / atr_1m
+
+        body_strength_ok = (
+            body_ratio >= min_body_atr
+        )
+
+        close_quality_ok = (
+            close_location <= (1.0 - min_close_location)
+        )
+
+        extension_from_level = (
+            recent_low - curr_close
+        )
+
+        extension_atr = (
+            extension_from_level / atr_1m
+        )
+
+        # Fresh breakout: extension must stay <= 1.20 ATR.
+        if not allow_momentum_continuation:
+
+            if not body_strength_ok:
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
+                    f"body/ATR {body_ratio:.2f} < "
+                    f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}"
+                )
+                return (
+                    "HOLD",
+                    "Breakout rejected: insufficient displacement",
+                    recent_high,
+                    recent_low
+                )
+
+            if not close_quality_ok:
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
+                    f"close location {close_location:.2f} > "
+                    f"{1.0 - BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
+                )
+                return (
+                    "HOLD",
+                    "Breakout rejected: weak candle close",
+                    recent_high,
+                    recent_low
+                )
+
+            if extension_from_level > (
+                BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
+            ):
+                logging.info(
+                    f"[MOMENTUM BREAKOUT] Bearish breakout extended: "
+                    f"${extension_from_level:.2f} "
+                    f"({extension_atr:.2f}x ATR) > "
+                    f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR. "
+                    f"Pending setups may use continuation mode."
+                )
+                return (
+                    "HOLD",
+                    "Breakout overextended - continuation check required",
+                    recent_high,
+                    recent_low
+                )
+
             logging.info(
-                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
-                f"body ${candle_body:.2f} < "
-                f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}x ATR "
-                f"(${atr_1m:.2f})"
+                f"[MOMENTUM BREAKOUT] VALID SELL | "
+                f"Level ${recent_low:.2f} | "
+                f"Close ${curr_close:.2f} | "
+                f"Body/ATR {body_ratio:.2f} | "
+                f"CloseLocation {close_location:.2f} | "
+                f"Extension {extension_atr:.2f}x ATR"
             )
 
             return (
+                "SELL",
+                "Momentum Breakout Continuation (Bearish)",
+                recent_high,
+                recent_low
+            )
+
+        # --------------------------------------------------
+        # Pending-setup momentum continuation.
+        # Only 1.20-1.80 ATR is eligible.
+        # --------------------------------------------------
+        if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
+            return (
                 "HOLD",
-                "Breakout rejected: insufficient displacement",
+                "Continuation not active: extension <= normal breakout limit",
+                recent_high,
+                recent_low
+            )
+
+        if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
+            logging.info(
+                f"[MOMENTUM CONTINUATION] Bearish rejected: "
+                f"extension {extension_atr:.2f}x ATR > "
+                f"{MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:.2f}x ATR"
+            )
+            return (
+                "HOLD",
+                "Continuation rejected: excessively extended",
+                recent_high,
+                recent_low
+            )
+
+        if not body_strength_ok:
+            logging.info(
+                f"[MOMENTUM CONTINUATION] Bearish rejected: "
+                f"body/ATR {body_ratio:.2f} < "
+                f"{MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT:.2f}"
+            )
+            return (
+                "HOLD",
+                "Continuation rejected: momentum weakening",
                 recent_high,
                 recent_low
             )
 
         if not close_quality_ok:
             logging.info(
-                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
-                f"close location {close_location:.2f} "
-                f"> {(1.0 - BREAKOUT_MIN_CLOSE_LOCATION):.2f}"
+                f"[MOMENTUM CONTINUATION] Bearish rejected: "
+                f"close location {close_location:.2f} > "
+                f"{1.0 - MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION:.2f}"
             )
-
             return (
                 "HOLD",
-                "Breakout rejected: weak candle close",
-                recent_high,
-                recent_low
-            )
-
-        if not extension_ok:
-            logging.info(
-                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
-                f"extension ${extension_from_level:.2f} > "
-                f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR "
-                f"(${atr_1m:.2f})"
-            )
-
-            return (
-                "HOLD",
-                "Breakout rejected: overextended",
+                "Continuation rejected: weak close",
                 recent_high,
                 recent_low
             )
 
         logging.info(
-            f"[MOMENTUM BREAKOUT] VALID SELL | "
+            f"[MOMENTUM CONTINUATION] VALID SELL | "
             f"Level ${recent_low:.2f} | "
             f"Close ${curr_close:.2f} | "
-            f"Body ${candle_body:.2f} | "
-            f"ATR ${atr_1m:.2f} | "
-            f"Body/ATR {(candle_body / atr_1m):.2f} | "
-            f"CloseLocation {close_location:.2f} | "
-            f"Extension ${extension_from_level:.2f}"
+            f"Extension {extension_atr:.2f}x ATR | "
+            f"Body/ATR {body_ratio:.2f} | "
+            f"CloseLocation {close_location:.2f}"
         )
 
         return (
             "SELL",
-            "Momentum Breakout Continuation (Bearish)",
+            "Momentum Continuation - No Pullback (Bearish)",
             recent_high,
             recent_low
         )
@@ -1550,7 +1880,7 @@ Respond strictly in valid JSON matching schema:
 
 # --- BACKGROUND SCANNING LOOP ---
 async def background_scanning_loop():
-    global SYSTEM_TRADING_ENABLED
+    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID
 
     async with httpx.AsyncClient(
         timeout=15.0,
@@ -1560,6 +1890,7 @@ async def background_scanning_loop():
         while True:
             try:
                 if not SYSTEM_TRADING_ENABLED:
+                    log_scan_event("SYSTEM_PAUSED", stage="SYSTEM", decision="SKIPPED", reason="Kill switch active")
                     logging.info(
                         "[PAUSED] System trading currently paused "
                         "via kill-switch. Skipping scan."
@@ -1575,11 +1906,29 @@ async def background_scanning_loop():
 
                 current_hour_wib = now_wib.hour
 
+                CURRENT_SCAN_CYCLE_ID = (
+                    f"{now_wib.strftime('%Y%m%d%H%M%S')}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                )
+
+                log_scan_event(
+                    "SCAN_START",
+                    stage="SCAN",
+                    decision="STARTED",
+                    reason="Scanner cycle started",
+                    details={"wib_time": now_wib.strftime('%Y-%m-%d %H:%M:%S')}
+                )
+
                 active_session = (
                     10 <= current_hour_wib < 22
                 )
 
                 if not active_session:
+                    log_scan_event(
+                        "OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED",
+                        reason="Outside active trading session",
+                        details={"wib_hour": current_hour_wib}
+                    )
                     logging.info(
                         f"[SLEEP MODE] WIB Time: "
                         f"{now_wib.strftime('%H:%M')} | "
@@ -1593,8 +1942,8 @@ async def background_scanning_loop():
                 logging.info(
                     f"[ACTIVE SCAN] WIB Time: "
                     f"{now_wib.strftime('%H:%M')} | "
-                    f"Scanning for Liquidity Sweep + "
-                    f"Structure Break..."
+                    f"Scanning Sweep/BOS + Breakout + "
+                    f"No-Pullback Momentum Continuation..."
                 )
 
                 df_1m = await fetch_timeframe_data(
@@ -1608,6 +1957,10 @@ async def background_scanning_loop():
                 )
 
                 if df_1m is None or df_5m is None:
+                    log_scan_event(
+                        "DATA_FETCH_FAILED", stage="DATA", decision="RETRY",
+                        reason="Failed to fetch M1/M5 candles"
+                    )
                     logging.warning(
                         "Failed to fetch M1/M5 candles. "
                         "Retrying next cycle."
@@ -1617,6 +1970,11 @@ async def background_scanning_loop():
                     continue
 
                 if len(df_1m) < 3 or len(df_5m) < 6:
+                    log_scan_event(
+                        "DATA_INSUFFICIENT", stage="DATA", decision="RETRY",
+                        reason="Insufficient M1/M5 candle history",
+                        details={"m1_len": len(df_1m), "m5_len": len(df_5m)}
+                    )
                     logging.warning(
                         "Insufficient candle history for "
                         "sweep/BOS detection. Retrying next cycle."
@@ -1729,16 +2087,90 @@ async def background_scanning_loop():
                 # ==================================================
                 if pending_setup is not None:
 
+                    # --------------------------------------------------
+                    # If the 10-minute pullback window expires, give the
+                    # original setup ONE FINAL momentum-continuation check
+                    # before discarding it.
+                    # --------------------------------------------------
                     if (
                         datetime.now(timezone.utc)
                         > pending_setup["expires"]
                     ):
+
+                        expired_action = pending_setup["action"]
+                        expired_trigger = pending_setup["trigger_type"]
+
                         logging.info(
                             f"[PULLBACK EXPIRED] "
-                            f"{pending_setup['action']} setup "
+                            f"{expired_action} setup "
                             f"from ${pending_setup['trigger_price']:.2f} "
-                            f"expired without a pullback entry."
+                            f"expired without a pullback entry. "
+                            f"Checking final momentum continuation."
                         )
+
+                        (
+                            b_action,
+                            b_trigger_type,
+                            b_recent_high,
+                            b_recent_low
+                        ) = logged_breakout_check(
+                            df_1m,
+                            df_5m,
+                            allow_momentum_continuation=True
+                        )
+
+                        if (
+                            b_action == expired_action
+                            and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX
+                        ):
+
+                            proposed_action = b_action
+
+                            trigger_type = (
+                                f"No Pullback -> "
+                                f"Momentum Continuation "
+                                f"({b_trigger_type})"
+                            )
+
+                            recent_high = b_recent_high
+                            recent_low = b_recent_low
+
+                            log_scan_event(
+                                "NO_PULLBACK_CONVERSION", stage="MOMENTUM_CONTINUATION",
+                                action=b_action, trigger_type=trigger_type, price=curr_price,
+                                recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
+                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
+                                decision="ENTRY_CANDIDATE",
+                                reason="Momentum continuation passed while pullback was unavailable",
+                                details={"min_adx": MOMENTUM_CONTINUATION_MIN_ADX}
+                            )
+
+                            logging.info(
+                                f"[NO-PULLBACK CONVERSION] "
+                                f"Expired {expired_action} setup "
+                                f"converted into momentum continuation. "
+                                f"ADX={adx_5m:.1f}"
+                            )
+
+                        else:
+                            log_scan_event(
+                                "PULLBACK_EXPIRED", stage="PULLBACK", action=expired_action,
+                                trigger_type=expired_trigger, price=curr_price,
+                                recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
+                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
+                                decision="DISCARDED",
+                                reason="10-minute pullback expired with no valid continuation",
+                                details={"final_action": b_action}
+                            )
+
+                            logging.info(
+                                f"[PULLBACK EXPIRED] "
+                                f"No valid momentum continuation. "
+                                f"Setup discarded. "
+                                f"Final action={b_action}, "
+                                f"ADX={adx_5m:.1f}, "
+                                f"Original={expired_action}."
+                            )
 
                         pending_setup = None
 
@@ -1752,43 +2184,59 @@ async def background_scanning_loop():
                             curr_candle
                         )
 
-                        recent_high = (
-                            pending_setup["recent_high"]
-                        )
-
-                        recent_low = (
-                            pending_setup["recent_low"]
-                        )
+                        recent_high = pending_setup["recent_high"]
+                        recent_low = pending_setup["recent_low"]
 
                         if confirmed:
-                            proposed_action = (
-                                pending_setup["action"]
-                            )
+                            proposed_action = pending_setup["action"]
 
                             trigger_type = (
                                 pending_setup["trigger_type"]
                                 + " + Pullback Confirmed"
                             )
 
+                            log_scan_event(
+                                "PULLBACK_CONFIRMED", stage="PULLBACK",
+                                action=proposed_action, trigger_type=trigger_type, price=curr_price,
+                                recent_high=recent_high, recent_low=recent_low, adx_5m=adx_5m,
+                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
+                                decision="ENTRY_CANDIDATE",
+                                reason="Pullback candle overlapped zone and confirmed direction"
+                            )
+
+                            logging.info(
+                                f"[PULLBACK CONFIRMED] "
+                                f"{proposed_action} setup entered "
+                                f"inside ${pending_setup['zone_lower']:.2f}-"
+                                f"${pending_setup['zone_upper']:.2f}"
+                            )
+
                             pending_setup = None
 
                         else:
-                            b_action, b_trigger_type, b_recent_high, b_recent_low = (
-                                detect_breakout_continuation(
-                                    df_1m,
-                                    df_5m
-                                )
+                            # --------------------------------------------------
+                            # No pullback yet. If price is already running,
+                            # allow the controlled 1.20-1.80 ATR continuation
+                            # path. This is the key recovery path for runaway
+                            # moves that refuse to retrace.
+                            # --------------------------------------------------
+                            (
+                                b_action,
+                                b_trigger_type,
+                                b_recent_high,
+                                b_recent_low
+                            ) = logged_breakout_check(
+                                df_1m,
+                                df_5m,
+                                allow_momentum_continuation=True
                             )
 
                             if (
                                 b_action != "HOLD"
-                                and adx_5m >= 20.0
+                                and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX
                             ):
 
-                                if (
-                                    b_action
-                                    == pending_setup["action"]
-                                ):
+                                if b_action == pending_setup["action"]:
                                     proposed_action = b_action
 
                                     trigger_type = (
@@ -1797,30 +2245,36 @@ async def background_scanning_loop():
                                         f"{b_trigger_type}"
                                     )
 
-                                    recent_high = (
-                                        b_recent_high
+                                    recent_high = b_recent_high
+                                    recent_low = b_recent_low
+
+                                    log_scan_event(
+                                        "NO_PULLBACK_CONVERSION", stage="MOMENTUM_CONTINUATION",
+                                        action=b_action, trigger_type=trigger_type, price=curr_price,
+                                        recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
+                                        adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
+                                        decision="ENTRY_CANDIDATE",
+                                        reason="Pending setup converted to controlled momentum continuation",
+                                        details={"min_adx": MOMENTUM_CONTINUATION_MIN_ADX}
                                     )
 
-                                    recent_low = (
-                                        b_recent_low
+                                    logging.info(
+                                        f"[NO-PULLBACK CONVERSION] "
+                                        f"{b_action} setup converted to "
+                                        f"{b_trigger_type}. "
+                                        f"ADX={adx_5m:.1f}"
                                     )
 
                                     pending_setup = None
 
                                 else:
-                                    invalidated_action = (
-                                        pending_setup["action"]
-                                    )
-
-                                    invalidated_trigger = (
-                                        pending_setup["trigger_type"]
-                                    )
+                                    invalidated_action = pending_setup["action"]
+                                    invalidated_trigger = pending_setup["trigger_type"]
 
                                     logging.info(
                                         f"[SETUP INVALIDATED] "
                                         f"{invalidated_action} setup "
-                                        f"({invalidated_trigger}) "
-                                        f"from "
+                                        f"({invalidated_trigger}) from "
                                         f"${pending_setup['trigger_price']:.2f} "
                                         f"invalidated by opposite "
                                         f"{b_action} breakout continuation."
@@ -1835,13 +2289,8 @@ async def background_scanning_loop():
                                         f"Sweep Setup)"
                                     )
 
-                                    recent_high = (
-                                        b_recent_high
-                                    )
-
-                                    recent_low = (
-                                        b_recent_low
-                                    )
+                                    recent_high = b_recent_high
+                                    recent_low = b_recent_low
 
                                     pending_setup = None
 
@@ -1919,6 +2368,16 @@ async def background_scanning_loop():
                                 ),
                             }
 
+                            log_scan_event(
+                                "PENDING_ARMED", stage="PULLBACK", action=new_action,
+                                trigger_type=new_trigger_type, price=curr_price,
+                                recent_high=new_recent_high, recent_low=new_recent_low,
+                                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                                pending=pending_setup, decision="ARMED",
+                                reason="Sweep + BOS setup armed for pullback",
+                                details={"expiry_minutes": PULLBACK_EXPIRY_MINUTES}
+                            )
+
                             status_note = (
                                 f" | New {new_action} setup "
                                 f"({new_trigger_type}) armed, "
@@ -1974,9 +2433,10 @@ async def background_scanning_loop():
                 ):
 
                     b_action, b_trigger_type, b_recent_high, b_recent_low = (
-                        detect_breakout_continuation(
+                        logged_breakout_check(
                             df_1m,
-                            df_5m
+                            df_5m,
+                            allow_momentum_continuation=False
                         )
                     )
 
@@ -2033,6 +2493,13 @@ async def background_scanning_loop():
                             0.0,
                             "None",
                             stat_veto_reason
+                        )
+
+                        log_scan_event(
+                            "STAT_VETO", stage="STAT_VETO", action=proposed_action,
+                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
+                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                            trend_15m=trend_15m, decision="VETOED", reason=stat_veto_reason
                         )
 
                         proposed_action = "HOLD"
@@ -2096,6 +2563,14 @@ async def background_scanning_loop():
                                 0 <= minutes_since_loss
                                 < LOSS_COOLDOWN_MINUTES
                             ):
+
+                                log_scan_event(
+                                    "LOSS_COOLDOWN", stage="RISK_FILTER", action=proposed_action,
+                                    trigger_type=trigger_type, price=curr_price, adx_5m=adx_5m,
+                                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="BLOCKED",
+                                    reason=f"{minutes_since_loss:.1f} minutes since last SL hit",
+                                    details={"cooldown_minutes": LOSS_COOLDOWN_MINUTES}
+                                )
 
                                 logging.info(
                                     f"[LOSS COOLDOWN] "
@@ -2174,6 +2649,16 @@ async def background_scanning_loop():
                                 < required_distance
                             ):
 
+                                log_scan_event(
+                                    "DISTANCE_COOLDOWN", stage="RISK_FILTER", action=proposed_action,
+                                    trigger_type=trigger_type, price=curr_price, adx_5m=adx_5m,
+                                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="BLOCKED",
+                                    reason=f"Price within ${required_distance:.2f} of previous trade",
+                                    details={"last_entry_price": last_entry_price,
+                                             "required_distance": required_distance,
+                                             "last_outcome": last_outcome}
+                                )
+
                                 logging.info(
                                     f"[SCALP COOLDOWN] "
                                     f"Skipping "
@@ -2195,6 +2680,18 @@ async def background_scanning_loop():
                 # ==================================================
                 # FINAL DECISION
                 # ==================================================
+                log_scan_event(
+                    "SCAN_DECISION", stage="FINAL_DECISION", action=proposed_action,
+                    trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
+                    recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                    trend_15m=trend_15m, pending=pending_setup,
+                    decision="HOLD" if proposed_action == "HOLD" else "AI_REVIEW",
+                    reason=status_note.strip(" |") if status_note else (
+                        trigger_type if proposed_action != "HOLD" else "No entry trigger"
+                    ),
+                    details={"trend_15m_separation_pct": trend_15m_sep}
+                )
+
                 if proposed_action == "HOLD":
 
                     logging.info(
@@ -2227,6 +2724,15 @@ async def background_scanning_loop():
                             trend_15m,
                             adx_15m_true
                         )
+                    )
+
+                    log_scan_event(
+                        "AI_DECISION", stage="AI", action=proposed_action,
+                        trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
+                        recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                        trend_15m=trend_15m, decision=ai_decision.action,
+                        reason=ai_decision.reasoning,
+                        details={"confidence": float(ai_decision.confidence)}
                     )
 
                     raw_atr = (
@@ -2315,6 +2821,16 @@ async def background_scanning_loop():
                             ai_decision.reasoning,
                             trend_15m,
                             adx_15m_true
+                        )
+
+                        log_scan_event(
+                            "SIGNAL_EXECUTED", stage="TRADE_SIGNAL", action=proposed_action,
+                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
+                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                            trend_15m=trend_15m, decision="EXECUTED", reason=ai_decision.reasoning,
+                            details={"signal_id": new_id, "confidence": float(ai_decision.confidence),
+                                     "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
+                                     "risk": risk, "tp1_r": tp1_r_mult, "tp2_r": tp2_r_mult}
                         )
 
                         id_tag = (
@@ -2414,10 +2930,30 @@ async def background_scanning_loop():
                             adx_15m_true
                         )
 
+                        log_scan_event(
+                            "AI_VETO", stage="AI", action=proposed_action,
+                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
+                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                            trend_15m=trend_15m, decision="VETOED", reason=ai_decision.reasoning,
+                            details={"confidence": float(ai_decision.confidence)}
+                        )
+
+                log_scan_event(
+                    "SCAN_END", stage="SCAN", action=proposed_action, trigger_type=trigger_type,
+                    price=curr_price, recent_high=recent_high, recent_low=recent_low, adx_5m=adx_5m,
+                    adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
+                    decision="COMPLETE", reason="Scanner cycle completed",
+                    details={"status_note": status_note}
+                )
+
                 del df_1m, df_5m
                 gc.collect()
 
             except Exception as e:
+                log_scan_event(
+                    "SCAN_ERROR", stage="SCAN", decision="ERROR", reason=str(e),
+                    details={"exception_type": type(e).__name__}
+                )
                 logging.error(
                     f"[SCAN LOOP ERROR] {e}"
                 )

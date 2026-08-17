@@ -69,46 +69,172 @@ ACTIVE_SESSION_END_HOUR = 22    # WIB
 MID_SESSION_START_HOUR = 14     # WIB
 MID_SESSION_END_HOUR = 18       # WIB
 
+# With the schedule above, the theoretical maximum is:
+# 10-14: 120 cycles x 2 requests = 240
+# 14-18: 120 cycles x 2 requests = 240
+# 18-22: 120 cycles x 2 requests = 240
+# 15M: 16 refreshes in 10-14 + 16 refreshes in 18-22 = 32
+# TOTAL = 752 Twelve Data requests/day.
+# Keep this below the 800/day plan limit.
 TWELVE_DATA_DAILY_LIMIT = 800
 LEVEL_LOOKBACK_CANDLES = 4
 
 # ==========================================================
 # MOMENTUM BREAKOUT QUALITY FILTERS
 # ==========================================================
+# These filters apply ONLY to the Momentum Breakout system.
+# Sweep + BOS logic is left unchanged.
+
+# ==========================================================
+# MOMENTUM BREAKOUT QUALITY FILTERS
+# ==========================================================
+# Normal breakout quality filters.
 BREAKOUT_MIN_BODY_ATR_MULT = 0.50
 BREAKOUT_MIN_CLOSE_LOCATION = 0.65
+
+# Fresh breakout entries remain conservative for the two-close path.
+# The separate FAST MOMENTUM path can enter earlier, but only within its own ATR cap.
 BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
 
 # ----------------------------------------------------------
 # MOMENTUM CONTINUATION MODE
 # ----------------------------------------------------------
+# Used ONLY when an existing setup has failed to pull back
+# and price continues to run in the same direction.
+#
+# Zone:
+#   <= 1.20 ATR  -> normal breakout territory / pullback path
+#   1.20-1.80 ATR -> controlled continuation entry allowed
+#   > 1.80 ATR  -> too extended, reject
 MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
 MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
 MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
 MOMENTUM_CONTINUATION_MIN_ADX = 20.0
+
+# ----------------------------------------------------------
+# FAST 1-MINUTE MOMENTUM ENTRY
+# ----------------------------------------------------------
+# Allows a decisive first M1 close through the previous 5M level
+# instead of waiting for two consecutive closes. This is designed
+# to catch clean XAU/USD impulse moves before they run away.
+FAST_MOMENTUM_MIN_BODY_ATR_MULT = 0.35
+FAST_MOMENTUM_MIN_CLOSE_LOCATION = 0.60
+FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT = 1.35
+FAST_MOMENTUM_PREV_BUFFER_ATR = 0.50
+FAST_MOMENTUM_MIN_ADX = 20.0
+
+# Require the current candle to continue in the breakout direction.
 BREAKOUT_REQUIRE_BODY_DIRECTION = True
 
 # --- STAT-BASED VETOES ---
+# High ADX is a hard veto for TREND-FOLLOWING breakout entries.
+# It is NOT a blanket veto for a confirmed Liquidity Sweep + BOS reversal.
+# In an extreme directional move, the sweep/BOS reversal is specifically the
+# setup we want to allow when price sweeps the trend extreme and breaks back.
 STAT_VETO_ADX_THRESHOLD = 50.0
 STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
 STAT_VETO_MID_SESSION_END_HOUR = 18    # WIB
+
+# Extreme-ADX reversal exception.
+# We require DI direction to confirm that the reversal is fighting the
+# dominant momentum: SELL after a bullish impulse, or BUY after a bearish impulse.
+EXTREME_ADX_REVERSAL_MIN_ADX = 50.0
+EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION = True
 
 # --- LOSS-COOLDOWN ---
 LOSS_COOLDOWN_MINUTES = 10
 
 
-def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    """Hard pre-AI veto based on forward-tested underperforming segments."""
-    if adx_5m >= STAT_VETO_ADX_THRESHOLD:
-        return True, (
-            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
-            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27 -- likely exhaustion/blow-off, not sustained trend)"
-        )
+def check_stat_veto(
+    adx_5m: float,
+    current_hour_wib: int,
+    action: str = "HOLD",
+    trigger_type: str = "",
+    plus_di_5m: float = None,
+    minus_di_5m: float = None,
+):
+    """
+    Direction-aware statistical veto.
 
+    ADX measures trend STRENGTH, not direction. Therefore an extreme ADX
+    reading must not blindly veto every setup.
+
+    Rules:
+      1) ADX >= 50 blocks momentum/breakout continuation entries.
+      2) A confirmed Liquidity Sweep + BOS reversal may bypass the ADX veto
+         ONLY when the reversal is opposite the dominant DI direction.
+         Example: +DI > -DI + SELL Sweep/BOS = bullish exhaustion reversal.
+      3) Mid-session 14:00-18:00 WIB remains a separate hard statistical veto.
+    """
+    action = str(action or "HOLD").upper()
+    trigger_type = str(trigger_type or "")
+
+    is_sweep_reversal = (
+        "Liquidity Sweep" in trigger_type
+        and "BOS" in trigger_type
+        and ("Pullback Confirmed" in trigger_type or "Sweep" in trigger_type)
+    )
+
+    # Mid-session remains a HARD veto and is checked before the extreme-ADX
+    # reversal exception. The exception only changes the ADX rule.
     if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
         return True, (
             f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
             f"forward-tested as underperforming (n=17, WR=29%, AvgR=-0.18)"
+        )
+
+    if adx_5m >= EXTREME_ADX_REVERSAL_MIN_ADX and is_sweep_reversal:
+        di_available = (
+            plus_di_5m is not None
+            and minus_di_5m is not None
+            and np.isfinite(float(plus_di_5m))
+            and np.isfinite(float(minus_di_5m))
+        )
+
+        if di_available:
+            plus_di = float(plus_di_5m)
+            minus_di = float(minus_di_5m)
+
+            bullish_dominant = plus_di > minus_di
+            bearish_dominant = minus_di > plus_di
+
+            # SELL after an extreme bullish impulse = exhaustion/reversal.
+            bearish_reversal = action == "SELL" and bullish_dominant
+            # BUY after an extreme bearish impulse = exhaustion/reversal.
+            bullish_reversal = action == "BUY" and bearish_dominant
+
+            if bearish_reversal or bullish_reversal:
+                return False, (
+                    f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} >= "
+                    f"{EXTREME_ADX_REVERSAL_MIN_ADX:.1f}, but {trigger_type} "
+                    f"is opposite the dominant momentum "
+                    f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}); "
+                    f"allowing structural exhaustion reversal."
+                )
+
+            return True, (
+                f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
+                f"Sweep+BOS direction is not opposite dominant momentum "
+                f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}), so this is not treated as exhaustion reversal."
+            )
+
+        if not EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION:
+            return False, (
+                f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} and "
+                f"confirmed {trigger_type}; DI confirmation disabled."
+            )
+
+        return True, (
+            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
+            f"confirmed Sweep+BOS reversal lacks valid +DI/-DI confirmation."
+        )
+
+    if adx_5m >= STAT_VETO_ADX_THRESHOLD:
+        return True, (
+            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
+            f"for {trigger_type or 'non-reversal'} entry "
+            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27; "
+            f"high-ADX breakout/continuation entries are treated as late/exhausted)."
         )
 
     return False, ""
@@ -229,6 +355,7 @@ def init_db():
         logging.error(
             f"[NEON DB ERROR] Failed to initialize database schema: {e}"
         )
+
 
 
 def log_bot_event(
@@ -354,6 +481,7 @@ def logged_breakout_check(
         elif action == "SELL":
             extension_atr = (recent_low - curr_close) / atr
         else:
+            # Estimate directional extension for rejected breakout candidates.
             extension_atr = max(
                 (curr_close - recent_high) / atr,
                 (recent_low - curr_close) / atr
@@ -803,6 +931,8 @@ def calculate_metrics_5m(df: pd.DataFrame):
         )
     )
 
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
     df["adx"] = dx.rolling(14).mean()
 
     df["atr"] = df["tr"].rolling(window=14).mean()
@@ -922,6 +1052,25 @@ def detect_breakout_continuation(
     df_5m: pd.DataFrame,
     allow_momentum_continuation: bool = False
 ):
+    """
+    Momentum breakout detector, revised to catch fast one-candle moves.
+
+    NORMAL / FRESH MODE:
+      1) Preferred path: two consecutive M1 closes beyond the prior 5M level.
+      2) Fast path: one decisive M1 close through the prior 5M level is enough
+         when the candle has real displacement and a strong directional close.
+         This prevents the scanner from waiting for the second candle and
+         missing a clean XAU/USD impulse.
+
+    CONTINUATION MODE:
+      Used when a pending setup has already failed to pull back. It allows
+      controlled continuation in the 1.20-1.80 ATR extension zone.
+
+    The fast path is still protected by ATR, close-quality, extension and ADX
+    checks (ADX is enforced by the caller), so this is not an unrestricted
+    breakout trigger.
+    """
+
     recent_high = float(
         df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
     )
@@ -952,6 +1101,9 @@ def detect_breakout_continuation(
     close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
     body_ratio = candle_body / atr_1m
 
+    # ======================================================
+    # STRUCTURAL BREAKOUTS
+    # ======================================================
     bullish_two_close = bool(
         prev_close > recent_high
         and curr_close > recent_high
@@ -963,6 +1115,11 @@ def detect_breakout_continuation(
         and curr_close < prev_close
     )
 
+    # Fast one-candle path. This deliberately does NOT require the previous
+    # candle to close beyond the level. The previous close only has to be
+    # reasonably close to the level OR already on the breakout side. This
+    # catches the first decisive impulse without chasing a move that started
+    # several ATRs ago.
     bullish_fast_cross = bool(
         curr_close > recent_high
         and curr_close > curr_open
@@ -980,6 +1137,9 @@ def detect_breakout_continuation(
         )
     )
 
+    # ======================================================
+    # MOMENTUM CONTINUATION MODE
+    # ======================================================
     if allow_momentum_continuation:
         min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
         min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
@@ -1010,6 +1170,9 @@ def detect_breakout_continuation(
 
         return "HOLD", "No continuation structure", recent_high, recent_low
 
+    # ======================================================
+    # NORMAL FRESH BREAKOUT — PREFERRED TWO-CLOSE PATH
+    # ======================================================
     if bullish_two_close:
         extension_atr = (curr_close - recent_high) / atr_1m
         if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT:
@@ -1017,6 +1180,7 @@ def detect_breakout_continuation(
         if close_location < BREAKOUT_MIN_CLOSE_LOCATION:
             return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
         if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT:
+            # The pending-setup continuation engine can handle 1.20-1.80 ATR.
             return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
         return "BUY", "Momentum Breakout Continuation (Bullish)", recent_high, recent_low
 
@@ -1030,6 +1194,9 @@ def detect_breakout_continuation(
             return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
         return "SELL", "Momentum Breakout Continuation (Bearish)", recent_high, recent_low
 
+    # ======================================================
+    # FAST ONE-CANDLE MOMENTUM PATH
+    # ======================================================
     if bullish_fast_cross:
         extension_atr = (curr_close - recent_high) / atr_1m
 
@@ -1184,6 +1351,19 @@ def detect_consolidation_breakout(
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     """
     Calculate the trade result using the bot's two-stage TP model.
+
+    This intentionally uses the stored TP1/TP2 levels when available,
+    and reconstructs missing legacy SL/TP values when older database rows
+    have NULL/zero price fields.
+
+    Accounting model:
+      - TP1 hit = +1.5R on the TP1 leg
+      - TP2 hit = TP1 leg + TP2 runner leg = 1.5R + 3.0R
+      - SL hit  = -2R (two 0.01-lot legs)
+
+    For legacy rows with missing SL/TP values, the standard minimum risk
+    of 2.5 XAU price points is used. Therefore a legacy TP1-only result
+    reconstructs to +37.5 pips (2.5 * 1.5 * 10).
     """
     action = str(trade.get("action") or "BUY").upper()
 
@@ -1223,6 +1403,8 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
         or "PENDING"
     )
 
+    # Legacy fallback: reconstruct missing risk from the actual exit when
+    # possible; otherwise use the bot's standard minimum risk of 2.5 points.
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
     if sl_dist == 0:
         sl_dist = 2.5
@@ -1258,6 +1440,7 @@ def compute_r_multiple(
     """Calculate R using the same two-stage TP accounting as pips."""
     risk_dist = abs(entry - sl)
 
+    # Legacy fallback.
     if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0:
@@ -1548,7 +1731,9 @@ async def analyze_signal_with_ai(
     recent_high: float,
     recent_low: float,
     trend_15m: str = "NEUTRAL",
-    adx_15m_true: float = 0.0
+    adx_15m_true: float = 0.0,
+    plus_di_5m: float = None,
+    minus_di_5m: float = None
 ):
     is_breakout = "Breakout" in trigger_type
 
@@ -1574,12 +1759,24 @@ async def analyze_signal_with_ai(
         )
 
         veto_rules_text = (
-            "- VETO if 5M ADX is above 45.0 "
-            "(indicating an extreme unstoppable runaway trend "
-            "that destroys mean-reversion setups).\n"
             "- VETO if 5M ADX is below 12.0 "
-            "(indicating dead market liquidity)."
+            "(indicating dead market liquidity).\n"
+            "- If 5M ADX is 50+ DO NOT automatically veto a confirmed "
+            "Liquidity Sweep + BOS reversal. ADX measures strength, not direction. "
+            "When +DI > -DI and the setup is SELL after a high-side liquidity sweep "
+            "and Bearish BOS, treat it as potential bullish exhaustion and allow the "
+            "reversal if the structural evidence is clean. Likewise, when -DI > +DI "
+            "and the setup is BUY after a low-side sweep + Bullish BOS, allow the "
+            "bearish-exhaustion reversal.\n"
+            "- Be conservative with high-ADX entries that are NOT a confirmed Sweep + BOS reversal; "
+            "do not chase late breakout/continuation moves."
         )
+
+    di_text = (
+        f"+DI={float(plus_di_5m):.1f}, -DI={float(minus_di_5m):.1f}"
+        if plus_di_5m is not None and minus_di_5m is not None
+        else "DI unavailable"
+    )
 
     confluence_text = (
         f"4. 15-Minute Trend: {trend_15m} "
@@ -1608,7 +1805,7 @@ Recent High=${recent_high:.2f},
 Recent Low=${recent_low:.2f}.
 
 3. 5-Minute:
-ADX Trend Strength={float(df_5m['adx'].iloc[-1]):.1f}.
+ADX Trend Strength={float(df_5m['adx'].iloc[-1]):.1f}; {di_text}.
 
 {confluence_text}
 
@@ -1815,6 +2012,21 @@ async def background_scanning_loop():
                     else 0.0
                 )
 
+                # ADX is directionless. Use +DI/-DI to determine whether an
+                # extreme-ADX Sweep+BOS is actually reversing the dominant move.
+                plus_di_5m = (
+                    float(df_5m["plus_di"].iloc[-1])
+                    if "plus_di" in df_5m.columns
+                    and not pd.isna(df_5m["plus_di"].iloc[-1])
+                    else None
+                )
+                minus_di_5m = (
+                    float(df_5m["minus_di"].iloc[-1])
+                    if "minus_di" in df_5m.columns
+                    and not pd.isna(df_5m["minus_di"].iloc[-1])
+                    else None
+                )
+
                 global cached_15m
 
                 need_refresh = (
@@ -1829,6 +2041,11 @@ async def background_scanning_loop():
                     )
                 )
 
+                # During the 14:00-18:00 WIB statistical veto window,
+                # keep scanning M1/M5 every 2 minutes but DO NOT spend
+                # Twelve Data requests refreshing the 15M confluence.
+                # The last valid 15M snapshot remains cached until the
+                # normal 15-minute refresh resumes at 18:00 WIB.
                 in_mid_session_veto = (
                     MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR
                 )
@@ -1906,6 +2123,11 @@ async def background_scanning_loop():
                 # ==================================================
                 if pending_setup is not None:
 
+                    # --------------------------------------------------
+                    # If the 10-minute pullback window expires, give the
+                    # original setup ONE FINAL momentum-continuation check
+                    # before discarding it.
+                    # --------------------------------------------------
                     if (
                         datetime.now(timezone.utc)
                         > pending_setup["expires"]
@@ -2028,6 +2250,12 @@ async def background_scanning_loop():
                             pending_setup = None
 
                         else:
+                            # --------------------------------------------------
+                            # No pullback yet. If price is already running,
+                            # allow the controlled 1.20-1.80 ATR continuation
+                            # path. This is the key recovery path for runaway
+                            # moves that refuse to retrace.
+                            # --------------------------------------------------
                             (
                                 b_action,
                                 b_trigger_type,
@@ -2277,7 +2505,11 @@ async def background_scanning_loop():
                     stat_vetoed, stat_veto_reason = (
                         check_stat_veto(
                             adx_5m,
-                            current_hour_wib
+                            current_hour_wib,
+                            action=proposed_action,
+                            trigger_type=trigger_type,
+                            plus_di_5m=plus_di_5m,
+                            minus_di_5m=minus_di_5m
                         )
                     )
 
@@ -2530,7 +2762,9 @@ async def background_scanning_loop():
                             recent_high,
                             recent_low,
                             trend_15m,
-                            adx_15m_true
+                            adx_15m_true,
+                            plus_di_5m,
+                            minus_di_5m
                         )
                     )
 
@@ -3017,12 +3251,12 @@ async def telegram_webhook(
                     "• `/help` - Display Command Menu\n\n"
 
                     f"⚠️ Active stat-vetoes: "
-                    f"ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} "
-                    f"and Mid session "
+                    f"ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} blocks late breakout/continuation entries; "
+                    f"confirmed Sweep+BOS reversals can receive an extreme-ADX exception when +DI/-DI "
+                    f"confirms the reversal direction. Mid session "
                     f"({STAT_VETO_MID_SESSION_START_HOUR}-"
                     f"{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-                    f"are auto-skipped based on "
-                    f"forward-test underperformance.\n"
+                    f"remains auto-skipped based on forward-test underperformance.\n"
 
                     f"⏱️ Loss cooldown: "
                     f"{LOSS_COOLDOWN_MINUTES} min "

@@ -66,12 +66,6 @@ LEVEL_LOOKBACK_CANDLES = 4
 # ==========================================================
 # MOMENTUM BREAKOUT QUALITY FILTERS
 # ==========================================================
-# These filters apply ONLY to the Momentum Breakout system.
-# Sweep + BOS logic is left unchanged.
-
-# ==========================================================
-# MOMENTUM BREAKOUT QUALITY FILTERS
-# ==========================================================
 # Normal breakout quality filters.
 BREAKOUT_MIN_BODY_ATR_MULT = 0.50
 BREAKOUT_MIN_CLOSE_LOCATION = 0.65
@@ -85,11 +79,6 @@ BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
 # ----------------------------------------------------------
 # Used ONLY when an existing setup has failed to pull back
 # and price continues to run in the same direction.
-#
-# Zone:
-#   <= 1.20 ATR  -> normal breakout territory / pullback path
-#   1.20-1.80 ATR -> controlled continuation entry allowed
-#   > 1.80 ATR  -> too extended, reject
 MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
 MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
 MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
@@ -239,7 +228,6 @@ def init_db():
         logging.error(
             f"[NEON DB ERROR] Failed to initialize database schema: {e}"
         )
-
 
 
 def log_bot_event(
@@ -1461,16 +1449,43 @@ def detect_consolidation_breakout(
     )
 
 
-# --- FORWARD-TEST ANALYTICS HELPERS ---
-def compute_r_multiple(
-    action: str,
-    entry: float,
-    exit_price: float,
-    sl: float,
-    tp1: float = 0.0,
-    tp2: float = 0.0,
-    outcome: str = "PENDING"
-) -> float:
+# =====================================================================
+# TWO-POSITION (2 x 0.01 LOT) REVISED PIP CALCULATOR
+# =====================================================================
+def compute_trade_pips(trade: dict) -> tuple[float, float]:
+    """2x 0.01 Lot calculator with fallback for old missing DB data"""
+    action = trade.get("action", "BUY")
+    entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
+    sl = float(trade.get("sl_price") or trade.get("sl") or 0.0)
+    tp1 = float(trade.get("tp1_price") or trade.get("tp1") or 0.0)
+    tp2 = float(trade.get("tp2_price") or trade.get("tp2") or 0.0)
+    exit_p = float(trade.get("exit_price") or entry)
+    outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
+
+    # Fallback for old legacy trades missing SL data in DB
+    sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
+    if sl_dist == 0: 
+        sl_dist = 2.5  # Standard minimum 2.5 risk
+        
+    tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
+    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
+
+    if outcome == "CLOSED (TP1 HIT / SL BE)": 
+        total_pips = tp1_dist * 10.0
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: 
+        total_pips = (tp1_dist + tp2_dist) * 10.0
+    elif outcome == "WIN (TP1 HIT)": 
+        total_pips = tp1_dist * 10.0
+    elif "LOSS" in outcome: 
+        total_pips = -(sl_dist * 10.0 * 2.0)
+    else:
+        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+        total_pips = diff * 10.0 * 2.0
+
+    return total_pips, (total_pips * 0.10)
+
+
+def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
     risk_dist = abs(entry - sl)
     
     # Fallback for old legacy trades
@@ -1888,41 +1903,6 @@ Respond strictly in valid JSON matching schema:
         )
     )
 
-def compute_trade_pips(trade: dict) -> tuple[float, float]:
-    """
-    Computes total realized pips and USD for a 2 x 0.01 lot order system.
-    Includes fallback for legacy trades missing SL/TP database data.
-    """
-    action = trade.get("action", "BUY")
-    entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
-    sl = float(trade.get("sl_price") or trade.get("sl") or 0.0)
-    tp1 = float(trade.get("tp1_price") or trade.get("tp1") or 0.0)
-    tp2 = float(trade.get("tp2_price") or trade.get("tp2") or 0.0)
-    exit_p = float(trade.get("exit_price") or entry)
-    outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
-
-    # Fallback for old legacy trades missing SL/TP data in DB
-    sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
-    if sl_dist == 0: 
-        sl_dist = 2.5  # Assume standard minimum 2.5 risk if data is missing
-        
-    tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
-    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
-
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        total_pips = tp1_dist * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif outcome == "WIN (TP1 HIT)":
-        total_pips = tp1_dist * 10.0
-    elif "LOSS" in outcome:
-        total_pips = -(sl_dist * 10.0 * 2.0)
-    else:
-        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0
-
-    profit_usd = total_pips * 0.10
-    return total_pips, profit_usd
 
 # --- BACKGROUND SCANNING LOOP ---
 async def background_scanning_loop():
@@ -3358,9 +3338,9 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) AS tp1_wins 
-                        FROM signals 
-                        WHERE outcome LIKE 'CLOSED%' 
+                        SELECT COUNT(*) AS tp1_wins
+                        FROM signals
+                        WHERE outcome LIKE 'CLOSED%'
                            OR outcome LIKE 'WIN (TP1%'
                     """)
 
@@ -3399,7 +3379,26 @@ async def telegram_webhook(
                                 price,
                                 0
                             ) AS entry_p,
-                            exit_price
+                            COALESCE(
+                                sl_price,
+                                sl,
+                                0
+                            ) AS sl_price,
+                            COALESCE(
+                                tp1_price,
+                                tp1,
+                                0
+                            ) AS tp1_price,
+                            COALESCE(
+                                tp2_price,
+                                tp2,
+                                0
+                            ) AS tp2_price,
+                            exit_price,
+                            COALESCE(
+                                outcome,
+                                'PENDING'
+                            ) AS outcome_val
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
@@ -3419,25 +3418,7 @@ async def telegram_webhook(
                     )
 
                     for t in closed_trades:
-
-                        entry = float(
-                            t["entry_p"]
-                        )
-
-                        exit_p = float(
-                            t["exit_price"]
-                        )
-
-                        action = t["action"]
-
-                        diff = (
-                            exit_p - entry
-                            if action == "BUY"
-                            else entry - exit_p
-                        )
-
-                        pips = diff * 10.0
-
+                        pips, usd = compute_trade_pips(t)
                         total_pips += pips
 
                         if pips > 0:
@@ -3575,7 +3556,26 @@ async def telegram_webhook(
                                 price,
                                 0
                             ) AS entry_p,
-                            exit_price
+                            COALESCE(
+                                sl_price,
+                                sl,
+                                0
+                            ) AS sl_price,
+                            COALESCE(
+                                tp1_price,
+                                tp1,
+                                0
+                            ) AS tp1_price,
+                            COALESCE(
+                                tp2_price,
+                                tp2,
+                                0
+                            ) AS tp2_price,
+                            exit_price,
+                            COALESCE(
+                                outcome,
+                                'PENDING'
+                            ) AS outcome_val
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
@@ -3591,25 +3591,7 @@ async def telegram_webhook(
                     losing_trades_count = 0
 
                     for t in trades:
-
-                        entry = float(
-                            t["entry_p"]
-                        )
-
-                        exit_p = float(
-                            t["exit_price"]
-                        )
-
-                        action = t["action"]
-
-                        diff = (
-                            exit_p - entry
-                            if action == "BUY"
-                            else entry - exit_p
-                        )
-
-                        pips = diff * 10.0
-
+                        pips, _ = compute_trade_pips(t)
                         total_pips += pips
 
                         if pips > 0:
@@ -3717,6 +3699,21 @@ async def telegram_webhook(
                                 price,
                                 0
                             ) AS entry_p,
+                            COALESCE(
+                                sl_price,
+                                sl,
+                                0
+                            ) AS sl_price,
+                            COALESCE(
+                                tp1_price,
+                                tp1,
+                                0
+                            ) AS tp1_price,
+                            COALESCE(
+                                tp2_price,
+                                tp2,
+                                0
+                            ) AS tp2_price,
                             exit_price,
                             COALESCE(
                                 outcome,
@@ -3777,19 +3774,8 @@ async def telegram_webhook(
                             )
 
                             if exit_p is not None:
-
-                                diff = (
-                                    exit_p - entry
-                                    if action == "BUY"
-                                    else entry - exit_p
-                                )
-
-                                pips = diff * 10.0
-
-                                pip_str = (
-                                    f"*{pips:+.1f} pips*"
-                                )
-
+                                pips, usd = compute_trade_pips(l)
+                                pip_str = f"*{pips:+.1f} pips* (${usd:+.2f})"
                             else:
                                 pip_str = (
                                     "*ACTIVE / IN PROGRESS*"
@@ -3865,13 +3851,31 @@ async def telegram_webhook(
                                 price,
                                 0
                             ) AS entry_p,
-                            sl_price,
+                            COALESCE(
+                                sl_price,
+                                sl,
+                                0
+                            ) AS sl_price,
+                            COALESCE(
+                                tp1_price,
+                                tp1,
+                                0
+                            ) AS tp1_price,
+                            COALESCE(
+                                tp2_price,
+                                tp2,
+                                0
+                            ) AS tp2_price,
                             exit_price,
                             COALESCE(
                                 adx_15m,
                                 0
                             ) AS adx_val,
                             trend_15m,
+                            COALESCE(
+                                outcome,
+                                'PENDING'
+                            ) AS outcome_val,
                             COALESCE(
                                 timestamp,
                                 created_at::text,
@@ -3927,6 +3931,14 @@ async def telegram_webhook(
                                 else 0.0
                             )
 
+                            tp1 = float(
+                                r["tp1_price"]
+                            )
+
+                            tp2 = float(
+                                r["tp2_price"]
+                            )
+
                             action = r["action"]
 
                             adx_val = float(
@@ -3942,6 +3954,8 @@ async def telegram_webhook(
                                 r.get("trend_15m")
                             )
 
+                            outcome = r["outcome_val"]
+
                             ts = (
                                 r["ts"]
                                 or ""
@@ -3952,7 +3966,10 @@ async def telegram_webhook(
                                     action,
                                     entry,
                                     exit_p,
-                                    sl
+                                    sl,
+                                    tp1,
+                                    tp2,
+                                    outcome
                                 )
                             )
 

@@ -507,7 +507,8 @@ def calculate_metrics_5m(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     df["atr"] = df["tr"].rolling(window=14).mean()
     return df
-
+    
+TREND_15M_MIN_SEPARATION_PCT = 0.02
 def compute_ema_trend(df: pd.DataFrame, fast: int = 9, slow: int = 20):
     if df is None or len(df) < slow + 1: return "NEUTRAL", 0.0
     ema_fast = df["close"].ewm(span=fast, adjust=False).mean()

@@ -61,6 +61,27 @@ cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 10
 LEVEL_LOOKBACK_CANDLES = 4
 
+# ==========================================================
+# MOMENTUM BREAKOUT QUALITY FILTERS
+# ==========================================================
+# These filters apply ONLY to the Momentum Breakout system.
+# Sweep + BOS logic is left unchanged.
+
+BREAKOUT_MIN_BODY_ATR_MULT = 0.50
+
+# Candle must close sufficiently close to the breakout direction.
+# BUY: close location measured from low -> high.
+# SELL: close location measured from low -> high as well,
+#       but requires the close to be near the low.
+BREAKOUT_MIN_CLOSE_LOCATION = 0.65
+
+# Prevent chasing a breakout after it has already travelled too far
+# beyond the original 5M breakout level.
+BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
+
+# Require the current candle to continue in the breakout direction.
+BREAKOUT_REQUIRE_BODY_DIRECTION = True
+
 # --- STAT-BASED VETOES ---
 STAT_VETO_ADX_THRESHOLD = 50.0
 STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
@@ -88,16 +109,8 @@ def check_stat_veto(adx_5m: float, current_hour_wib: int):
 
 
 class SignalOutput(BaseModel):
-    action: str = Field(
-        default="HOLD",
-        description="BUY, SELL, or HOLD"
-    )
-
-    confidence: float = Field(
-        default=1.0,
-        description="Confidence score between 0.0 and 1.0"
-    )
-
+    action: str = Field(default="HOLD", description="BUY, SELL, or HOLD")
+    confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0")
     reasoning: str = Field(
         default="Market conditions do not favor entry.",
         description="2 clean sentences explaining the decision"
@@ -105,7 +118,6 @@ class SignalOutput(BaseModel):
 
 
 # --- DATABASE CONNECTION & AUTO-MIGRATION INITIALIZATION ---
-
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is missing.")
@@ -118,9 +130,7 @@ def get_db_connection():
 
 def init_db():
     if not DATABASE_URL:
-        logging.warning(
-            "[WARNING] DATABASE_URL not set. Database logging disabled."
-        )
+        logging.warning("[WARNING] DATABASE_URL not set. Database logging disabled.")
         return
 
     try:
@@ -148,13 +158,7 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp2 REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp2_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS confidence REAL;",
-
-            # Correct ADX naming:
-            # adx_5m  = actual 5M ADX
-            # adx_15m = actual 15M ADX
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m REAL;",
-
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS stoch_rsi_15m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS divergence_type TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS reasoning TEXT;",
@@ -162,52 +166,18 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS exit_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome_timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_15m TEXT;",
-
-            # Legacy column retained temporarily so existing databases
-            # can migrate their historical 15M ADX values safely.
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;"
         ]
 
         for query in migrations:
             cursor.execute(query)
 
-        # ----------------------------------------------------------
-        # ADX COLUMN MIGRATION
-        #
-        # Previous schema:
-        #   adx_15m      = actually 5M ADX
-        #   adx_15m_true = actually 15M ADX
-        #
-        # Correct schema:
-        #   adx_5m  = 5M ADX
-        #   adx_15m = 15M ADX
-        #
-        # Historical data is copied only where appropriate.
-        # ----------------------------------------------------------
-
-        cursor.execute("""
-            UPDATE signals
-            SET adx_5m = adx_15m
-            WHERE adx_5m IS NULL
-              AND adx_15m IS NOT NULL;
-        """)
-
-        cursor.execute("""
-            UPDATE signals
-            SET adx_15m = adx_15m_true
-            WHERE adx_15m_true IS NOT NULL
-              AND (
-                  adx_15m IS NULL
-                  OR adx_15m = adx_5m
-              );
-        """)
-
         conn.commit()
         cursor.close()
         conn.close()
 
         logging.info(
-            "[NEON DATABASE] Full schema verified and ADX columns migrated."
+            "[NEON DATABASE] Full schema verified and missing columns auto-migrated."
         )
 
     except Exception as e:
@@ -225,12 +195,12 @@ def log_trade_signal(
     tp1: float,
     tp2: float,
     confidence: float,
-    adx_5m: float,
+    adx_15m: float,
     stoch_rsi_15m: float,
     divergence_type: str,
     reasoning: str,
     trend_15m: str = None,
-    adx_15m: float = None
+    adx_15m_true: float = None
 ):
     if not DATABASE_URL:
         return None
@@ -248,18 +218,8 @@ def log_trade_signal(
         tp1_val = float(tp1) if tp1 is not None else 0.0
         tp2_val = float(tp2) if tp2 is not None else 0.0
         conf_val = float(confidence) if confidence is not None else 0.0
-
-        adx_5m_val = (
-            float(adx_5m)
-            if adx_5m is not None
-            else 0.0
-        )
-
-        stoch_val = (
-            float(stoch_rsi_15m)
-            if stoch_rsi_15m is not None
-            else 0.0
-        )
+        adx_val = float(adx_15m) if adx_15m is not None else 0.0
+        stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
 
         trend_15m_val = (
             str(trend_15m)
@@ -267,9 +227,9 @@ def log_trade_signal(
             else None
         )
 
-        adx_15m_val = (
-            float(adx_15m)
-            if adx_15m is not None
+        adx_15m_true_val = (
+            float(adx_15m_true)
+            if adx_15m_true is not None
             else None
         )
 
@@ -288,20 +248,20 @@ def log_trade_signal(
                 tp2,
                 tp2_price,
                 confidence,
-                adx_5m,
+                adx_15m,
                 stoch_rsi_15m,
                 divergence_type,
                 reasoning,
                 outcome,
                 outcome_timestamp,
                 trend_15m,
-                adx_15m,
+                adx_15m_true,
                 created_at
             )
             VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, NOW()
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, NOW()
             )
             RETURNING id;
         """, (
@@ -318,18 +278,17 @@ def log_trade_signal(
             tp2_val,
             tp2_val,
             conf_val,
-            adx_5m_val,
+            adx_val,
             stoch_val,
             str(divergence_type),
             str(reasoning),
             "PENDING",
             "",
             trend_15m_val,
-            adx_15m_val
+            adx_15m_true_val
         ))
 
         inserted_row = cursor.fetchone()
-
         new_id = (
             inserted_row["id"]
             if inserted_row and "id" in inserted_row
@@ -342,8 +301,7 @@ def log_trade_signal(
 
         logging.info(
             f"[NEON DB LOGGED] Signal ID #{new_id} | "
-            f"Status: {status} | Action: {action} | "
-            f"Price: ${price_val:.2f}"
+            f"Status: {status} | Action: {action} | Price: ${price_val:.2f}"
         )
 
         return new_id
@@ -356,7 +314,6 @@ def log_trade_signal(
 
 
 # --- TWO-STAGE TP TRACKING FUNCTION ---
-
 def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
         return
@@ -424,7 +381,6 @@ def update_open_trades(current_high: float, current_low: float):
             if action == "BUY":
 
                 if current_outcome == "WIN (TP1 HIT)":
-
                     if tp2 > 0 and c_high >= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
@@ -448,7 +404,6 @@ def update_open_trades(current_high: float, current_low: float):
             elif action == "SELL":
 
                 if current_outcome == "WIN (TP1 HIT)":
-
                     if tp2 > 0 and c_low <= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
@@ -500,7 +455,6 @@ def update_open_trades(current_high: float, current_low: float):
 
 
 # --- MARKET DATA FETCHING ---
-
 async def fetch_timeframe_data(
     client: httpx.AsyncClient,
     timeframe: str,
@@ -544,7 +498,6 @@ async def fetch_timeframe_data(
 
 
 # --- INDICATOR CALCULATIONS ---
-
 def calculate_metrics_m1(df: pd.DataFrame):
     df = df.tail(100).copy()
 
@@ -638,17 +591,15 @@ def compute_ema_trend(
     if df is None or len(df) < slow + 1:
         return "NEUTRAL", 0.0
 
-    ema_fast = (
-        df["close"]
-        .ewm(span=fast, adjust=False)
-        .mean()
-    )
+    ema_fast = df["close"].ewm(
+        span=fast,
+        adjust=False
+    ).mean()
 
-    ema_slow = (
-        df["close"]
-        .ewm(span=slow, adjust=False)
-        .mean()
-    )
+    ema_slow = df["close"].ewm(
+        span=slow,
+        adjust=False
+    ).mean()
 
     last_fast = float(ema_fast.iloc[-1])
     last_slow = float(ema_slow.iloc[-1])
@@ -672,21 +623,20 @@ def compute_ema_trend(
 
 
 # --- STRATEGIES ---
-
 def detect_liquidity_sweep_structure(
     df_1m: pd.DataFrame,
     df_5m: pd.DataFrame
 ):
     recent_high = float(
-        df_5m["high"]
-        .iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1]
-        .max()
+        df_5m[
+            "high"
+        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
     )
 
     recent_low = float(
-        df_5m["low"]
-        .iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1]
-        .min()
+        df_5m[
+            "low"
+        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
     )
 
     prev = df_1m.iloc[-2]
@@ -734,49 +684,332 @@ def detect_liquidity_sweep_structure(
     )
 
 
+# ==========================================================
+# IMPROVED MOMENTUM BREAKOUT DETECTION
+# ==========================================================
 def detect_breakout_continuation(
     df_1m: pd.DataFrame,
     df_5m: pd.DataFrame
 ):
+    """
+    Momentum breakout detector.
+
+    Improvements over the original version:
+    1. Requires two consecutive closes beyond the 5M level.
+    2. Requires meaningful M1 body displacement relative to ATR.
+    3. Requires the breakout candle to close strongly in the
+       breakout direction.
+    4. Prevents chasing an already-overextended breakout.
+    5. Keeps the existing 5M reference-level logic intact.
+
+    This function does NOT change:
+    - Sweep + BOS
+    - Pullback system
+    - 15M bias
+    - AI filtering
+    - Stat vetoes
+    - API frequency
+    """
+
     recent_high = float(
-        df_5m["high"]
-        .iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1]
-        .max()
+        df_5m[
+            "high"
+        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
     )
 
     recent_low = float(
-        df_5m["low"]
-        .iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1]
-        .min()
+        df_5m[
+            "low"
+        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
     )
 
     prev = df_1m.iloc[-2]
     curr = df_1m.iloc[-1]
 
-    bullish_breakout = bool(
+    # ------------------------------------------------------
+    # Current M1 ATR
+    # ------------------------------------------------------
+    raw_atr = (
+        df_1m["atr"].iloc[-1]
+        if "atr" in df_1m.columns
+        else np.nan
+    )
+
+    if pd.isna(raw_atr) or float(raw_atr) <= 0:
+        atr_1m = None
+    else:
+        atr_1m = float(raw_atr)
+
+    # ------------------------------------------------------
+    # Candle measurements
+    # ------------------------------------------------------
+    curr_open = float(curr["open"])
+    curr_high = float(curr["high"])
+    curr_low = float(curr["low"])
+    curr_close = float(curr["close"])
+
+    candle_range = curr_high - curr_low
+    candle_body = abs(curr_close - curr_open)
+
+    if candle_range > 0:
+        close_location = (
+            (curr_close - curr_low)
+            / candle_range
+        )
+    else:
+        close_location = 0.5
+
+    # ------------------------------------------------------
+    # Breakout direction
+    # ------------------------------------------------------
+    bullish_breakout_structure = bool(
         prev["close"] > recent_high
         and curr["close"] > recent_high
         and curr["close"] > prev["close"]
     )
 
-    bearish_breakout = bool(
+    bearish_breakout_structure = bool(
         prev["close"] < recent_low
         and curr["close"] < recent_low
         and curr["close"] < prev["close"]
     )
 
-    if bullish_breakout:
+    # ------------------------------------------------------
+    # If neither structural breakout exists, stop here.
+    # ------------------------------------------------------
+    if not bullish_breakout_structure and not bearish_breakout_structure:
         return (
-            "BUY",
-            "Breakout Continuation (Bullish)",
+            "HOLD",
+            "No setup",
             recent_high,
             recent_low
         )
 
-    if bearish_breakout:
+    # ------------------------------------------------------
+    # ATR must be available for quality validation.
+    # If unavailable, do not manufacture a breakout.
+    # ------------------------------------------------------
+    if atr_1m is None:
+        logging.info(
+            "[MOMENTUM BREAKOUT] Breakout structure detected "
+            "but M1 ATR unavailable. Waiting for valid ATR."
+        )
+
+        return (
+            "HOLD",
+            "Breakout rejected: M1 ATR unavailable",
+            recent_high,
+            recent_low
+        )
+
+    # ======================================================
+    # BULLISH BREAKOUT
+    # ======================================================
+    if bullish_breakout_structure:
+
+        # 1. Candle must actually be bullish.
+        body_direction_ok = (
+            curr_close > curr_open
+            if BREAKOUT_REQUIRE_BODY_DIRECTION
+            else True
+        )
+
+        # 2. Body displacement must be meaningful.
+        body_strength_ok = (
+            candle_body
+            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
+        )
+
+        # 3. Close must be toward the upper portion
+        #    of the breakout candle.
+        close_quality_ok = (
+            close_location
+            >= BREAKOUT_MIN_CLOSE_LOCATION
+        )
+
+        # 4. Prevent chasing a breakout that has already
+        #    travelled too far above the original level.
+        extension_from_level = (
+            curr_close - recent_high
+        )
+
+        extension_ok = (
+            extension_from_level
+            <= BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
+        )
+
+        if not body_direction_ok:
+            return (
+                "HOLD",
+                "Breakout rejected: bullish candle direction weak",
+                recent_high,
+                recent_low
+            )
+
+        if not body_strength_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
+                f"body ${candle_body:.2f} < "
+                f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}x ATR "
+                f"(${atr_1m:.2f})"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: insufficient displacement",
+                recent_high,
+                recent_low
+            )
+
+        if not close_quality_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
+                f"close location {close_location:.2f} "
+                f"< {BREAKOUT_MIN_CLOSE_LOCATION:.2f}"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: weak candle close",
+                recent_high,
+                recent_low
+            )
+
+        if not extension_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bullish breakout rejected: "
+                f"extension ${extension_from_level:.2f} > "
+                f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR "
+                f"(${atr_1m:.2f})"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: overextended",
+                recent_high,
+                recent_low
+            )
+
+        logging.info(
+            f"[MOMENTUM BREAKOUT] VALID BUY | "
+            f"Level ${recent_high:.2f} | "
+            f"Close ${curr_close:.2f} | "
+            f"Body ${candle_body:.2f} | "
+            f"ATR ${atr_1m:.2f} | "
+            f"Body/ATR {(candle_body / atr_1m):.2f} | "
+            f"CloseLocation {close_location:.2f} | "
+            f"Extension ${extension_from_level:.2f}"
+        )
+
+        return (
+            "BUY",
+            "Momentum Breakout Continuation (Bullish)",
+            recent_high,
+            recent_low
+        )
+
+    # ======================================================
+    # BEARISH BREAKOUT
+    # ======================================================
+    if bearish_breakout_structure:
+
+        # 1. Candle must actually be bearish.
+        body_direction_ok = (
+            curr_close < curr_open
+            if BREAKOUT_REQUIRE_BODY_DIRECTION
+            else True
+        )
+
+        # 2. Body displacement must be meaningful.
+        body_strength_ok = (
+            candle_body
+            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
+        )
+
+        # 3. Close must be toward the lower portion
+        #    of the breakout candle.
+        close_quality_ok = (
+            close_location
+            <= (1.0 - BREAKOUT_MIN_CLOSE_LOCATION)
+        )
+
+        # 4. Prevent chasing a breakout that has already
+        #    travelled too far below the original level.
+        extension_from_level = (
+            recent_low - curr_close
+        )
+
+        extension_ok = (
+            extension_from_level
+            <= BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
+        )
+
+        if not body_direction_ok:
+            return (
+                "HOLD",
+                "Breakout rejected: bearish candle direction weak",
+                recent_high,
+                recent_low
+            )
+
+        if not body_strength_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
+                f"body ${candle_body:.2f} < "
+                f"{BREAKOUT_MIN_BODY_ATR_MULT:.2f}x ATR "
+                f"(${atr_1m:.2f})"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: insufficient displacement",
+                recent_high,
+                recent_low
+            )
+
+        if not close_quality_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
+                f"close location {close_location:.2f} "
+                f"> {(1.0 - BREAKOUT_MIN_CLOSE_LOCATION):.2f}"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: weak candle close",
+                recent_high,
+                recent_low
+            )
+
+        if not extension_ok:
+            logging.info(
+                f"[MOMENTUM BREAKOUT] Bearish breakout rejected: "
+                f"extension ${extension_from_level:.2f} > "
+                f"{BREAKOUT_MAX_EXTENSION_ATR_MULT:.2f}x ATR "
+                f"(${atr_1m:.2f})"
+            )
+
+            return (
+                "HOLD",
+                "Breakout rejected: overextended",
+                recent_high,
+                recent_low
+            )
+
+        logging.info(
+            f"[MOMENTUM BREAKOUT] VALID SELL | "
+            f"Level ${recent_low:.2f} | "
+            f"Close ${curr_close:.2f} | "
+            f"Body ${candle_body:.2f} | "
+            f"ATR ${atr_1m:.2f} | "
+            f"Body/ATR {(candle_body / atr_1m):.2f} | "
+            f"CloseLocation {close_location:.2f} | "
+            f"Extension ${extension_from_level:.2f}"
+        )
+
         return (
             "SELL",
-            "Breakout Continuation (Bearish)",
+            "Momentum Breakout Continuation (Bearish)",
             recent_high,
             recent_low
         )
@@ -791,7 +1024,6 @@ def detect_breakout_continuation(
 
 CONSOLIDATION_LOOKBACK_5M = 8
 CONSOLIDATION_MAX_RANGE_ATR_MULT = 1.5
-BREAKOUT_MIN_BODY_ATR_MULT = 0.5
 
 
 def detect_consolidation_breakout(
@@ -808,15 +1040,12 @@ def detect_consolidation_breakout(
         -(CONSOLIDATION_LOOKBACK_5M + 1):-1
     ]
 
-    bracket_high = float(
-        bracket["high"].max()
-    )
+    bracket_high = float(bracket["high"].max())
+    bracket_low = float(bracket["low"].min())
 
-    bracket_low = float(
-        bracket["low"].min()
+    bracket_range = (
+        bracket_high - bracket_low
     )
-
-    bracket_range = bracket_high - bracket_low
 
     atr_5m = df_5m["atr"].iloc[-1]
 
@@ -860,10 +1089,7 @@ def detect_consolidation_breakout(
     strong_candle = (
         bool(
             candle_body
-            >= (
-                BREAKOUT_MIN_BODY_ATR_MULT
-                * atr_1m
-            )
+            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
         )
         if atr_1m and not pd.isna(atr_1m)
         else True
@@ -906,7 +1132,6 @@ def detect_consolidation_breakout(
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
-
 def compute_r_multiple(
     action: str,
     entry: float,
@@ -920,14 +1145,12 @@ def compute_r_multiple(
 
     if action == "BUY":
         return (
-            (exit_price - entry)
-            / risk_dist
-        )
+            exit_price - entry
+        ) / risk_dist
 
     return (
-        (entry - exit_price)
-        / risk_dist
-    )
+        entry - exit_price
+    ) / risk_dist
 
 
 def bucket_adx(adx: float) -> str:
@@ -968,6 +1191,7 @@ def bucket_session(timestamp_str: str) -> str:
             .split(" ")[1]
             .split(":")[0]
         )
+
     except Exception:
         return "Unknown"
 
@@ -1016,28 +1240,23 @@ def format_performance_segment(
         n = len(r_values)
 
         wins = sum(
-            1
-            for r in r_values
-            if r > 0
+            1 for r in r_values if r > 0
         )
 
         win_rate = (
             wins / n * 100
-            if n
-            else 0.0
-        )
+        ) if n else 0.0
 
         avg_r = (
             sum(r_values) / n
-            if n
-            else 0.0
-        )
+        ) if n else 0.0
 
         flag = ""
 
         if n >= min_sample_to_flag:
             if win_rate < 35:
                 flag = " ⚠️ underperforming"
+
             elif win_rate > 65:
                 flag = " ✅ strong"
 
@@ -1095,21 +1314,10 @@ def check_pullback_entry(
     curr_candle
 ) -> bool:
 
-    candle_low = float(
-        curr_candle["low"]
-    )
-
-    candle_high = float(
-        curr_candle["high"]
-    )
-
-    candle_open = float(
-        curr_candle["open"]
-    )
-
-    candle_close = float(
-        curr_candle["close"]
-    )
+    candle_low = float(curr_candle["low"])
+    candle_high = float(curr_candle["high"])
+    candle_open = float(curr_candle["open"])
+    candle_close = float(curr_candle["close"])
 
     overlaps_zone = (
         candle_high >= zone_lower
@@ -1122,12 +1330,10 @@ def check_pullback_entry(
     if action == "BUY":
         return candle_close > candle_open
 
-    else:
-        return candle_close < candle_open
+    return candle_close < candle_open
 
 
 # --- TELEGRAM NOTIFICATIONS ---
-
 async def send_telegram_alert(
     client: httpx.AsyncClient,
     text: str,
@@ -1135,8 +1341,7 @@ async def send_telegram_alert(
 ):
     chat_id = "".join(
         str(
-            target_chat_id
-            or TELEGRAM_CHAT_ID
+            target_chat_id or TELEGRAM_CHAT_ID
         ).split()
     )
 
@@ -1180,10 +1385,11 @@ async def send_telegram_alert(
                     f"[TELEGRAM SENT] Delivered plain text "
                     f"to Chat ID {chat_id}"
                 )
+
             else:
                 logging.error(
-                    f"[TELEGRAM ERROR] Failed sending message: "
-                    f"{res_plain.text}"
+                    f"[TELEGRAM ERROR] "
+                    f"Failed sending message: {res_plain.text}"
                 )
 
         else:
@@ -1199,7 +1405,6 @@ async def send_telegram_alert(
 
 
 # --- AI ANALYST EVALUATION ---
-
 async def analyze_signal_with_ai(
     proposed_action: str,
     trigger_type: str,
@@ -1209,13 +1414,11 @@ async def analyze_signal_with_ai(
     recent_high: float,
     recent_low: float,
     trend_15m: str = "NEUTRAL",
-    adx_15m: float = 0.0
+    adx_15m_true: float = 0.0
 ):
-
     is_breakout = "Breakout" in trigger_type
 
     if is_breakout:
-
         strategy_label = (
             "Breakout Continuation "
             "(trend-following momentum entry)"
@@ -1231,7 +1434,6 @@ async def analyze_signal_with_ai(
         )
 
     else:
-
         strategy_label = (
             "Liquidity Sweep + Break-of-Structure "
             "(reversal entry)"
@@ -1239,15 +1441,15 @@ async def analyze_signal_with_ai(
 
         veto_rules_text = (
             "- VETO if 5M ADX is above 45.0 "
-            "(indicating an extreme unstoppable runaway "
-            "trend that destroys mean-reversion setups).\n"
+            "(indicating an extreme unstoppable runaway trend "
+            "that destroys mean-reversion setups).\n"
             "- VETO if 5M ADX is below 12.0 "
             "(indicating dead market liquidity)."
         )
 
     confluence_text = (
         f"4. 15-Minute Trend: {trend_15m} "
-        f"(EMA9/EMA20, ADX={adx_15m:.1f}). "
+        f"(EMA9/EMA20, ADX={adx_15m_true:.1f}). "
         f"This is a SOFT input, not a hard rule -- "
         f"weigh it as confluence, don't auto-veto on it alone."
     )
@@ -1288,7 +1490,6 @@ Respond strictly in valid JSON matching schema:
 """
 
     if GROQ_API_KEY:
-
         try:
             res = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -1305,9 +1506,7 @@ Respond strictly in valid JSON matching schema:
             )
 
             data = json.loads(
-                res.choices[0]
-                .message
-                .content
+                res.choices[0].message.content
             )
 
             return SignalOutput(**data)
@@ -1319,7 +1518,6 @@ Respond strictly in valid JSON matching schema:
             )
 
     if GEMINI_API_KEY:
-
         try:
             res = genai_client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -1344,16 +1542,14 @@ Respond strictly in valid JSON matching schema:
         action=proposed_action,
         confidence=0.7,
         reasoning=(
-            "Fallback: Executed on pure "
-            "liquidity sweep + structure break alignment."
+            "Fallback: Executed on pure liquidity sweep "
+            "+ structure break alignment."
         )
     )
 
 
 # --- BACKGROUND SCANNING LOOP ---
-
 async def background_scanning_loop():
-
     global SYSTEM_TRADING_ENABLED
 
     async with httpx.AsyncClient(
@@ -1362,14 +1558,11 @@ async def background_scanning_loop():
     ) as client:
 
         while True:
-
             try:
-
                 if not SYSTEM_TRADING_ENABLED:
-
                     logging.info(
-                        "[PAUSED] System trading currently "
-                        "paused via kill-switch. Skipping scan."
+                        "[PAUSED] System trading currently paused "
+                        "via kill-switch. Skipping scan."
                     )
 
                     await asyncio.sleep(60)
@@ -1387,7 +1580,6 @@ async def background_scanning_loop():
                 )
 
                 if not active_session:
-
                     logging.info(
                         f"[SLEEP MODE] WIB Time: "
                         f"{now_wib.strftime('%H:%M')} | "
@@ -1401,7 +1593,8 @@ async def background_scanning_loop():
                 logging.info(
                     f"[ACTIVE SCAN] WIB Time: "
                     f"{now_wib.strftime('%H:%M')} | "
-                    f"Scanning for Liquidity Sweep + Structure Break..."
+                    f"Scanning for Liquidity Sweep + "
+                    f"Structure Break..."
                 )
 
                 df_1m = await fetch_timeframe_data(
@@ -1415,7 +1608,6 @@ async def background_scanning_loop():
                 )
 
                 if df_1m is None or df_5m is None:
-
                     logging.warning(
                         "Failed to fetch M1/M5 candles. "
                         "Retrying next cycle."
@@ -1424,38 +1616,24 @@ async def background_scanning_loop():
                     await asyncio.sleep(120)
                     continue
 
-                if (
-                    len(df_1m) < 3
-                    or len(df_5m) < 6
-                ):
-
+                if len(df_1m) < 3 or len(df_5m) < 6:
                     logging.warning(
-                        "Insufficient candle history "
-                        "for sweep/BOS detection. "
-                        "Retrying next cycle."
+                        "Insufficient candle history for "
+                        "sweep/BOS detection. Retrying next cycle."
                     )
 
                     await asyncio.sleep(120)
                     continue
 
-                df_1m = calculate_metrics_m1(
-                    df_1m
-                )
-
-                df_5m = calculate_metrics_5m(
-                    df_5m
-                )
+                df_1m = calculate_metrics_m1(df_1m)
+                df_5m = calculate_metrics_5m(df_5m)
 
                 curr_high = float(
-                    df_1m["high"]
-                    .tail(3)
-                    .max()
+                    df_1m["high"].tail(3).max()
                 )
 
                 curr_low = float(
-                    df_1m["low"]
-                    .tail(3)
-                    .min()
+                    df_1m["low"].tail(3).min()
                 )
 
                 update_open_trades(
@@ -1467,15 +1645,13 @@ async def background_scanning_loop():
                     df_1m["close"].iloc[-1]
                 )
 
-                adx_5m = float(
-                    df_5m["adx"].iloc[-1]
-                ) if not pd.isna(
-                    df_5m["adx"].iloc[-1]
-                ) else 0.0
-
-                # --------------------------------------------------
-                # 15M CACHE
-                # --------------------------------------------------
+                adx_5m = (
+                    float(df_5m["adx"].iloc[-1])
+                    if not pd.isna(
+                        df_5m["adx"].iloc[-1]
+                    )
+                    else 0.0
+                )
 
                 global cached_15m
 
@@ -1492,7 +1668,6 @@ async def background_scanning_loop():
                 )
 
                 if need_refresh:
-
                     df_15m_raw = await fetch_timeframe_data(
                         client,
                         "15min"
@@ -1502,7 +1677,6 @@ async def background_scanning_loop():
                         df_15m_raw is not None
                         and len(df_15m_raw) >= 21
                     ):
-
                         cached_15m["df"] = (
                             calculate_metrics_5m(
                                 df_15m_raw
@@ -1514,7 +1688,6 @@ async def background_scanning_loop():
                         )
 
                     else:
-
                         logging.warning(
                             "[15M CONFLUENCE] Fetch failed "
                             "or insufficient candles -- "
@@ -1529,7 +1702,7 @@ async def background_scanning_loop():
                     else ("NEUTRAL", 0.0)
                 )
 
-                adx_15m = (
+                adx_15m_true = (
                     float(
                         cached_15m["df"]["adx"].iloc[-1]
                     )
@@ -1546,21 +1719,20 @@ async def background_scanning_loop():
 
                 proposed_action = "HOLD"
                 trigger_type = "None"
+
                 recent_high = 0.0
                 recent_low = 0.0
                 status_note = ""
 
                 # ==================================================
-                # STAGE 2: PULLBACK CONFIRMATION
+                # STAGE 2: Pullback confirmation check
                 # ==================================================
-
                 if pending_setup is not None:
 
                     if (
                         datetime.now(timezone.utc)
                         > pending_setup["expires"]
                     ):
-
                         logging.info(
                             f"[PULLBACK EXPIRED] "
                             f"{pending_setup['action']} setup "
@@ -1571,7 +1743,6 @@ async def background_scanning_loop():
                         pending_setup = None
 
                     else:
-
                         curr_candle = df_1m.iloc[-1]
 
                         confirmed = check_pullback_entry(
@@ -1590,7 +1761,6 @@ async def background_scanning_loop():
                         )
 
                         if confirmed:
-
                             proposed_action = (
                                 pending_setup["action"]
                             )
@@ -1603,7 +1773,6 @@ async def background_scanning_loop():
                             pending_setup = None
 
                         else:
-
                             b_action, b_trigger_type, b_recent_high, b_recent_low = (
                                 detect_breakout_continuation(
                                     df_1m,
@@ -1620,7 +1789,6 @@ async def background_scanning_loop():
                                     b_action
                                     == pending_setup["action"]
                                 ):
-
                                     proposed_action = b_action
 
                                     trigger_type = (
@@ -1640,7 +1808,6 @@ async def background_scanning_loop():
                                     pending_setup = None
 
                                 else:
-
                                     invalidated_action = (
                                         pending_setup["action"]
                                     )
@@ -1679,18 +1846,15 @@ async def background_scanning_loop():
                                     pending_setup = None
 
                             else:
-
                                 status_note = (
                                     f" | Awaiting pullback into "
-                                    f"${pending_setup['zone_lower']:.2f}"
-                                    f"-"
+                                    f"${pending_setup['zone_lower']:.2f}-"
                                     f"${pending_setup['zone_upper']:.2f}"
                                 )
 
                 # ==================================================
-                # STAGE 1: FRESH SWEEP + BOS CHECK
+                # STAGE 1: Fresh Sweep + BOS Check
                 # ==================================================
-
                 if (
                     pending_setup is None
                     and proposed_action == "HOLD"
@@ -1712,40 +1876,22 @@ async def background_scanning_loop():
                         prev_candle = df_1m.iloc[-2]
                         curr_candle = df_1m.iloc[-1]
 
-                        # --------------------------------------------------
-                        # CORRECT MEASURED IMPULSE
-                        #
-                        # BUY:
-                        #   impulse starts at sweep low
-                        #   and ends at BOS candle HIGH.
-                        #
-                        # SELL:
-                        #   impulse starts at sweep high
-                        #   and ends at BOS candle LOW.
-                        #
-                        # This uses the actual wick extremes of the
-                        # two-candle sweep/BOS structure instead of using
-                        # the BOS candle close as the impulse endpoint.
-                        # --------------------------------------------------
-
                         if new_action == "BUY":
-
                             swing_low = float(
                                 prev_candle["low"]
                             )
 
                             swing_high = float(
-                                curr_candle["high"]
+                                curr_candle["close"]
                             )
 
                         else:
-
                             swing_high = float(
                                 prev_candle["high"]
                             )
 
                             swing_low = float(
-                                curr_candle["low"]
+                                curr_candle["close"]
                             )
 
                         zone_lower, zone_upper = (
@@ -1757,7 +1903,6 @@ async def background_scanning_loop():
                         )
 
                         if zone_lower is not None:
-
                             pending_setup = {
                                 "action": new_action,
                                 "trigger_type": new_trigger_type,
@@ -1778,15 +1923,13 @@ async def background_scanning_loop():
                                 f" | New {new_action} setup "
                                 f"({new_trigger_type}) armed, "
                                 f"awaiting pullback into "
-                                f"${zone_lower:.2f}"
-                                f"-"
+                                f"${zone_lower:.2f}-"
                                 f"${zone_upper:.2f}"
                             )
 
                 # ==================================================
-                # STAGE 1b: CONSOLIDATION BRACKET BREAKOUT
+                # STAGE 1b: Consolidation bracket breakout
                 # ==================================================
-
                 if (
                     pending_setup is None
                     and proposed_action == "HOLD"
@@ -1803,7 +1946,6 @@ async def background_scanning_loop():
                     if c_action != "HOLD":
 
                         if adx_5m >= 20.0:
-
                             proposed_action = c_action
                             trigger_type = c_trigger_type
 
@@ -1816,7 +1958,6 @@ async def background_scanning_loop():
                             )
 
                         else:
-
                             status_note = (
                                 f" | Bracket breakout seen "
                                 f"but 5M ADX {adx_5m:.1f} "
@@ -1824,9 +1965,8 @@ async def background_scanning_loop():
                             )
 
                 # ==================================================
-                # STAGE 1c: MOMENTUM BREAKOUT CONTINUATION
+                # STAGE 1c: Improved Momentum breakout continuation
                 # ==================================================
-
                 if (
                     pending_setup is None
                     and proposed_action == "HOLD"
@@ -1843,7 +1983,6 @@ async def background_scanning_loop():
                     if b_action != "HOLD":
 
                         if adx_5m >= 20.0:
-
                             proposed_action = b_action
                             trigger_type = b_trigger_type
 
@@ -1856,7 +1995,6 @@ async def background_scanning_loop():
                             )
 
                         else:
-
                             status_note = (
                                 f" | Breakout seen but "
                                 f"5M ADX {adx_5m:.1f} "
@@ -1864,9 +2002,8 @@ async def background_scanning_loop():
                             )
 
                 # ==================================================
-                # STAT-VETO CHECK
+                # Stat-Veto Check
                 # ==================================================
-
                 if proposed_action != "HOLD":
 
                     stat_vetoed, stat_veto_reason = (
@@ -1901,13 +2038,11 @@ async def background_scanning_loop():
                         proposed_action = "HOLD"
 
                 # ==================================================
-                # LOSS-COOLDOWN CHECK
+                # Loss-cooldown Check
                 # ==================================================
-
                 if proposed_action != "HOLD":
 
                     try:
-
                         conn = get_db_connection()
                         cursor = conn.cursor()
 
@@ -1934,16 +2069,13 @@ async def background_scanning_loop():
                             )
                         ):
 
-                            ts_str = (
-                                str(
-                                    last_loss[
-                                        "outcome_timestamp"
-                                    ]
-                                )
-                                .replace(
-                                    " WIB",
-                                    ""
-                                )
+                            ts_str = str(
+                                last_loss[
+                                    "outcome_timestamp"
+                                ]
+                            ).replace(
+                                " WIB",
+                                ""
                             )
 
                             last_loss_time = (
@@ -1961,14 +2093,14 @@ async def background_scanning_loop():
                             ).total_seconds() / 60.0
 
                             if (
-                                0
-                                <= minutes_since_loss
+                                0 <= minutes_since_loss
                                 < LOSS_COOLDOWN_MINUTES
                             ):
 
                                 logging.info(
                                     f"[LOSS COOLDOWN] "
-                                    f"Skipping {proposed_action}: "
+                                    f"Skipping "
+                                    f"{proposed_action}: "
                                     f"{minutes_since_loss:.1f} "
                                     f"min since last SL hit "
                                     f"(< {LOSS_COOLDOWN_MINUTES} "
@@ -1978,20 +2110,17 @@ async def background_scanning_loop():
                                 proposed_action = "HOLD"
 
                     except Exception as lc_err:
-
                         logging.error(
                             f"[LOSS COOLDOWN ERROR] "
                             f"{lc_err}"
                         )
 
                 # ==================================================
-                # COOLDOWN DISTANCE CHECK
+                # Cooldown Distance Check
                 # ==================================================
-
                 if proposed_action != "HOLD":
 
                     try:
-
                         conn = get_db_connection()
                         cursor = conn.cursor()
 
@@ -2001,7 +2130,7 @@ async def background_scanning_loop():
                                     entry_price,
                                     price,
                                     0
-                                ) as entry_p,
+                                ) AS entry_p,
                                 outcome
                             FROM signals
                             WHERE status = 'EXECUTED'
@@ -2047,7 +2176,8 @@ async def background_scanning_loop():
 
                                 logging.info(
                                     f"[SCALP COOLDOWN] "
-                                    f"Skipping {proposed_action}: "
+                                    f"Skipping "
+                                    f"{proposed_action}: "
                                     f"Price within "
                                     f"${required_distance:.2f} "
                                     f"of previous trade at "
@@ -2057,16 +2187,14 @@ async def background_scanning_loop():
                                 proposed_action = "HOLD"
 
                     except Exception as cd_err:
-
                         logging.error(
                             f"[COOLDOWN ERROR] "
                             f"{cd_err}"
                         )
 
                 # ==================================================
-                # FINAL SIGNAL PROCESSING
+                # FINAL DECISION
                 # ==================================================
-
                 if proposed_action == "HOLD":
 
                     logging.info(
@@ -2074,17 +2202,16 @@ async def background_scanning_loop():
                         f"Price: ${curr_price:.2f} | "
                         f"5M Swept High: ${recent_high:.2f} | "
                         f"5M Swept Low: ${recent_low:.2f} | "
-                        f"Status: HOLD"
-                        f"{status_note}"
+                        f"Status: HOLD{status_note}"
                     )
 
                 else:
 
                     logging.info(
-                        f"[MARKET SCAN] "
-                        f"Triggered {proposed_action} "
-                        f"({trigger_type}) "
-                        f"at ${curr_price:.2f}. "
+                        f"[MARKET SCAN] Triggered "
+                        f"{proposed_action} "
+                        f"({trigger_type}) at "
+                        f"${curr_price:.2f}. "
                         f"Running AI Analysis..."
                     )
 
@@ -2098,7 +2225,7 @@ async def background_scanning_loop():
                             recent_high,
                             recent_low,
                             trend_15m,
-                            adx_15m
+                            adx_15m_true
                         )
                     )
 
@@ -2118,8 +2245,7 @@ async def background_scanning_loop():
                     )
 
                     is_breakout_trigger = (
-                        "Breakout"
-                        in trigger_type
+                        "Breakout" in trigger_type
                     )
 
                     tp1_r_mult = 1.5
@@ -2132,44 +2258,45 @@ async def background_scanning_loop():
 
                     if proposed_action == "BUY":
 
-                        sl_price = float(
-                            curr_price - risk
+                        sl_price = (
+                            float(curr_price - risk)
                         )
 
-                        tp1_price = float(
-                            curr_price
-                            + risk * tp1_r_mult
+                        tp1_price = (
+                            float(
+                                curr_price
+                                + risk * tp1_r_mult
+                            )
                         )
 
-                        tp2_price = float(
-                            curr_price
-                            + risk * tp2_r_mult
+                        tp2_price = (
+                            float(
+                                curr_price
+                                + risk * tp2_r_mult
+                            )
                         )
 
                     else:
 
-                        sl_price = float(
-                            curr_price + risk
+                        sl_price = (
+                            float(curr_price + risk)
                         )
 
-                        tp1_price = float(
-                            curr_price
-                            - risk * tp1_r_mult
+                        tp1_price = (
+                            float(
+                                curr_price
+                                - risk * tp1_r_mult
+                            )
                         )
 
-                        tp2_price = float(
-                            curr_price
-                            - risk * tp2_r_mult
+                        tp2_price = (
+                            float(
+                                curr_price
+                                - risk * tp2_r_mult
+                            )
                         )
 
-                    # ==================================================
-                    # AI APPROVAL
-                    # ==================================================
-
-                    if (
-                        ai_decision.action
-                        == proposed_action
-                    ):
+                    if ai_decision.action == proposed_action:
 
                         new_id = log_trade_signal(
                             "EXECUTED",
@@ -2187,7 +2314,7 @@ async def background_scanning_loop():
                             "None",
                             ai_decision.reasoning,
                             trend_15m,
-                            adx_15m
+                            adx_15m_true
                         )
 
                         id_tag = (
@@ -2222,13 +2349,9 @@ async def background_scanning_loop():
                             f"*{header_label}{id_tag}*\n\n"
 
                             f"Asset: *XAUUSD (Gold Spot)*\n"
-
                             f"Action: *{proposed_action}*\n"
-
                             f"Type: *{trigger_type}*\n"
-
-                            f"Entry Price: "
-                            f"*${curr_price:.2f}*\n\n"
+                            f"Entry Price: *${curr_price:.2f}*\n\n"
 
                             f"Stop Loss (SL): "
                             f"*${sl_price:.2f}*\n"
@@ -2259,7 +2382,7 @@ async def background_scanning_loop():
 
                             f"- 15M Confluence: "
                             f"{trend_15m} "
-                            f"(ADX {adx_15m:.1f})\n\n"
+                            f"(ADX {adx_15m_true:.1f})\n\n"
 
                             f"Reasoning: "
                             f"{ai_decision.reasoning}"
@@ -2288,14 +2411,13 @@ async def background_scanning_loop():
                             "None",
                             ai_decision.reasoning,
                             trend_15m,
-                            adx_15m
+                            adx_15m_true
                         )
 
                 del df_1m, df_5m
                 gc.collect()
 
             except Exception as e:
-
                 logging.error(
                     f"[SCAN LOOP ERROR] {e}"
                 )
@@ -2304,7 +2426,6 @@ async def background_scanning_loop():
 
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -2313,7 +2434,6 @@ async def lifespan(app: FastAPI):
     if TELEGRAM_BOT_TOKEN and APP_URL:
 
         try:
-
             webhook_endpoint = (
                 f"{APP_URL.rstrip('/')}"
                 f"/telegram-webhook"
@@ -2321,8 +2441,8 @@ async def lifespan(app: FastAPI):
 
             set_url = (
                 f"https://api.telegram.org/"
-                f"bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-                f"?url={webhook_endpoint}"
+                f"bot{TELEGRAM_BOT_TOKEN}"
+                f"/setWebhook?url={webhook_endpoint}"
             )
 
             async with httpx.AsyncClient(
@@ -2340,7 +2460,6 @@ async def lifespan(app: FastAPI):
                 )
 
         except Exception as e:
-
             logging.error(
                 f"[AUTO WEBHOOK SETUP ERROR] "
                 f"Failed: {e}"
@@ -2362,12 +2481,11 @@ app = FastAPI(
 
 @app.get("/")
 def home():
-
     return {
         "status": "ok",
         "message": (
-            "Trading bot scanner and "
-            "webhook server active."
+            "Trading bot scanner and webhook "
+            "server active."
         )
     }
 
@@ -2375,22 +2493,12 @@ def home():
 # =====================================================================
 # MT5 COPIER BRIDGE API ENDPOINT
 # =====================================================================
-
 @app.get("/get-latest-signal")
 async def get_latest_signal():
-
-    """
-    Returns the most recent EXECUTED signal
-    along with the kill-switch state.
-
-    Uses COALESCE across schema columns
-    for robust querying.
-    """
 
     global SYSTEM_TRADING_ENABLED
 
     if not SYSTEM_TRADING_ENABLED:
-
         return {
             "signal": None,
             "trading_enabled": False,
@@ -2398,7 +2506,6 @@ async def get_latest_signal():
         }
 
     if not DATABASE_URL:
-
         return {
             "signal": None,
             "error": "DATABASE_URL not set",
@@ -2406,7 +2513,6 @@ async def get_latest_signal():
         }
 
     try:
-
         conn = get_db_connection()
         cur = conn.cursor()
 
@@ -2414,43 +2520,34 @@ async def get_latest_signal():
             SELECT
                 id,
                 action,
-
                 COALESCE(
                     entry_price,
                     price,
                     0
-                ) as entry_p,
-
+                ) AS entry_p,
                 COALESCE(
                     sl_price,
                     sl,
                     0
-                ) as sl_p,
-
+                ) AS sl_p,
                 COALESCE(
                     tp1_price,
                     tp1,
                     0
-                ) as tp1_p,
-
+                ) AS tp1_p,
                 COALESCE(
                     tp2_price,
                     tp2,
                     0
-                ) as tp2_p,
-
+                ) AS tp2_p,
                 COALESCE(
                     timestamp,
                     created_at::text,
                     ''
-                ) as log_time
-
+                ) AS log_time
             FROM signals
-
             WHERE status = 'EXECUTED'
-
             ORDER BY id DESC
-
             LIMIT 1;
         """)
 
@@ -2460,7 +2557,6 @@ async def get_latest_signal():
         conn.close()
 
         if row:
-
             return {
                 "id": int(row["id"]),
                 "action": str(
@@ -2504,7 +2600,6 @@ async def get_latest_signal():
 
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
-
 @app.post("/telegram-webhook")
 async def telegram_webhook(
     request: Request
@@ -2513,7 +2608,6 @@ async def telegram_webhook(
     global SYSTEM_TRADING_ENABLED
 
     try:
-
         data = await request.json()
 
         message = data.get(
@@ -2534,10 +2628,7 @@ async def telegram_webhook(
             .get("id", "")
         )
 
-        if (
-            not sender_chat_id
-            or not raw_text
-        ):
+        if not sender_chat_id or not raw_text:
             return {
                 "status": "ignored"
             }
@@ -2552,10 +2643,6 @@ async def telegram_webhook(
             timeout=10.0,
             follow_redirects=True
         ) as client:
-
-            # =========================================================
-            # /HELP
-            # =========================================================
 
             if raw_text in [
                 "/help",
@@ -2588,16 +2675,15 @@ async def telegram_webhook(
                     f"⚠️ Active stat-vetoes: "
                     f"ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} "
                     f"and Mid session "
-                    f"({STAT_VETO_MID_SESSION_START_HOUR}"
-                    f"-"
+                    f"({STAT_VETO_MID_SESSION_START_HOUR}-"
                     f"{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
                     f"are auto-skipped based on "
                     f"forward-test underperformance.\n"
 
                     f"⏱️ Loss cooldown: "
                     f"{LOSS_COOLDOWN_MINUTES} min "
-                    f"after any SL hit (any direction) "
-                    f"before a new signal can execute."
+                    f"after any SL hit "
+                    f"(any direction) before a new signal can execute."
                 )
 
                 await send_telegram_alert(
@@ -2605,10 +2691,6 @@ async def telegram_webhook(
                     reply,
                     target_chat_id=sender_chat_id
                 )
-
-            # =========================================================
-            # /PAUSE
-            # =========================================================
 
             elif raw_text == "/pause":
 
@@ -2633,10 +2715,6 @@ async def telegram_webhook(
                     target_chat_id=sender_chat_id
                 )
 
-            # =========================================================
-            # /RESUME
-            # =========================================================
-
             elif raw_text == "/resume":
 
                 SYSTEM_TRADING_ENABLED = True
@@ -2657,19 +2735,14 @@ async def telegram_webhook(
                     target_chat_id=sender_chat_id
                 )
 
-            # =========================================================
-            # /STATS
-            # =========================================================
-
             elif raw_text == "/stats":
 
                 try:
-
                     conn = get_db_connection()
                     cur = conn.cursor()
 
                     cur.execute("""
-                        SELECT COUNT(*) as total
+                        SELECT COUNT(*) AS total
                         FROM signals
                         WHERE status = 'EXECUTED'
                     """)
@@ -2680,7 +2753,7 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) as vetoes
+                        SELECT COUNT(*) AS vetoes
                         FROM signals
                         WHERE status = 'VETOED'
                     """)
@@ -2691,7 +2764,7 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) as pending
+                        SELECT COUNT(*) AS pending
                         FROM signals
                         WHERE status = 'EXECUTED'
                           AND outcome = 'PENDING'
@@ -2703,7 +2776,7 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) as tp1_wins
+                        SELECT COUNT(*) AS tp1_wins
                         FROM signals
                         WHERE outcome LIKE 'WIN (TP1%'
                            OR outcome LIKE 'CLOSED%'
@@ -2715,7 +2788,7 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) as tp2_wins
+                        SELECT COUNT(*) AS tp2_wins
                         FROM signals
                         WHERE outcome LIKE 'WIN (TP2%'
                     """)
@@ -2726,7 +2799,7 @@ async def telegram_webhook(
                     )
 
                     cur.execute("""
-                        SELECT COUNT(*) as losses
+                        SELECT COUNT(*) AS losses
                         FROM signals
                         WHERE outcome LIKE 'LOSS%'
                     """)
@@ -2743,16 +2816,16 @@ async def telegram_webhook(
                                 entry_price,
                                 price,
                                 0
-                            ) as entry_p,
+                            ) AS entry_p,
                             exit_price
-
                         FROM signals
-
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
                     """)
 
-                    closed_trades = cur.fetchall()
+                    closed_trades = (
+                        cur.fetchall()
+                    )
 
                     total_pips = 0.0
                     win_pips = 0.0
@@ -2787,6 +2860,7 @@ async def telegram_webhook(
 
                         if pips > 0:
                             win_pips += pips
+
                         else:
                             loss_pips += abs(pips)
 
@@ -2817,8 +2891,7 @@ async def telegram_webhook(
                     )
 
                     profit_factor = (
-                        win_pips
-                        / loss_pips
+                        win_pips / loss_pips
                         if loss_pips > 0
                         else (
                             win_pips
@@ -2906,14 +2979,9 @@ async def telegram_webhook(
                         target_chat_id=sender_chat_id
                     )
 
-            # =========================================================
-            # /PIPS
-            # =========================================================
-
             elif raw_text == "/pips":
 
                 try:
-
                     conn = get_db_connection()
                     cur = conn.cursor()
 
@@ -2924,11 +2992,9 @@ async def telegram_webhook(
                                 entry_price,
                                 price,
                                 0
-                            ) as entry_p,
+                            ) AS entry_p,
                             exit_price
-
                         FROM signals
-
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
                     """)
@@ -2965,12 +3031,10 @@ async def telegram_webhook(
                         total_pips += pips
 
                         if pips > 0:
-
                             gross_win_pips += pips
                             winning_trades_count += 1
 
                         elif pips < 0:
-
                             gross_loss_pips += abs(pips)
                             losing_trades_count += 1
 
@@ -3056,14 +3120,9 @@ async def telegram_webhook(
                         target_chat_id=sender_chat_id
                     )
 
-            # =========================================================
-            # /LOGS
-            # =========================================================
-
             elif raw_text == "/logs":
 
                 try:
-
                     conn = get_db_connection()
                     cur = conn.cursor()
 
@@ -3075,24 +3134,20 @@ async def telegram_webhook(
                                 entry_price,
                                 price,
                                 0
-                            ) as entry_p,
+                            ) AS entry_p,
                             exit_price,
                             COALESCE(
                                 outcome,
                                 'PENDING'
-                            ) as outcome_val,
+                            ) AS outcome_val,
                             COALESCE(
                                 timestamp,
                                 created_at::text,
                                 'N/A'
-                            ) as log_time
-
+                            ) AS log_time
                         FROM signals
-
                         WHERE status = 'EXECUTED'
-
                         ORDER BY id DESC
-
                         LIMIT 10
                     """)
 
@@ -3126,16 +3181,15 @@ async def telegram_webhook(
                             )
 
                             exit_p = (
-                                float(l["exit_price"])
+                                float(
+                                    l["exit_price"]
+                                )
                                 if l.get("exit_price")
                                 is not None
                                 else None
                             )
 
-                            outcome = (
-                                l["outcome_val"]
-                            )
-
+                            outcome = l["outcome_val"]
                             date_str = str(
                                 l["log_time"]
                             )
@@ -3155,26 +3209,20 @@ async def telegram_webhook(
                                 )
 
                             else:
-
                                 pip_str = (
                                     "*ACTIVE / IN PROGRESS*"
                                 )
 
                             if (
-                                "WIN"
-                                in outcome
-                                or "CLOSED"
-                                in outcome
+                                "WIN" in outcome
+                                or "CLOSED" in outcome
                             ):
-
                                 icon = "🟢"
 
                             elif "LOSS" in outcome:
-
                                 icon = "🔴"
 
                             else:
-
                                 icon = "🟡"
 
                             reply += (
@@ -3220,14 +3268,9 @@ async def telegram_webhook(
                         target_chat_id=sender_chat_id
                     )
 
-            # =========================================================
-            # /ANALYZE
-            # =========================================================
-
             elif raw_text == "/analyze":
 
                 try:
-
                     conn = get_db_connection()
                     cur = conn.cursor()
 
@@ -3235,33 +3278,24 @@ async def telegram_webhook(
                         SELECT
                             action,
                             trigger_type,
-
                             COALESCE(
                                 entry_price,
                                 price,
                                 0
-                            ) as entry_p,
-
+                            ) AS entry_p,
                             sl_price,
                             exit_price,
-
-                            -- CORRECT:
-                            -- This is now explicitly 5M ADX.
                             COALESCE(
-                                adx_5m,
+                                adx_15m,
                                 0
-                            ) as adx_val,
-
+                            ) AS adx_val,
                             trend_15m,
-
                             COALESCE(
                                 timestamp,
                                 created_at::text,
                                 ''
-                            ) as ts
-
+                            ) AS ts
                         FROM signals
-
                         WHERE status = 'EXECUTED'
                           AND exit_price IS NOT NULL
                     """)
@@ -3274,8 +3308,7 @@ async def telegram_webhook(
                     if not rows:
 
                         reply = (
-                            "📐 *STRATEGY FORWARD-TEST "
-                            "ANALYSIS*\n\n"
+                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
                             "_Not enough closed trades yet "
                             "to analyze. Check back after "
                             "more signals complete._"
@@ -3303,9 +3336,12 @@ async def telegram_webhook(
                             )
 
                             sl = (
-                                float(r["sl_price"])
-                                if r.get("sl_price")
-                                is not None
+                                float(
+                                    r["sl_price"]
+                                )
+                                if r.get(
+                                    "sl_price"
+                                ) is not None
                                 else 0.0
                             )
 
@@ -3329,11 +3365,13 @@ async def telegram_webhook(
                                 or ""
                             )
 
-                            r_mult = compute_r_multiple(
-                                action,
-                                entry,
-                                exit_p,
-                                sl
+                            r_mult = (
+                                compute_r_multiple(
+                                    action,
+                                    entry,
+                                    exit_p,
+                                    sl
+                                )
                             )
 
                             overall_r.append(
@@ -3409,20 +3447,12 @@ async def telegram_webhook(
                         )
 
                         reply_parts = [
-                            "📐 *STRATEGY "
-                            "FORWARD-TEST ANALYSIS*",
-
+                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*",
                             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-
-                            f"Sample: "
-                            f"*{n_total} closed trades*",
-
-                            f"Overall Win Rate: "
-                            f"*{overall_wr:.1f}%* "
-                            f"| Avg R: "
-                            f"*{overall_avg_r:+.2f}*",
-
-                            ""
+                            f"Sample: *{n_total} closed trades*",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | "
+                            f"Avg R: *{overall_avg_r:+.2f}*",
+                            "",
                         ]
 
                         for dim in [
@@ -3446,36 +3476,30 @@ async def telegram_webhook(
                         )
 
                         reply_parts.append(
-                            "💡 Segments need n≥8 "
-                            "to be flagged ⚠️/✅ "
-                            "(smaller samples are shown "
-                            "but noisy). "
-                            "This does not auto-adjust "
-                            "the bot -- use it to decide "
-                            "whether to retune the ADX "
-                            "veto thresholds, fib "
-                            "pullback zone, or session "
-                            "windows in code.\n\n"
+                            "💡 Segments need n≥8 to be flagged "
+                            "⚠️/✅ (smaller samples are shown "
+                            "but noisy). This does not auto-adjust "
+                            "the bot -- use it to decide whether "
+                            "to retune the ADX veto thresholds, "
+                            "fib pullback zone, or session windows "
+                            "in code.\n\n"
 
                             f"🚫 Active stat-vetoes: "
                             f"ADX ≥ "
                             f"{STAT_VETO_ADX_THRESHOLD:.0f} "
                             f"and Mid session "
-                            f"({STAT_VETO_MID_SESSION_START_HOUR}"
-                            f"-"
+                            f"({STAT_VETO_MID_SESSION_START_HOUR}-"
                             f"{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-                            f"are being auto-skipped -- "
-                            f"re-check this report after "
-                            f"~30-40 more trades to confirm "
-                            f"they're actually lifting AvgR.\n"
+                            f"are being auto-skipped -- re-check "
+                            f"this report after ~30-40 more trades "
+                            f"to confirm they're actually lifting AvgR.\n"
 
                             f"⏱️ Loss cooldown "
                             f"({LOSS_COOLDOWN_MINUTES} min, "
-                            f"any direction) is also active "
-                            f"-- added after spotting "
-                            f"clustered same-session "
-                            f"losing sequences in the "
-                            f"raw trade list."
+                            f"any direction) is also active -- "
+                            f"added after spotting clustered "
+                            f"same-session losing sequences "
+                            f"in the raw trade list."
                         )
 
                         reply = "\n".join(

@@ -923,33 +923,21 @@ def detect_breakout_continuation(
     allow_momentum_continuation: bool = False
 ):
     recent_high = float(
-        df_5m[
-            "high"
-        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
+        df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
+    )
+    recent_low = float(
+        df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
     )
 
-    recent_low = float(
-        df_5m[
-            "low"
-        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
-    )
+    if len(df_1m) < 3:
+        return "HOLD", "Breakout rejected: insufficient M1 candles", recent_high, recent_low
 
     prev = df_1m.iloc[-2]
     curr = df_1m.iloc[-1]
 
-    raw_atr = (
-        df_1m["atr"].iloc[-1]
-        if "atr" in df_1m.columns
-        else np.nan
-    )
-
+    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else np.nan
     if pd.isna(raw_atr) or float(raw_atr) <= 0:
-        return (
-            "HOLD",
-            "Breakout rejected: M1 ATR unavailable",
-            recent_high,
-            recent_low
-        )
+        return "HOLD", "Breakout rejected: M1 ATR unavailable", recent_high, recent_low
 
     atr_1m = float(raw_atr)
 
@@ -957,248 +945,130 @@ def detect_breakout_continuation(
     curr_high = float(curr["high"])
     curr_low = float(curr["low"])
     curr_close = float(curr["close"])
-
     prev_close = float(prev["close"])
 
     candle_range = curr_high - curr_low
     candle_body = abs(curr_close - curr_open)
+    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
+    body_ratio = candle_body / atr_1m
 
-    if candle_range > 0:
-        close_location = (
-            (curr_close - curr_low)
-            / candle_range
-        )
-    else:
-        close_location = 0.5
-
-    bullish_breakout_structure = bool(
+    bullish_two_close = bool(
         prev_close > recent_high
         and curr_close > recent_high
         and curr_close > prev_close
     )
-
-    bearish_breakout_structure = bool(
+    bearish_two_close = bool(
         prev_close < recent_low
         and curr_close < recent_low
         and curr_close < prev_close
     )
 
-    if (
-        not bullish_breakout_structure
-        and not bearish_breakout_structure
-    ):
-        return (
-            "HOLD",
-            "No setup",
-            recent_high,
-            recent_low
+    bullish_fast_cross = bool(
+        curr_close > recent_high
+        and curr_close > curr_open
+        and (
+            prev_close <= recent_high
+            or prev_close <= recent_high + FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m
         )
+    )
+    bearish_fast_cross = bool(
+        curr_close < recent_low
+        and curr_close < curr_open
+        and (
+            prev_close >= recent_low
+            or prev_close >= recent_low - FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m
+        )
+    )
 
     if allow_momentum_continuation:
         min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
         min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
-        max_extension_atr = MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT
-    else:
-        min_body_atr = BREAKOUT_MIN_BODY_ATR_MULT
-        min_close_location = BREAKOUT_MIN_CLOSE_LOCATION
-        max_extension_atr = BREAKOUT_MAX_EXTENSION_ATR_MULT
 
-    if bullish_breakout_structure:
+        if bullish_two_close:
+            extension_atr = (curr_close - recent_high) / atr_1m
+            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
+                return "HOLD", "Continuation not active: extension <= normal breakout limit", recent_high, recent_low
+            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
+                return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
+            if body_ratio < min_body_atr:
+                return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
+            if close_location < min_close_location:
+                return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
+            return "BUY", "Momentum Continuation - No Pullback (Bullish)", recent_high, recent_low
 
-        body_direction_ok = (
-            curr_close > curr_open
-            if BREAKOUT_REQUIRE_BODY_DIRECTION
-            else True
+        if bearish_two_close:
+            extension_atr = (recent_low - curr_close) / atr_1m
+            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
+                return "HOLD", "Continuation not active: extension <= normal breakout limit", recent_high, recent_low
+            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
+                return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
+            if body_ratio < min_body_atr:
+                return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
+            if close_location > (1.0 - min_close_location):
+                return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
+            return "SELL", "Momentum Continuation - No Pullback (Bearish)", recent_high, recent_low
+
+        return "HOLD", "No continuation structure", recent_high, recent_low
+
+    if bullish_two_close:
+        extension_atr = (curr_close - recent_high) / atr_1m
+        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT:
+            return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
+        if close_location < BREAKOUT_MIN_CLOSE_LOCATION:
+            return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
+        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT:
+            return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
+        return "BUY", "Momentum Breakout Continuation (Bullish)", recent_high, recent_low
+
+    if bearish_two_close:
+        extension_atr = (recent_low - curr_close) / atr_1m
+        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT:
+            return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
+        if close_location > (1.0 - BREAKOUT_MIN_CLOSE_LOCATION):
+            return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
+        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT:
+            return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
+        return "SELL", "Momentum Breakout Continuation (Bearish)", recent_high, recent_low
+
+    if bullish_fast_cross:
+        extension_atr = (curr_close - recent_high) / atr_1m
+
+        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT:
+            return "HOLD", f"Fast momentum rejected: body/ATR {body_ratio:.2f} < {FAST_MOMENTUM_MIN_BODY_ATR_MULT:.2f}", recent_high, recent_low
+
+        if close_location < FAST_MOMENTUM_MIN_CLOSE_LOCATION:
+            return "HOLD", f"Fast momentum rejected: close location {close_location:.2f} < {FAST_MOMENTUM_MIN_CLOSE_LOCATION:.2f}", recent_high, recent_low
+
+        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT:
+            return "HOLD", f"Fast momentum rejected: extension {extension_atr:.2f}x ATR too high", recent_high, recent_low
+
+        logging.info(
+            f"[FAST MOMENTUM] VALID BUY | Level ${recent_high:.2f} | "
+            f"Close ${curr_close:.2f} | Body/ATR {body_ratio:.2f} | "
+            f"CloseLocation {close_location:.2f} | Extension {extension_atr:.2f}x ATR"
         )
+        return "BUY", "Fast Momentum Breakout (Bullish - 1M impulse)", recent_high, recent_low
 
-        if not body_direction_ok:
-            return (
-                "HOLD",
-                "Breakout rejected: bullish candle direction weak",
-                recent_high,
-                recent_low
-            )
+    if bearish_fast_cross:
+        extension_atr = (recent_low - curr_close) / atr_1m
 
-        body_ratio = candle_body / atr_1m
-        body_strength_ok = (body_ratio >= min_body_atr)
-        close_quality_ok = (close_location >= min_close_location)
-        extension_from_level = (curr_close - recent_high)
-        extension_atr = (extension_from_level / atr_1m)
+        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT:
+            return "HOLD", f"Fast momentum rejected: body/ATR {body_ratio:.2f} < {FAST_MOMENTUM_MIN_BODY_ATR_MULT:.2f}", recent_high, recent_low
 
-        if not allow_momentum_continuation:
-            if not body_strength_ok:
-                return (
-                    "HOLD",
-                    "Breakout rejected: insufficient displacement",
-                    recent_high,
-                    recent_low
-                )
+        if close_location > (1.0 - FAST_MOMENTUM_MIN_CLOSE_LOCATION):
+            return "HOLD", f"Fast momentum rejected: close location {close_location:.2f} too weak for SELL", recent_high, recent_low
 
-            if not close_quality_ok:
-                return (
-                    "HOLD",
-                    "Breakout rejected: weak candle close",
-                    recent_high,
-                    recent_low
-                )
+        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT:
+            return "HOLD", f"Fast momentum rejected: extension {extension_atr:.2f}x ATR too high", recent_high, recent_low
 
-            if extension_from_level > (
-                BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
-            ):
-                return (
-                    "HOLD",
-                    "Breakout overextended - continuation check required",
-                    recent_high,
-                    recent_low
-                )
-
-            return (
-                "BUY",
-                "Momentum Breakout Continuation (Bullish)",
-                recent_high,
-                recent_low
-            )
-
-        if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
-            return (
-                "HOLD",
-                "Continuation not active: extension <= normal breakout limit",
-                recent_high,
-                recent_low
-            )
-
-        if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-            return (
-                "HOLD",
-                "Continuation rejected: excessively extended",
-                recent_high,
-                recent_low
-            )
-
-        if not body_strength_ok:
-            return (
-                "HOLD",
-                "Continuation rejected: momentum weakening",
-                recent_high,
-                recent_low
-            )
-
-        if not close_quality_ok:
-            return (
-                "HOLD",
-                "Continuation rejected: weak close",
-                recent_high,
-                recent_low
-            )
-
-        return (
-            "BUY",
-            "Momentum Continuation - No Pullback (Bullish)",
-            recent_high,
-            recent_low
+        logging.info(
+            f"[FAST MOMENTUM] VALID SELL | Level ${recent_low:.2f} | "
+            f"Close ${curr_close:.2f} | Body/ATR {body_ratio:.2f} | "
+            f"CloseLocation {close_location:.2f} | Extension {extension_atr:.2f}x ATR"
         )
+        return "SELL", "Fast Momentum Breakout (Bearish - 1M impulse)", recent_high, recent_low
 
-    if bearish_breakout_structure:
-
-        body_direction_ok = (
-            curr_close < curr_open
-            if BREAKOUT_REQUIRE_BODY_DIRECTION
-            else True
-        )
-
-        if not body_direction_ok:
-            return (
-                "HOLD",
-                "Breakout rejected: bearish candle direction weak",
-                recent_high,
-                recent_low
-            )
-
-        body_ratio = candle_body / atr_1m
-        body_strength_ok = (body_ratio >= min_body_atr)
-        close_quality_ok = (close_location <= (1.0 - min_close_location))
-        extension_from_level = (recent_low - curr_close)
-        extension_atr = (extension_from_level / atr_1m)
-
-        if not allow_momentum_continuation:
-            if not body_strength_ok:
-                return (
-                    "HOLD",
-                    "Breakout rejected: insufficient displacement",
-                    recent_high,
-                    recent_low
-                )
-
-            if not close_quality_ok:
-                return (
-                    "HOLD",
-                    "Breakout rejected: weak candle close",
-                    recent_high,
-                    recent_low
-                )
-
-            if extension_from_level > (
-                BREAKOUT_MAX_EXTENSION_ATR_MULT * atr_1m
-            ):
-                return (
-                    "HOLD",
-                    "Breakout overextended - continuation check required",
-                    recent_high,
-                    recent_low
-                )
-
-            return (
-                "SELL",
-                "Momentum Breakout Continuation (Bearish)",
-                recent_high,
-                recent_low
-            )
-
-        if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
-            return (
-                "HOLD",
-                "Continuation not active: extension <= normal breakout limit",
-                recent_high,
-                recent_low
-            )
-
-        if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-            return (
-                "HOLD",
-                "Continuation rejected: excessively extended",
-                recent_high,
-                recent_low
-            )
-
-        if not body_strength_ok:
-            return (
-                "HOLD",
-                "Continuation rejected: momentum weakening",
-                recent_high,
-                recent_low
-            )
-
-        if not close_quality_ok:
-            return (
-                "HOLD",
-                "Continuation rejected: weak close",
-                recent_high,
-                recent_low
-            )
-
-        return (
-            "SELL",
-            "Momentum Continuation - No Pullback (Bearish)",
-            recent_high,
-            recent_low
-        )
-
-    return (
-        "HOLD",
-        "No setup",
-        recent_high,
-        recent_low
-    )
+    return "HOLD", "No setup", recent_high, recent_low
 
 
 CONSOLIDATION_LOOKBACK_5M = 8

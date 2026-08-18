@@ -1,3 +1,4 @@
+# V7 MOMENTUM & SWEEP: 5M SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
 import os
 import json
 import asyncio
@@ -22,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        # Suppress noisy polling requests from flooding the console
+        # Suppress noisy MT5 polling requests from flooding the Render console
         return "/get-latest-signal" not in record.getMessage()
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
@@ -36,6 +37,7 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
 
+# Sanitize Telegram Bot Token
 CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
 TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
 
@@ -54,31 +56,136 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 
-# --- GLOBAL SYSTEM STATE & HEARTBEAT ---
+# --- GLOBAL EMERGENCY KILL SWITCH STATE & HEARTBEAT ---
 SYSTEM_TRADING_ENABLED = True
 CURRENT_SCAN_CYCLE_ID = None
 LAST_MT5_PING_TIME = None  # Tracks live MT5 connection timestamp
 
+# --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
+pending_setup = None
+PULLBACK_EXPIRY_MINUTES = 10
+FIB_RETRACE_MIN = 0.382
+FIB_RETRACE_MAX = 0.618
+
 # --- 15M CONFLUENCE CACHE ---
 cached_15m = {"df": None, "fetched_at": None}
+FIFTEEN_M_REFRESH_MINUTES = 15
 
-# --- SCAN SCHEDULE & BUDGET ---
-SCAN_INTERVAL_SECONDS = 300  # 5-minute candle boundary
-ACTIVE_SESSION_START_HOUR = 0  # 24/7 all-day trading
-ACTIVE_SESSION_END_HOUR = 24
+# --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
+ACTIVE_SESSION_START_HOUR = 10  # WIB
+ACTIVE_SESSION_END_HOUR = 22    # WIB
+MID_SESSION_START_HOUR = 14     # WIB
+MID_SESSION_END_HOUR = 18       # WIB
 TWELVE_DATA_DAILY_LIMIT = 800
+LEVEL_LOOKBACK_CANDLES = 4
 
 # ==========================================================
-# EMA 9/15 STRATEGY PARAMETERS
+# MOMENTUM BREAKOUT QUALITY FILTERS
 # ==========================================================
-EMA_FAST = 9
-EMA_SLOW = 15
-EMA_TOUCH_TOLERANCE = 0.0
-EMA_REQUIRE_CLOSE_IN_TREND = True
-EMA_15M_REQUIRE_CLOSE_SIDE = False  # Bypasses API lag timing discrepancies
+BREAKOUT_MIN_BODY_ATR_MULT = 0.50
+BREAKOUT_MIN_CLOSE_LOCATION = 0.65
+BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
 
-# --- RISK FILTERS ---
+MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
+MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
+MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
+MOMENTUM_CONTINUATION_MIN_ADX = 20.0
+
+FAST_MOMENTUM_MIN_BODY_ATR_MULT = 0.35
+FAST_MOMENTUM_MIN_CLOSE_LOCATION = 0.60
+FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT = 1.35
+FAST_MOMENTUM_PREV_BUFFER_ATR = 0.50
+FAST_MOMENTUM_MIN_ADX = 20.0
+
+BREAKOUT_REQUIRE_BODY_DIRECTION = True
+
+# --- STAT-BASED VETOES ---
+STAT_VETO_ADX_THRESHOLD = 50.0
+STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
+STAT_VETO_MID_SESSION_END_HOUR = 18    # WIB
+
+EXTREME_ADX_REVERSAL_MIN_ADX = 50.0
+EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION = True
+
+# --- LOSS-COOLDOWN ---
 LOSS_COOLDOWN_MINUTES = 10
+
+
+def check_stat_veto(
+    adx_5m: float,
+    current_hour_wib: int,
+    action: str = "HOLD",
+    trigger_type: str = "",
+    plus_di_5m: float = None,
+    minus_di_5m: float = None,
+):
+    action = str(action or "HOLD").upper()
+    trigger_type = str(trigger_type or "")
+
+    is_sweep_reversal = (
+        "Liquidity Sweep" in trigger_type
+        and "BOS" in trigger_type
+        and ("Pullback Confirmed" in trigger_type or "Sweep" in trigger_type)
+    )
+
+    if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
+        return True, (
+            f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
+            f"forward-tested as underperforming (n=17, WR=29%, AvgR=-0.18)"
+        )
+
+    if adx_5m >= EXTREME_ADX_REVERSAL_MIN_ADX and is_sweep_reversal:
+        di_available = (
+            plus_di_5m is not None
+            and minus_di_5m is not None
+            and np.isfinite(float(plus_di_5m))
+            and np.isfinite(float(minus_di_5m))
+        )
+
+        if di_available:
+            plus_di = float(plus_di_5m)
+            minus_di = float(minus_di_5m)
+            bullish_dominant = plus_di > minus_di
+            bearish_dominant = minus_di > plus_di
+
+            bearish_reversal = action == "SELL" and bullish_dominant
+            bullish_reversal = action == "BUY" and bearish_dominant
+
+            if bearish_reversal or bullish_reversal:
+                return False, (
+                    f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} >= "
+                    f"{EXTREME_ADX_REVERSAL_MIN_ADX:.1f}, but {trigger_type} "
+                    f"is opposite the dominant momentum "
+                    f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}); "
+                    f"allowing structural exhaustion reversal."
+                )
+
+            return True, (
+                f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
+                f"Sweep+BOS direction is not opposite dominant momentum "
+                f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}), so this is not treated as exhaustion reversal."
+            )
+
+        if not EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION:
+            return False, (
+                f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} and "
+                f"confirmed {trigger_type}; DI confirmation disabled."
+            )
+
+        return True, (
+            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
+            f"confirmed Sweep+BOS reversal lacks valid +DI/-DI confirmation."
+        )
+
+    if adx_5m >= STAT_VETO_ADX_THRESHOLD:
+        return True, (
+            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
+            f"for {trigger_type or 'non-reversal'} entry "
+            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27; "
+            f"high-ADX breakout/continuation entries are treated as late/exhausted)."
+        )
+
+    return False, ""
 
 
 class SignalOutput(BaseModel):
@@ -90,7 +197,7 @@ class SignalOutput(BaseModel):
     )
 
 
-# --- DATABASE CONNECTION & SCHEMA AUTO-MIGRATION ---
+# --- DATABASE CONNECTION & AUTO-MIGRATION INITIALIZATION ---
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is missing.")
@@ -184,30 +291,17 @@ def init_db():
         cursor.close()
         conn.close()
         logging.info("[NEON DATABASE] Full schema verified and missing columns auto-migrated.")
-
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
 
 
 def log_bot_event(
-    event_type: str,
-    stage: str = None,
-    action: str = None,
-    trigger_type: str = None,
-    price: float = None,
-    recent_high: float = None,
-    recent_low: float = None,
-    adx_5m: float = None,
-    adx_15m: float = None,
-    trend_15m: str = None,
-    pending: dict = None,
-    extension_atr: float = None,
-    body_atr: float = None,
-    close_location: float = None,
-    decision: str = None,
-    reason: str = None,
-    details: dict = None,
-    cycle_id: str = None
+    event_type: str, stage: str = None, action: str = None, trigger_type: str = None,
+    price: float = None, recent_high: float = None, recent_low: float = None,
+    adx_5m: float = None, adx_15m: float = None, trend_15m: str = None,
+    pending: dict = None, extension_atr: float = None, body_atr: float = None,
+    close_location: float = None, decision: str = None, reason: str = None,
+    details: dict = None, cycle_id: str = None
 ):
     if not DATABASE_URL:
         return None
@@ -220,10 +314,8 @@ def log_bot_event(
         pending = pending or {}
 
         def f(value):
-            try:
-                return float(value) if value is not None else None
-            except Exception:
-                return None
+            try: return float(value) if value is not None else None
+            except Exception: return None
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -241,26 +333,15 @@ def log_bot_event(
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
         """, (
-            wib_time,
-            cycle_id or CURRENT_SCAN_CYCLE_ID,
-            str(event_type),
-            str(stage) if stage is not None else None,
-            str(action) if action is not None else None,
-            str(trigger_type) if trigger_type is not None else None,
-            f(price), f(recent_high), f(recent_low), f(adx_5m), f(adx_15m),
-            str(trend_15m) if trend_15m is not None else None,
+            wib_time, cycle_id or CURRENT_SCAN_CYCLE_ID, str(event_type), str(stage) if stage is not None else None,
+            str(action) if action is not None else None, str(trigger_type) if trigger_type is not None else None,
+            f(price), f(recent_high), f(recent_low), f(adx_5m), f(adx_15m), str(trend_15m) if trend_15m is not None else None,
             str(pending.get("action")) if pending.get("action") is not None else None,
             str(pending.get("trigger_type")) if pending.get("trigger_type") is not None else None,
-            f(pending.get("trigger_price")),
-            f(pending.get("zone_lower")),
-            f(pending.get("zone_upper")),
+            f(pending.get("trigger_price")), f(pending.get("zone_lower")), f(pending.get("zone_upper")),
             str(pending.get("expires")) if pending.get("expires") is not None else None,
-            f(extension_atr),
-            f(body_atr),
-            f(close_location),
-            str(decision) if decision is not None else None,
-            str(reason) if reason is not None else None,
-            json.dumps(details or {}, default=str)
+            f(extension_atr), f(body_atr), f(close_location), str(decision) if decision is not None else None,
+            str(reason) if reason is not None else None, json.dumps(details or {}, default=str)
         ))
         conn.commit()
         return True
@@ -279,21 +360,45 @@ def log_scan_event(event_type: str, **kwargs):
     return log_bot_event(event_type=event_type, **kwargs)
 
 
+def logged_breakout_check(df_1m: pd.DataFrame, df_5m: pd.DataFrame, allow_momentum_continuation: bool = False):
+    result = detect_breakout_continuation(df_1m, df_5m, allow_momentum_continuation=allow_momentum_continuation)
+    action, trigger_type, recent_high, recent_low = result
+
+    curr = df_1m.iloc[-1]
+    curr_open = float(curr["open"])
+    curr_high = float(curr["high"])
+    curr_low = float(curr["low"])
+    curr_close = float(curr["close"])
+    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else None
+    atr = float(raw_atr) if raw_atr is not None and not pd.isna(raw_atr) and float(raw_atr) > 0 else None
+    body_atr = abs(curr_close - curr_open) / atr if atr else None
+    candle_range = curr_high - curr_low
+    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
+    extension_atr = None
+    if atr:
+        if action == "BUY":
+            extension_atr = (curr_close - recent_high) / atr
+        elif action == "SELL":
+            extension_atr = (recent_low - curr_close) / atr
+        else:
+            extension_atr = max((curr_close - recent_high) / atr, (recent_low - curr_close) / atr)
+
+    log_bot_event(
+        event_type="BREAKOUT_EVALUATION",
+        stage="MOMENTUM_CONTINUATION" if allow_momentum_continuation else "FRESH_BREAKOUT",
+        action=action, trigger_type=trigger_type, price=float(df_1m["close"].iloc[-1]),
+        recent_high=recent_high, recent_low=recent_low, extension_atr=extension_atr,
+        body_atr=body_atr, close_location=close_location,
+        decision="VALID" if action != "HOLD" else "REJECTED_OR_NONE",
+        reason=trigger_type, details={"continuation_mode": allow_momentum_continuation}
+    )
+    return result
+
+
 def log_trade_signal(
-    status: str,
-    action: str,
-    trigger_type: str,
-    price: float,
-    sl: float,
-    tp1: float,
-    tp2: float,
-    confidence: float,
-    adx_15m: float,
-    stoch_rsi_15m: float,
-    divergence_type: str,
-    reasoning: str,
-    trend_15m: str = None,
-    adx_15m_true: float = None
+    status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float,
+    confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str,
+    trend_15m: str = None, adx_15m_true: float = None
 ):
     if not DATABASE_URL:
         return None
@@ -310,7 +415,6 @@ def log_trade_signal(
         conf_val = float(confidence) if confidence is not None else 0.0
         adx_val = float(adx_15m) if adx_15m is not None else 0.0
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
-
         trend_15m_val = str(trend_15m) if trend_15m is not None else None
         adx_15m_true_val = float(adx_15m_true) if adx_15m_true is not None else None
 
@@ -334,7 +438,6 @@ def log_trade_signal(
 
         inserted_row = cursor.fetchone()
         new_id = inserted_row["id"] if inserted_row and "id" in inserted_row else None
-
         conn.commit()
         cursor.close()
         conn.close()
@@ -347,23 +450,18 @@ def log_trade_signal(
         return None
 
 
-# --- TWO-STAGE TP TRACKING FUNCTION ---
-def update_open_trades(current_high: float, current_low: float, current_close: float):
+def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
         return
-
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
         cursor.execute("""
-            SELECT *
-            FROM signals
-            WHERE status = 'EXECUTED'
-              AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')
+            SELECT * FROM signals
+            WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')
         """)
-
         open_trades = cursor.fetchall()
+
         if not open_trades:
             cursor.close()
             conn.close()
@@ -372,12 +470,10 @@ def update_open_trades(current_high: float, current_low: float, current_close: f
         wib_now = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         c_high = float(current_high)
         c_low = float(current_low)
-        c_close = float(current_close)
 
         for trade in open_trades:
             trade_id = trade["id"]
             action = trade["action"]
-
             entry_price = float(trade["entry_price"] if trade.get("entry_price") is not None else trade.get("price", 0.0))
             sl = float(trade["sl_price"] if trade.get("sl_price") is not None else trade.get("sl", 0.0))
             tp1 = float(trade["tp1_price"] if trade.get("tp1_price") is not None else trade.get("tp1", 0.0))
@@ -390,46 +486,33 @@ def update_open_trades(current_high: float, current_low: float, current_close: f
             if action == "BUY":
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 > 0 and c_high >= tp2:
-                        new_outcome = "WIN (TP2 HIT)"
-                        exit_price = tp2
-                    elif c_close <= entry_price:
-                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = entry_price
-                elif sl > 0 and c_close <= sl:
-                    new_outcome = "LOSS (SL HIT)"
-                    exit_price = sl
+                        new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
+                    elif c_low <= entry_price:
+                        new_outcome = "CLOSED (TP1 HIT / SL BE)"; exit_price = entry_price
+                elif sl > 0 and c_low <= sl:
+                    new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_high >= tp2:
-                    new_outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
+                    new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
                 elif tp1 > 0 and c_high >= tp1:
-                    new_outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
+                    new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             elif action == "SELL":
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 > 0 and c_low <= tp2:
-                        new_outcome = "WIN (TP2 HIT)"
-                        exit_price = tp2
-                    elif c_close >= entry_price:
-                        new_outcome = "CLOSED (TP1 HIT / SL BE)"
-                        exit_price = entry_price
-                elif sl > 0 and c_close >= sl:
-                    new_outcome = "LOSS (SL HIT)"
-                    exit_price = sl
+                        new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
+                    elif c_high >= entry_price:
+                        new_outcome = "CLOSED (TP1 HIT / SL BE)"; exit_price = entry_price
+                elif sl > 0 and c_high >= sl:
+                    new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
-                    new_outcome = "WIN (TP2 HIT)"
-                    exit_price = tp2
+                    new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
                 elif tp1 > 0 and c_low <= tp1:
-                    new_outcome = "WIN (TP1 HIT)"
-                    exit_price = tp1
+                    new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
-                    UPDATE signals
-                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s
-                    WHERE id = %s
+                    UPDATE signals SET outcome = %s, exit_price = %s, outcome_timestamp = %s WHERE id = %s
                 """, (new_outcome, float(exit_price), wib_now, trade_id))
-
                 conn.commit()
 
                 trade_for_calc = {
@@ -442,162 +525,175 @@ def update_open_trades(current_high: float, current_low: float, current_close: f
                 log_bot_event(
                     "TRADE_OUTCOME", stage="TRADE_MANAGEMENT", action=action, price=float(exit_price), decision=new_outcome,
                     reason="Two-stage TP/SL outcome detected",
-                    details={
-                        "signal_id": trade_id, "entry": entry_price, "sl": sl, "tp1": tp1, "tp2": tp2,
-                        "exit": float(exit_price), "outcome": new_outcome, "pips": result_pips,
-                        "profit_usd": result_usd, "r_multiple": result_r, "legacy_fallback_used": not bool(sl > 0 and tp1 > 0)
-                    }
+                    details={"signal_id": trade_id, "pips": result_pips, "profit_usd": result_usd, "r_multiple": result_r}
                 )
-
-                logging.info(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f} | Result: {result_pips:+.1f} pips | {result_r:+.2f}R | ${result_usd:+.2f}")
+                logging.info(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f} | {result_pips:+.1f} pips | {result_r:+.2f}R")
 
         cursor.close()
         conn.close()
-
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to update trade outcomes: {e}")
 
 
-# --- MARKET DATA FETCHING ---
 async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100):
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={timeframe}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
-    try:
-        res = await client.get(url)
-        if res.status_code != 200 or not res.text:
-            return None
-        data = res.json()
-    except Exception as e:
-        logging.error(f"[DATA FETCH ERROR] {timeframe}: {e}")
-        return None
-
-    if "values" not in data:
-        return None
-
+    res = await client.get(url)
+    if res.status_code != 200 or not res.text: return None
+    try: data = res.json()
+    except Exception: return None
+    if "values" not in data: return None
     df = pd.DataFrame(data["values"])
-    if df.empty:
-        return None
-
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-
     for col in ["open", "high", "low", "close"]:
-        if col in df.columns:
-            df[col] = df[col].astype(float)
-
+        if col in df.columns: df[col] = df[col].astype(float)
     return df
 
 
-# --- EMA / ATR CALCULATIONS ---
-def calculate_ema_metrics(df: pd.DataFrame):
-    df = df.tail(150).copy()
-    df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema15"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
-    )
+def calculate_metrics_m1(df: pd.DataFrame):
+    df = df.tail(100).copy()
+    df["tr"] = np.maximum(df["high"] - df["low"], np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1))))
     df["atr"] = df["tr"].rolling(window=14).mean()
     return df
 
 
 def calculate_metrics_5m(df: pd.DataFrame):
-    return calculate_ema_metrics(df)
+    df = df.tail(100).copy()
+    df["tr"] = np.maximum(df["high"] - df["low"], np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1))))
+    df["up_move"] = df["high"] - df["high"].shift(1)
+    df["down_move"] = df["low"].shift(1) - df["low"]
+    df["plus_dm"] = np.where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), df["up_move"], 0.0)
+    df["minus_dm"] = np.where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), df["down_move"], 0.0)
+    tr14 = df["tr"].rolling(14).sum()
+    plus_di = 100 * (df["plus_dm"].rolling(14).sum() / (tr14 + 1e-10))
+    minus_di = 100 * (df["minus_dm"].rolling(14).sum() / (tr14 + 1e-10))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    df["adx"] = dx.rolling(14).mean()
+    df["atr"] = df["tr"].rolling(window=14).mean()
+    return df
 
 
-def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SLOW):
-    if df is None or len(df) < slow + 1:
-        return "NEUTRAL", 0.0
-    if "ema9" not in df.columns or "ema15" not in df.columns:
-        df = calculate_ema_metrics(df)
+TREND_15M_MIN_SEPARATION_PCT = 0.02
 
-    last_fast = float(df["ema9"].iloc[-1])
-    last_slow = float(df["ema15"].iloc[-1])
-    if last_slow == 0:
-        return "NEUTRAL", 0.0
-
-    separation_pct = abs(last_fast - last_slow) / abs(last_slow) * 100.0
-    if last_fast > last_slow:
-        return "BULLISH", separation_pct
-    if last_fast < last_slow:
-        return "BEARISH", separation_pct
-    return "NEUTRAL", separation_pct
+def compute_ema_trend(df: pd.DataFrame, fast: int = 9, slow: int = 20):
+    if df is None or len(df) < slow + 1: return "NEUTRAL", 0.0
+    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
+    last_fast = float(ema_fast.iloc[-1])
+    last_slow = float(ema_slow.iloc[-1])
+    if last_slow == 0: return "NEUTRAL", 0.0
+    separation_pct = abs(last_fast - last_slow) / last_slow * 100
+    if separation_pct < TREND_15M_MIN_SEPARATION_PCT: return "NEUTRAL", separation_pct
+    return "BULLISH" if last_fast > last_slow else "BEARISH", separation_pct
 
 
-# --- STRATEGY ENGINE: CROSSOVERS + PULLBACKS ---
-def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
-    if df_5m is None or df_15m is None or len(df_5m) < 20 or len(df_15m) < 20:
-        return "HOLD", "EMA setup rejected: insufficient 5M/15M data", 0.0, 0.0
+def detect_liquidity_sweep_structure(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    recent_high = float(df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max())
+    recent_low = float(df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min())
+    prev = df_1m.iloc[-2]
+    curr = df_1m.iloc[-1]
+    sweep_high = bool(prev["high"] > recent_high and curr["close"] < recent_high)
+    sweep_low = bool(prev["low"] < recent_low and curr["close"] > recent_low)
+    bearish_bos = bool(curr["close"] < prev["low"])
+    bullish_bos = bool(curr["close"] > prev["high"])
+    if sweep_high and bearish_bos: return "SELL", "Liquidity Sweep + Bearish BOS", recent_high, recent_low
+    if sweep_low and bullish_bos: return "BUY", "Liquidity Sweep + Bullish BOS", recent_high, recent_low
+    return "HOLD", "No setup", recent_high, recent_low
 
-    m5 = df_5m.iloc[-1]
-    p5 = df_5m.iloc[-2]
-    m15 = df_15m.iloc[-1]
 
-    ema9_5 = float(m5["ema9"])
-    ema15_5 = float(m5["ema15"])
-    ema9_15 = float(m15["ema9"])
-    ema15_15 = float(m15["ema15"])
+def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame, allow_momentum_continuation: bool = False):
+    recent_high = float(df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max())
+    recent_low = float(df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min())
+    if len(df_1m) < 3: return "HOLD", "Breakout rejected: insufficient M1 candles", recent_high, recent_low
+    prev = df_1m.iloc[-2]; curr = df_1m.iloc[-1]
+    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else np.nan
+    if pd.isna(raw_atr) or float(raw_atr) <= 0: return "HOLD", "Breakout rejected: M1 ATR unavailable", recent_high, recent_low
+    atr_1m = float(raw_atr)
+    curr_open = float(curr["open"]); curr_high = float(curr["high"]); curr_low = float(curr["low"]); curr_close = float(curr["close"])
+    prev_close = float(prev["close"])
+    candle_range = curr_high - curr_low
+    candle_body = abs(curr_close - curr_open)
+    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
+    body_ratio = candle_body / atr_1m
 
-    close5 = float(m5["close"])
-    open5 = float(m5["open"])
-    high5 = float(m5["high"])
-    low5 = float(m5["low"])
+    bullish_two_close = bool(prev_close > recent_high and curr_close > recent_high and curr_close > prev_close)
+    bearish_two_close = bool(prev_close < recent_low and curr_close < recent_low and curr_close < prev_close)
+    bullish_fast_cross = bool(curr_close > recent_high and curr_close > curr_open and (prev_close <= recent_high or prev_close <= recent_high + FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m))
+    bearish_fast_cross = bool(curr_close < recent_low and curr_close < curr_open and (prev_close >= recent_low or prev_close >= recent_low - FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m))
 
-    trend_5m = "BULLISH" if ema9_5 > ema15_5 else "BEARISH" if ema9_5 < ema15_5 else "NEUTRAL"
-    trend_15m = "BULLISH" if ema9_15 > ema15_15 else "BEARISH" if ema9_15 < ema15_15 else "NEUTRAL"
+    if allow_momentum_continuation:
+        min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
+        min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
+        if bullish_two_close:
+            extension_atr = (curr_close - recent_high) / atr_1m
+            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation not active", recent_high, recent_low
+            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
+            if body_ratio < min_body_atr: return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
+            if close_location < min_close_location: return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
+            return "BUY", "Momentum Continuation - No Pullback (Bullish)", recent_high, recent_low
+        if bearish_two_close:
+            extension_atr = (recent_low - curr_close) / atr_1m
+            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation not active", recent_high, recent_low
+            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
+            if body_ratio < min_body_atr: return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
+            if close_location > (1.0 - min_close_location): return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
+            return "SELL", "Momentum Continuation - No Pullback (Bearish)", recent_high, recent_low
+        return "HOLD", "No continuation structure", recent_high, recent_low
 
-    p_high = float(p5["high"])
-    p_low = float(p5["low"])
-    p_ema9 = float(p5["ema9"])
-    p_ema15 = float(p5["ema15"])
+    if bullish_two_close:
+        extension_atr = (curr_close - recent_high) / atr_1m
+        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT: return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
+        if close_location < BREAKOUT_MIN_CLOSE_LOCATION: return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
+        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT: return "HOLD", "Breakout overextended", recent_high, recent_low
+        return "BUY", "Momentum Breakout Continuation (Bullish)", recent_high, recent_low
 
-    bullish_cross = (p_ema9 <= p_ema15) and (ema9_5 > ema15_5)
-    bearish_cross = (p_ema9 >= p_ema15) and (ema9_5 < ema15_5)
+    if bearish_two_close:
+        extension_atr = (recent_low - curr_close) / atr_1m
+        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT: return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
+        if close_location > (1.0 - BREAKOUT_MIN_CLOSE_LOCATION): return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
+        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT: return "HOLD", "Breakout overextended", recent_high, recent_low
+        return "SELL", "Momentum Breakout Continuation (Bearish)", recent_high, recent_low
 
-    touched_ema15 = (low5 - EMA_TOUCH_TOLERANCE <= ema15_5 <= high5 + EMA_TOUCH_TOLERANCE)
-    touched_ema9 = (low5 - EMA_TOUCH_TOLERANCE <= ema9_5 <= high5 + EMA_TOUCH_TOLERANCE)
-    prev_touched_ema15 = (p_low <= p_ema15 <= p_high)
-    prev_touched_ema9 = (p_low <= p_ema9 <= p_high)
+    if bullish_fast_cross:
+        extension_atr = (curr_close - recent_high) / atr_1m
+        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT: return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        if close_location < FAST_MOMENTUM_MIN_CLOSE_LOCATION: return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT: return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        return "BUY", "Fast Momentum Breakout (Bullish - 1M impulse)", recent_high, recent_low
 
-    # 1. CROSSOVER TRIGGER (Independent of 15M Trend Lag)
-    if bullish_cross and close5 > ema9_5:
-        return "BUY", "5M EMA Crossover - Bullish Momentum", ema9_5, ema15_5
+    if bearish_fast_cross:
+        extension_atr = (recent_low - curr_close) / atr_1m
+        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT: return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        if close_location > (1.0 - FAST_MOMENTUM_MIN_CLOSE_LOCATION): return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT: return "HOLD", "Fast momentum rejected", recent_high, recent_low
+        return "SELL", "Fast Momentum Breakout (Bearish - 1M impulse)", recent_high, recent_low
 
-    if bearish_cross and close5 < ema9_5:
-        return "SELL", "5M EMA Crossover - Bearish Momentum", ema9_5, ema15_5
+    return "HOLD", "No setup", recent_high, recent_low
 
-    # 2. TOUCH / PULLBACK TRIGGER (Requires 15M Confluence)
-    if trend_5m == "BULLISH" and trend_15m == "BULLISH":
-        close_side_ok = close5 > ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
-        m15_side_ok = (float(m15["close"]) > ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
 
-        if m15_side_ok and close_side_ok:
-            if touched_ema15:
-                trigger = "5M EMA15 Touch - Bullish Trend"
-                if prev_touched_ema15: trigger += " (Continuation Touch)"
-                return "BUY", trigger, ema9_5, ema15_5
+CONSOLIDATION_LOOKBACK_5M = 8
+CONSOLIDATION_MAX_RANGE_ATR_MULT = 1.5
 
-            if touched_ema9:
-                trigger = "5M EMA9 Touch - Bullish Trend"
-                if prev_touched_ema9: trigger += " (Continuation Touch)"
-                return "BUY", trigger, ema9_5, ema15_5
+def detect_consolidation_breakout(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    if len(df_5m) < CONSOLIDATION_LOOKBACK_5M + 1 or "atr" not in df_5m.columns: return "HOLD", "No setup", 0.0, 0.0
+    bracket = df_5m.iloc[-(CONSOLIDATION_LOOKBACK_5M + 1):-1]
+    bracket_high = float(bracket["high"].max()); bracket_low = float(bracket["low"].min())
+    atr_5m = df_5m["atr"].iloc[-1]
+    if pd.isna(atr_5m) or atr_5m <= 0: return "HOLD", "No setup", bracket_high, bracket_low
+    if (bracket_high - bracket_low) > (CONSOLIDATION_MAX_RANGE_ATR_MULT * atr_5m): return "HOLD", "No setup", bracket_high, bracket_low
 
-    if trend_5m == "BEARISH" and trend_15m == "BEARISH":
-        close_side_ok = close5 < ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
-        m15_side_ok = (float(m15["close"]) < ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
+    curr = df_1m.iloc[-1]
+    candle_body = abs(float(curr["close"]) - float(curr["open"]))
+    atr_1m = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else None
+    strong_candle = bool(candle_body >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m) if atr_1m and not pd.isna(atr_1m) else True
 
-        if m15_side_ok and close_side_ok:
-            if touched_ema15:
-                trigger = "5M EMA15 Touch - Bearish Trend"
-                if prev_touched_ema15: trigger += " (Continuation Touch)"
-                return "SELL", trigger, ema9_5, ema15_5
-
-            if touched_ema9:
-                trigger = "5M EMA9 Touch - Bearish Trend"
-                if prev_touched_ema9: trigger += " (Continuation Touch)"
-                return "SELL", trigger, ema9_5, ema15_5
-
-    reason = f"5M {trend_5m}, 15M {trend_15m}; EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch or cross"
-    return "HOLD", reason, ema9_5, ema15_5
+    if curr["close"] > bracket_high and curr["close"] > curr["open"] and strong_candle:
+        return "BUY", "Consolidation Bracket Breakout (Bullish)", bracket_high, bracket_low
+    if curr["close"] < bracket_low and curr["close"] < curr["open"] and strong_candle:
+        return "SELL", "Consolidation Bracket Breakout (Bearish)", bracket_high, bracket_low
+    return "HOLD", "No setup", bracket_high, bracket_low
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
@@ -622,33 +718,19 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
         total_pips = diff * 10.0 * 2.0
-
     profit_usd = total_pips * 0.10
     return total_pips, profit_usd
-
 
 def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
     risk_dist = abs(entry - sl)
     if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0: risk_dist = 2.5
-
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        return tp1_dist / risk_dist
-    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
-        return (tp1_dist + tp2_dist) / risk_dist
-    if outcome == "WIN (TP1 HIT)":
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        return tp1_dist / risk_dist
-    if "LOSS" in outcome:
-        return -2.0
-
-    single_r = ((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)
-    return single_r * 2.0
-
+    if outcome == "CLOSED (TP1 HIT / SL BE)": return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
+    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: return ((abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) + (abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0)) / risk_dist
+    if outcome == "WIN (TP1 HIT)": return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
+    if "LOSS" in outcome: return -2.0
+    return (((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)) * 2.0
 
 def bucket_adx(adx: float) -> str:
     if adx < 20: return "ADX <20"
@@ -657,32 +739,26 @@ def bucket_adx(adx: float) -> str:
     if adx < 50: return "ADX 40-50"
     return "ADX 50+"
 
-
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
-    if "EMA15" in t: return "EMA15 Trend Pullback"
-    if "EMA9" in t: return "EMA9 Trend Pullback"
-    if "Crossover" in t: return "EMA Crossover Momentum"
-    return "EMA 9/15 Trend Pullback"
-
+    if "Converted" in t: return "No-Pullback Conversion"
+    if "Consolidation" in t: return "Consolidation Bracket Breakout"
+    if "Breakout" in t: return "Momentum Breakout"
+    return "Sweep + BOS"
 
 def bucket_session(timestamp_str: str) -> str:
-    try:
-        hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
-    except Exception:
-        return "Unknown"
+    try: hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
+    except Exception: return "Unknown"
     if 9 <= hour < 14: return "Early (09-14 WIB)"
     if 14 <= hour < 18: return "Mid (14-18 WIB)"
     if 18 <= hour < 22: return "Late (18-22 WIB)"
     return "Outside session"
-
 
 def bucket_confluence(action: str, trend_15m: str) -> str:
     t = (trend_15m or "").upper()
     if not t or t == "NEUTRAL": return "15m Neutral"
     if ((action == "BUY" and t == "BULLISH") or (action == "SELL" and t == "BEARISH")): return "15m Aligned"
     return "15m Disagreed"
-
 
 def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag: int = 8) -> str:
     lines = [f"*{dim_name}:*"]
@@ -699,68 +775,56 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
     return "\n".join(lines)
 
 
+def compute_pullback_zone(action: str, swing_high: float, swing_low: float):
+    rng = swing_high - swing_low
+    if rng <= 0: return None, None
+    if action == "BUY": return float(swing_high - (FIB_RETRACE_MAX * rng)), float(swing_high - (FIB_RETRACE_MIN * rng))
+    return float(swing_low + (FIB_RETRACE_MIN * rng)), float(swing_low + (FIB_RETRACE_MAX * rng))
+
+def check_pullback_entry(action: str, zone_lower: float, zone_upper: float, curr_candle) -> bool:
+    overlaps_zone = (float(curr_candle["high"]) >= zone_lower and float(curr_candle["low"]) <= zone_upper)
+    if not overlaps_zone: return False
+    return float(curr_candle["close"]) > float(curr_candle["open"]) if action == "BUY" else float(curr_candle["close"]) < float(curr_candle["open"])
+
+
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
     chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
-    if not TELEGRAM_BOT_TOKEN or not chat_id:
-        logging.error("[TELEGRAM ERROR] Missing token or chat_id")
-        return
-
+    if not TELEGRAM_BOT_TOKEN or not chat_id: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-
     try:
-        res = await client.post(url, json=payload)
-        if res.status_code != 200:
-            payload_plain = {"chat_id": chat_id, "text": text}
-            res_plain = await client.post(url, json=payload_plain)
-            if res_plain.status_code == 200:
-                logging.info(f"[TELEGRAM SENT] Delivered plain text to Chat ID {chat_id}")
-            else:
-                logging.error(f"[TELEGRAM ERROR] Failed sending message: {res_plain.text}")
-        else:
-            logging.info(f"[TELEGRAM SENT] Delivered Markdown to Chat ID {chat_id}")
-    except Exception as e:
-        logging.error(f"[TELEGRAM EXCEPTION] {e}")
+        res = await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        if res.status_code != 200: await client.post(url, json={"chat_id": chat_id, "text": text})
+    except Exception as e: logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
-    proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame,
-    df_15m: pd.DataFrame, ema9_5m: float, ema15_5m: float, trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0
+    proposed_action: str, trigger_type: str, current_price: float, df_1m: pd.DataFrame, df_5m: pd.DataFrame,
+    recent_high: float, recent_low: float, trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0,
+    plus_di_5m: float = None, minus_di_5m: float = None
 ):
-    m5 = df_5m.iloc[-1]
-    m15 = df_15m.iloc[-1]
+    is_breakout = "Breakout" in trigger_type
+    strategy_label = "Breakout Continuation" if is_breakout else "Liquidity Sweep + Break-of-Structure"
+    veto_rules_text = "- VETO if 5M ADX < 20.0" if is_breakout else "- VETO if 5M ADX < 12.0. Allow extreme-ADX reversal if structure dictates."
+    di_text = f"+DI={float(plus_di_5m):.1f}, -DI={float(minus_di_5m):.1f}" if plus_di_5m is not None else "DI unavailable"
 
     prompt = f"""
-Act as a conservative risk manager for Spot Gold (XAU/USD).
+Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping.
+Strategy in play: {strategy_label}.
+Trigger ({trigger_type}): {proposed_action} at ${current_price:.2f}.
 
-ONLY strategy in use: 5-minute EMA9/EMA15 trend-following pullback & crossover.
-The deterministic strategy has already produced a {proposed_action} trigger.
-Your job is ONLY to approve or veto it; never reverse the direction.
+TECHNICAL CONTEXT:
+1. 1M Close=${float(df_1m['close'].iloc[-1]):.2f}
+2. 5M Ref High=${recent_high:.2f}, Low=${recent_low:.2f}.
+3. 5M ADX={float(df_5m['adx'].iloc[-1]):.1f}; {di_text}.
+4. 15M Trend: {trend_15m}
 
-5M:
-- Trend: {('BULLISH' if ema9_5m > ema15_5m else 'BEARISH')}
-- EMA9: ${ema9_5m:.2f}
-- EMA15: ${ema15_5m:.2f}
-- Open: ${float(m5['open']):.2f}
-- High: ${float(m5['high']):.2f}
-- Low: ${float(m5['low']):.2f}
-- Close: ${float(m5['close']):.2f}
+CRITICAL SCALP VETO RULES:
+{veto_rules_text}
 
-15M CONFLUENCE:
-- Trend: {trend_15m}
-- EMA9: ${float(m15['ema9']):.2f}
-- EMA15: ${float(m15['ema15']):.2f}
-- Close: ${float(m15['close']):.2f}
-- ADX: {adx_15m_true:.1f}
-
-Trigger: {trigger_type}
-Entry: ${current_price:.2f}
-
-Approve only if the technical reaction aligns cleanly with the trigger and there is no obvious immediate structural contradiction.
-Return strict JSON:
-{{"action":"{proposed_action}" or "HOLD", "confidence":0.0-1.0, "reasoning":"2 concise sentences"}}
+Respond strictly in valid JSON matching schema:
+{{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
 """
 
     if GROQ_API_KEY:
@@ -768,8 +832,7 @@ Return strict JSON:
             res = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                response_format={"type": "json_object"}
+                temperature=0.1, response_format={"type": "json_object"}
             )
             return SignalOutput(**json.loads(res.choices[0].message.content))
         except Exception as e:
@@ -777,8 +840,9 @@ Return strict JSON:
 
     if GEMINI_API_KEY:
         try:
+            # UPDATED to gemini-3.7-flash to fix the 404 Error
             res = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.7-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -790,228 +854,221 @@ Return strict JSON:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.70, reasoning="Fallback approval: EMA9/EMA15 strategy conditions satisfied.")
+    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure liquidity sweep + structure break alignment.")
 
 
-# --- BACKGROUND SCANNING LOOP ---
+# --- BACKGROUND SCANNING LOOP (RATE-LIMIT PROTECTED) ---
 async def background_scanning_loop():
-    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID, cached_15m
+    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID, cached_15m, pending_setup
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        last_5m_candle_time = None
+        last_processed_candle_time = None
 
         while True:
             try:
                 now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
+                current_hour_wib = now_wib.hour
 
                 if not SYSTEM_TRADING_ENABLED:
-                    log_scan_event("SYSTEM_PAUSED", stage="SYSTEM", decision="SKIPPED", reason="Kill switch active")
-                    await asyncio.sleep(30)
-                    continue
-
-                active_session = ACTIVE_SESSION_START_HOUR <= now_wib.hour < ACTIVE_SESSION_END_HOUR
-                if not active_session:
-                    log_scan_event("OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED", reason="Outside active session", details={"wib_time": now_wib.strftime('%H:%M')})
                     await asyncio.sleep(60)
                     continue
 
-                # Widened window to prevent MT5 polling delays from skipping scans
+                # =========================================================
+                # 1. 5-MINUTE BOUNDARY LOCK
+                # =========================================================
+                # Forces the scanner to wait for the exact 5-minute candle marks (00, 05, 10...)
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
                     await asyncio.sleep(1)
                     continue
 
-                CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
-                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="5M EMA scan started", details={"wib_time": now_wib.strftime('%Y-%m-%d %H:%M:%S')})
+                active_session = ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
+                if not active_session:
+                    await asyncio.sleep(60)
+                    continue
 
-                df_5m_raw = await fetch_timeframe_data(client, "5min", outputsize=100)
-                if df_5m_raw is None or len(df_5m_raw) < 20:
-                    log_scan_event("DATA_FETCH_FAILED", stage="DATA", decision="RETRY", reason="Failed to fetch sufficient 5M candles")
+                # Fetch 5M data first to check the timestamp
+                df_5m = await fetch_timeframe_data(client, "5min")
+                if df_5m is None or len(df_5m) < 6:
                     await asyncio.sleep(15)
                     continue
 
-                df_5m = calculate_ema_metrics(df_5m_raw)
-                if len(df_5m) >= 2:
-                    df_5m = df_5m.iloc[:-1].copy()
-                if len(df_5m) < 20:
-                    log_scan_event("DATA_INSUFFICIENT", stage="DATA", decision="RETRY", reason="No completed 5M candle available yet")
-                    await asyncio.sleep(10)
-                    continue
-                
+                df_5m = calculate_metrics_5m(df_5m)
                 candle_time_5m = df_5m["datetime"].iloc[-1]
-                if last_5m_candle_time is not None and candle_time_5m == last_5m_candle_time:
-                    await asyncio.sleep(2)
-                    continue
-                last_5m_candle_time = candle_time_5m
 
-                # Refresh 15M data alongside 5M data
-                df_15m_raw = await fetch_timeframe_data(client, "15min", outputsize=100)
-                if df_15m_raw is not None and len(df_15m_raw) >= 20:
-                    df_15m_new = calculate_ema_metrics(df_15m_raw)
-                    if len(df_15m_new) >= 2:
-                        df_15m_new = df_15m_new.iloc[:-1].copy()
-                    if len(df_15m_new) >= 20:
-                        cached_15m["df"] = df_15m_new
+                # =========================================================
+                # 2. STRICT DEDUPLICATION (PREVENTS TWELVE DATA 429 SPAM)
+                # =========================================================
+                if last_processed_candle_time is not None and candle_time_5m == last_processed_candle_time:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Lock this cycle down so we never evaluate it twice
+                last_processed_candle_time = candle_time_5m
+
+                CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Scanner cycle started")
+                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning Sweep/BOS + Breakout...")
+
+                # Fetch 1M data (Snapshot at the 5-minute boundary)
+                df_1m = await fetch_timeframe_data(client, "1min")
+                if df_1m is None or len(df_1m) < 3:
+                    await asyncio.sleep(15)
+                    continue
+
+                df_1m = calculate_metrics_m1(df_1m)
+
+                curr_high = float(df_1m["high"].tail(3).max())
+                curr_low = float(df_1m["low"].tail(3).min())
+                update_open_trades(curr_high, curr_low)
+
+                curr_price = float(df_1m["close"].iloc[-1])
+                adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
+                plus_di_5m = float(df_5m["plus_di"].iloc[-1]) if "plus_di" in df_5m.columns and not pd.isna(df_5m["plus_di"].iloc[-1]) else None
+                minus_di_5m = float(df_5m["minus_di"].iloc[-1]) if "minus_di" in df_5m.columns and not pd.isna(df_5m["minus_di"].iloc[-1]) else None
+
+                need_refresh = (cached_15m["df"] is None or cached_15m["fetched_at"] is None or (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES)))
+                in_mid_session_veto = MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR
+
+                if in_mid_session_veto:
+                    logging.info(f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | 15M API refresh skipped.")
+                elif need_refresh:
+                    df_15m_raw = await fetch_timeframe_data(client, "15min")
+                    if df_15m_raw is not None and len(df_15m_raw) >= 21:
+                        cached_15m["df"] = calculate_metrics_5m(df_15m_raw)
                         cached_15m["fetched_at"] = datetime.now(timezone.utc)
-                        logging.info(f"[15M REFRESH] New completed 15M EMA snapshot cached at {now_wib.strftime('%H:%M:%S')} WIB")
 
-                df_15m = cached_15m["df"]
-                if df_15m is None or len(df_15m) < 20:
-                    log_scan_event("DATA_INSUFFICIENT", stage="DATA", decision="HOLD", reason="No valid 15M confluence cache")
-                    await asyncio.sleep(2)
-                    continue
+                trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
+                adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                trend_15m, trend_15m_sep = compute_ema_trend(df_15m)
-                adx_15m_true = 0.0
+                proposed_action = "HOLD"
+                trigger_type = "None"
+                recent_high = 0.0
+                recent_low = 0.0
+                status_note = ""
 
-                update_open_trades(
-                    float(df_5m["high"].iloc[-1]), 
-                    float(df_5m["low"].iloc[-1]), 
-                    float(df_5m["close"].iloc[-1])
-                )
+                # --- V7 MOMENTUM LOGIC ---
+                if pending_setup is not None:
+                    if datetime.now(timezone.utc) > pending_setup["expires"]:
+                        expired_action = pending_setup["action"]
+                        b_action, b_trigger_type, b_recent_high, b_recent_low = logged_breakout_check(df_1m, df_5m, allow_momentum_continuation=True)
+                        if b_action == expired_action and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX:
+                            proposed_action = b_action
+                            trigger_type = f"No Pullback -> Momentum Continuation ({b_trigger_type})"
+                            recent_high = b_recent_high
+                            recent_low = b_recent_low
+                        pending_setup = None
+                    else:
+                        confirmed = check_pullback_entry(pending_setup["action"], pending_setup["zone_lower"], pending_setup["zone_upper"], df_1m.iloc[-1])
+                        recent_high = pending_setup["recent_high"]
+                        recent_low = pending_setup["recent_low"]
+                        if confirmed:
+                            proposed_action = pending_setup["action"]
+                            trigger_type = pending_setup["trigger_type"] + " + Pullback Confirmed"
+                            pending_setup = None
+                        else:
+                            b_action, b_trigger_type, b_recent_high, b_recent_low = logged_breakout_check(df_1m, df_5m, allow_momentum_continuation=True)
+                            if b_action != "HOLD" and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX:
+                                if b_action == pending_setup["action"]:
+                                    proposed_action = b_action
+                                    trigger_type = f"No Pullback -> Converted to {b_trigger_type}"
+                                    recent_high = b_recent_high
+                                    recent_low = b_recent_low
+                                    pending_setup = None
+                                else:
+                                    proposed_action = b_action
+                                    trigger_type = f"{b_trigger_type} (Invalidated Sweep)"
+                                    recent_high = b_recent_high
+                                    recent_low = b_recent_low
+                                    pending_setup = None
+                            else:
+                                status_note = f" | Awaiting pullback into ${pending_setup['zone_lower']:.2f}-${pending_setup['zone_upper']:.2f}"
 
-                curr_price = float(df_5m["close"].iloc[-1])
-                proposed_action, trigger_type, ema9_5m, ema15_5m = detect_ema_touch_signal(df_5m, df_15m)
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    new_action, new_trigger_type, new_recent_high, new_recent_low = detect_liquidity_sweep_structure(df_1m, df_5m)
+                    recent_high = new_recent_high
+                    recent_low = new_recent_low
+                    if new_action != "HOLD":
+                        swing_low = float(df_1m.iloc[-2]["low"]) if new_action == "BUY" else float(df_1m.iloc[-1]["close"])
+                        swing_high = float(df_1m.iloc[-1]["close"]) if new_action == "BUY" else float(df_1m.iloc[-2]["high"])
+                        zone_lower, zone_upper = compute_pullback_zone(new_action, swing_high, swing_low)
+                        if zone_lower is not None:
+                            pending_setup = {
+                                "action": new_action, "trigger_type": new_trigger_type, "trigger_price": float(curr_price),
+                                "recent_high": new_recent_high, "recent_low": new_recent_low, "zone_lower": zone_lower,
+                                "zone_upper": zone_upper, "expires": datetime.now(timezone.utc) + timedelta(minutes=PULLBACK_EXPIRY_MINUTES),
+                            }
+                            status_note = f" | New {new_action} setup armed, awaiting pullback"
 
-                log_scan_event(
-                    "EMA_EVALUATION", stage="EMA_STRATEGY", action=proposed_action, trigger_type=trigger_type, price=curr_price,
-                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="ENTRY_CANDIDATE" if proposed_action != "HOLD" else "HOLD",
-                    reason=trigger_type,
-                    details={
-                        "5m_candle_time": str(candle_time_5m), "ema9_5m": ema9_5m, "ema15_5m": ema15_5m,
-                        "ema9_15m": float(df_15m["ema9"].iloc[-1]), "ema15_15m": float(df_15m["ema15"].iloc[-1]),
-                        "trend_15m": trend_15m, "15m_cached": True,
-                    }
-                )
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    c_action, c_trigger_type, c_bracket_high, c_bracket_low = detect_consolidation_breakout(df_1m, df_5m)
+                    if c_action != "HOLD" and adx_5m >= 20.0:
+                        proposed_action = c_action; trigger_type = c_trigger_type; recent_high = c_bracket_high; recent_low = c_bracket_low
 
+                if pending_setup is None and proposed_action == "HOLD" and not status_note:
+                    b_action, b_trigger_type, b_recent_high, b_recent_low = logged_breakout_check(df_1m, df_5m, allow_momentum_continuation=False)
+                    if b_action != "HOLD" and adx_5m >= 20.0:
+                        proposed_action = b_action; trigger_type = b_trigger_type; recent_high = b_recent_high; recent_low = b_recent_low
+
+                # --- VETO CHECKS ---
+                if proposed_action != "HOLD":
+                    stat_vetoed, stat_veto_reason = check_stat_veto(adx_5m, current_hour_wib, action=proposed_action, trigger_type=trigger_type, plus_di_5m=plus_di_5m, minus_di_5m=minus_di_5m)
+                    if stat_vetoed:
+                        logging.info(f"[STAT VETO] {stat_veto_reason}")
+                        proposed_action = "HOLD"
+
+                if proposed_action != "HOLD":
+                    try:
+                        conn = get_db_connection(); cursor = conn.cursor()
+                        cursor.execute("SELECT outcome_timestamp FROM signals WHERE status = 'EXECUTED' AND outcome = 'LOSS (SL HIT)' AND outcome_timestamp IS NOT NULL AND outcome_timestamp != '' ORDER BY id DESC LIMIT 1")
+                        last_loss = cursor.fetchone()
+                        cursor.close(); conn.close()
+                        if last_loss and last_loss.get("outcome_timestamp"):
+                            last_loss_time = datetime.strptime(str(last_loss["outcome_timestamp"]).replace(" WIB", ""), "%Y-%m-%d %H:%M:%S")
+                            if 0 <= (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0 < LOSS_COOLDOWN_MINUTES:
+                                logging.info(f"[LOSS COOLDOWN] Skipping {proposed_action}.")
+                                proposed_action = "HOLD"
+                    except Exception as e: logging.error(e)
+
+                if proposed_action != "HOLD":
+                    try:
+                        conn = get_db_connection(); cursor = conn.cursor()
+                        cursor.execute("SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome FROM signals WHERE status = 'EXECUTED' AND action = %s ORDER BY id DESC LIMIT 1", (str(proposed_action),))
+                        last_trade = cursor.fetchone()
+                        cursor.close(); conn.close()
+                        if last_trade:
+                            required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
+                            if abs(curr_price - float(last_trade["entry_p"])) < required_distance:
+                                logging.info(f"[DISTANCE COOLDOWN] Skipping {proposed_action}: Price too close.")
+                                proposed_action = "HOLD"
+                    except Exception as e: logging.error(e)
+
+                # --- AI EVALUATION ---
                 if proposed_action == "HOLD":
-                    logging.info(f"[EMA SCAN] {now_wib.strftime('%H:%M')} WIB | Price ${curr_price:.2f} | 5M EMA9 ${ema9_5m:.2f} / EMA15 ${ema15_5m:.2f} | 15M {trend_15m} | HOLD ({trigger_type})")
-                    log_scan_event("SCAN_END", stage="SCAN", action="HOLD", trigger_type=trigger_type, price=curr_price, adx_15m=adx_15m_true, trend_15m=trend_15m, decision="COMPLETE", reason="No aligned EMA touch or crossover")
-                    await asyncio.sleep(2)
-                    continue
-
-                # Loss Cooldown Check
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT outcome_timestamp FROM signals
-                        WHERE status='EXECUTED' AND outcome='LOSS (SL HIT)'
-                        AND outcome_timestamp IS NOT NULL AND outcome_timestamp != ''
-                        ORDER BY id DESC LIMIT 1
-                    """)
-                    last_loss = cursor.fetchone()
-                    cursor.close(); conn.close()
-
-                    if last_loss and last_loss.get("outcome_timestamp"):
-                        ts_str = str(last_loss["outcome_timestamp"]).replace(" WIB", "")
-                        last_loss_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        minutes_since_loss = (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0
-                        if 0 <= minutes_since_loss < LOSS_COOLDOWN_MINUTES:
-                            log_scan_event("LOSS_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"{minutes_since_loss:.1f} minutes since last SL hit")
-                            logging.info(f"[RISK FILTER] Valid {proposed_action} blocked by LOSS COOLDOWN. {minutes_since_loss:.1f} mins since last SL hit.")
-                            await asyncio.sleep(2)
-                            continue
-                except Exception as e:
-                    logging.error(f"[LOSS COOLDOWN ERROR] {e}")
-
-                # Distance Cooldown Check
-                try:
-                    conn = get_db_connection(); cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome
-                        FROM signals WHERE status='EXECUTED' AND action=%s
-                        ORDER BY id DESC LIMIT 1
-                    """, (str(proposed_action),))
-                    last_trade = cursor.fetchone()
-                    cursor.close(); conn.close()
-                    
-                    if last_trade:
-                        last_entry_price = float(last_trade["entry_p"] or 0.0)
-                        required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
-                        if last_entry_price > 0 and abs(curr_price - last_entry_price) < required_distance:
-                            log_scan_event("DISTANCE_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"Price within ${required_distance:.2f} of previous {proposed_action} trade")
-                            logging.info(f"[RISK FILTER] Valid {proposed_action} blocked by DISTANCE COOLDOWN. Price ${curr_price:.2f} is within ${required_distance:.2f} of previous entry.")
-                            await asyncio.sleep(2)
-                            continue
-                except Exception as e:
-                    logging.error(f"[DISTANCE COOLDOWN ERROR] {e}")
-
-                ai_decision = await analyze_signal_with_ai(
-                    proposed_action, trigger_type, curr_price,
-                    df_5m, df_15m, ema9_5m, ema15_5m,
-                    trend_15m, adx_15m_true
-                )
-
-                log_scan_event(
-                    "AI_DECISION", stage="AI", action=proposed_action, trigger_type=trigger_type,
-                    price=curr_price, trend_15m=trend_15m, decision=ai_decision.action,
-                    reason=ai_decision.reasoning, details={"confidence": float(ai_decision.confidence)}
-                )
-
-                raw_atr = df_5m["atr"].iloc[-1]
-                atr_5m = float(raw_atr) if not pd.isna(raw_atr) and float(raw_atr) > 0 else 2.5
-                risk = max(2.5, atr_5m * 1.2)
-                tp1_r_mult = 1.5
-                tp2_r_mult = 2.5
-
-                if proposed_action == "BUY":
-                    sl_price = curr_price - risk
-                    tp1_price = curr_price + risk * tp1_r_mult
-                    tp2_price = curr_price + risk * tp2_r_mult
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | Status: HOLD{status_note}")
                 else:
-                    sl_price = curr_price + risk
-                    tp1_price = curr_price - risk * tp1_r_mult
-                    tp2_price = curr_price - risk * tp2_r_mult
+                    logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
+                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m, recent_high, recent_low, trend_15m, adx_15m_true, plus_di_5m, minus_di_5m)
 
-                if ai_decision.action == proposed_action:
-                    new_id = log_trade_signal(
-                        "EXECUTED", proposed_action, trigger_type, curr_price,
-                        sl_price, tp1_price, tp2_price, float(ai_decision.confidence),
-                        0.0, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true
-                    )
+                    atr_1m = float(df_1m["atr"].iloc[-1]) if not pd.isna(df_1m["atr"].iloc[-1]) else 3.0
+                    risk = max(2.5, atr_1m * 1.2)
+                    tp1_r_mult = 1.5
+                    tp2_r_mult = 3.0 if "Breakout" in trigger_type else 2.5
 
-                    log_scan_event(
-                        "SIGNAL_EXECUTED", stage="TRADE_SIGNAL", action=proposed_action,
-                        trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m,
-                        decision="EXECUTED", reason=ai_decision.reasoning,
-                        details={"signal_id": new_id, "ema9_5m": ema9_5m, "ema15_5m": ema15_5m,
-                                 "ema9_15m": float(df_15m["ema9"].iloc[-1]),
-                                 "ema15_15m": float(df_15m["ema15"].iloc[-1]),
-                                 "risk": risk, "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price}
-                    )
+                    sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
+                    tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
+                    tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
 
-                    msg = (
-                        f"📈 *EMA 9/15 TREND SIGNAL #{new_id}*\n\n"
-                        f"Asset: *XAUUSD (Gold Spot)*\n"
-                        f"Action: *{proposed_action}*\n"
-                        f"Type: *{trigger_type}*\n"
-                        f"Entry Price: *${curr_price:.2f}*\n\n"
-                        f"Stop Loss (SL): *${sl_price:.2f}*\n"
-                        f"Take Profit 1 (1.5R): *${tp1_price:.2f}*\n"
-                        f"Take Profit 2 (2.5R): *${tp2_price:.2f}*\n\n"
-                        f"INDICATOR METRICS:\n"
-                        f"- 5M EMA9: *${ema9_5m:.2f}*\n"
-                        f"- 5M EMA15: *${ema15_5m:.2f}*\n"
-                        f"- 15M Trend: *{trend_15m}*\n"
-                        f"- 15M EMA9: *${float(df_15m['ema9'].iloc[-1]):.2f}*\n"
-                        f"- 15M EMA15: *${float(df_15m['ema15'].iloc[-1]):.2f}*\n"
-                        f"- 5M ATR (risk unit): *${atr_5m:.2f}*\n\n"
-                        f"Reasoning: {ai_decision.reasoning}"
-                    )
-                    await send_telegram_alert(client, msg)
-                else:
-                    log_trade_signal(
-                        "VETOED", proposed_action, trigger_type, curr_price,
-                        sl_price, tp1_price, tp2_price, float(ai_decision.confidence),
-                        0.0, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true
-                    )
-                    log_scan_event("AI_VETO", stage="AI", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="VETOED", reason=ai_decision.reasoning)
+                    if ai_decision.action == proposed_action:
+                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
+                        msg = (f"🚀 *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
+                        await send_telegram_alert(client, msg)
+                    else:
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
 
-                log_scan_event("SCAN_END", stage="SCAN", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="COMPLETE", reason="EMA strategy cycle completed")
-                await asyncio.sleep(2)
+                del df_1m, df_5m; gc.collect()
+                await asyncio.sleep(5)  # Sleeps safely because the boundary lock is handled at the top
 
             except Exception as e:
-                log_scan_event("SCAN_ERROR", stage="SCAN", decision="ERROR", reason=str(e), details={"exception_type": type(e).__name__})
                 logging.error(f"[SCAN LOOP ERROR] {e}")
                 await asyncio.sleep(10)
 
@@ -1037,7 +1094,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/")
 def home():
     return {"status": "ok", "message": "Trading bot scanner and webhook server active."}
@@ -1061,26 +1117,20 @@ async def get_latest_signal():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
         cur.execute("""
             SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                    COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
             FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1;
         """)
-
         row = cur.fetchone()
         cur.close()
         conn.close()
 
         if row:
-            return {
-                "id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]),
-                "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]),
-                "timestamp": str(row["log_time"]), "trading_enabled": True
-            }
+            return {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "trading_enabled": True}
         return {"signal": None, "trading_enabled": True}
     except Exception as e:
-        logging.error(f"[MT5 BRIDGE ERROR /get-latest-signal] {e}")
+        logging.error(f"[MT5 BRIDGE ERROR] {e}")
         return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
 
 
@@ -1094,10 +1144,7 @@ async def telegram_webhook(request: Request):
         raw_text = message.get("text", "").strip().lower()
         sender_chat_id = str(message.get("chat", {}).get("id", ""))
 
-        if not sender_chat_id or not raw_text:
-            return {"status": "ignored"}
-
-        logging.info(f"[WEBHOOK RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
+        if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             if raw_text in ["/help", "/start"]:
@@ -1105,17 +1152,14 @@ async def telegram_webhook(request: Request):
                     "🤖 *TRADING BOT COMMANDS:*\n\n"
                     "• `/status` - 📡 Real-Time MT5 & Server Heartbeat Status\n"
                     "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
-                    "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
+                    "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown\n"
                     "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
-                    "• `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
-                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
-                    "• `/resume` - 🟢 Re-enable Auto-Trading Execution\n"
-                    "• `/help` - Display Command Menu\n\n"
-                    "📐 Active strategy: 5M EMA9/EMA15 trend pullback and crossover.\n"
-                    f"⏱️ Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit."
+                    "• `/analyze` - Forward-Test Breakdown by Strategy\n"
+                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH*\n"
+                    "• `/resume` - 🟢 Re-enable Auto-Trading Execution"
                 )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-
+            
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:
                     now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
@@ -1139,272 +1183,48 @@ async def telegram_webhook(request: Request):
                         f"• Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`"
                     )
                 else:
-                    reply = (
-                        "🔴 *MT5 DISCONNECTED*\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "The server is running, but MT5 has not sent any pings since the last reboot."
-                    )
+                    reply = "🔴 *MT5 DISCONNECTED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
-                reply = "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Market scanner loop has been **PAUSED**.\n• MT5 Signal Copier will **IGNORE** all new signals.\n\n👉 Send `/resume` to reactivate trading."
-                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                await send_telegram_alert(client, "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.", target_chat_id=sender_chat_id)
 
             elif raw_text == "/resume":
                 SYSTEM_TRADING_ENABLED = True
-                reply = "🟢 *AUTO-TRADING SYSTEM RESUMED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Scanner loop is now **ACTIVE**.\n• MT5 bridge is listening for live setups."
-                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                await send_telegram_alert(client, "🟢 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.", target_chat_id=sender_chat_id)
 
             elif raw_text == "/stats":
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
-
                     cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED'")
                     total_executed = cur.fetchone()["total"] or 0
-
                     cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED'")
                     total_vetoes = cur.fetchone()["vetoes"] or 0
-
-                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
-                    total_pending = cur.fetchone()["pending"] or 0
-
                     cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
                     tp1_wins = cur.fetchone()["tp1_wins"] or 0
-
                     cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
                     tp2_wins = cur.fetchone()["tp2_wins"] or 0
-
                     cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE outcome LIKE 'LOSS%'")
                     losses = cur.fetchone()["losses"] or 0
 
-                    cur.execute("""
-                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
-                    """)
+                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
                     closed_trades = cur.fetchall()
                     total_pips = win_pips = loss_pips = 0.0
                     total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
-                        trade_pips, _trade_usd = compute_trade_pips({
-                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
-                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]
-                        })
+                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
                         total_pips += trade_pips
                         if trade_pips > 0: win_pips += trade_pips
                         elif trade_pips < 0: loss_pips += abs(trade_pips)
 
                     win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                    est_dollar = total_pips * 0.10
-                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
-                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
-                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
-
-                    cur.close()
-                    conn.close()
-
-                    reply = (
-                        f"📊 *PERFORMANCE ANALYTICS DASHBOARD*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💰 *NET PIPS & PROFIT:*\n"
-                        f"• Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
-                        f"📈 *WIN / LOSS BREAKDOWN:*\n"
-                        f"• Total Executed: *{total_executed}*\n"
-                        f"• Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
-                        f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
-                        f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
-                        f"• Total Losses (SL Hit): *{losses}*\n"
-                        f"• Active Pending: *{total_pending}*\n\n"
-                        f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
-                        f"• Total Signals: *{total_executed + total_vetoes}*\n"
-                        f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
-                        f"🎯 *RISK & TRADE METRICS:*\n"
-                        f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
-                        f"• Profit Factor: *{profit_factor:.2f}*\n"
-                        f"• Win Rate: *{win_rate:.1f}%*"
-                    )
+                    cur.close(); conn.close()
+                    reply = f"📊 *PERFORMANCE*\nTotal Pips: *{total_pips:+.1f}*\nWin Rate: *{win_rate:.1f}%*\nWins: {total_wins_count} | Losses: {losses}"
                     await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as e: await send_telegram_alert(client, f"⚠️ Error: {e}", target_chat_id=sender_chat_id)
 
-                except Exception as db_err:
-                    logging.error(f"[WEBHOOK ERROR /stats] {db_err}")
-                    await send_telegram_alert(client, f"⚠️ Error querying stats: {db_err}", target_chat_id=sender_chat_id)
-
-            elif raw_text == "/pips":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
-                    """)
-                    trades = cur.fetchall()
-                    
-                    total_pips = gross_win_pips = gross_loss_pips = 0.0
-                    winning_trades_count = losing_trades_count = 0
-
-                    for t in trades:
-                        pips, _profit_usd = compute_trade_pips({
-                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
-                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]
-                        })
-                        total_pips += pips
-                        if pips > 0:
-                            gross_win_pips += pips
-                            winning_trades_count += 1
-                        elif pips < 0:
-                            gross_loss_pips += abs(pips)
-                            losing_trades_count += 1
-
-                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
-                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
-                    est_profit_usd = total_pips * 0.10
-
-                    cur.close()
-                    conn.close()
-
-                    reply = (
-                        f"💵 *DETAILED PIPS & EARNINGS REPORT*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 *SUMMARY:*\n"
-                        f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
-                        f"📈 *PIPS BREAKDOWN:*\n"
-                        f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
-                        f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
-                        f"🎯 *AVERAGE METRICS:*\n"
-                        f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
-                        f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
-                        f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💡 *Catatan:* Dihitung pada $0.10/pip (0.01 lot XAU/USD)."
-                    )
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-                except Exception as err:
-                    logging.error(f"[WEBHOOK ERROR /pips] {err}")
-                    await send_telegram_alert(client, f"⚠️ Error calculating pips: {err}", target_chat_id=sender_chat_id)
-
-            elif raw_text == "/logs":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(timestamp, created_at::text, 'N/A') AS log_time
-                        FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 10
-                    """)
-                    logs = cur.fetchall()
-                    cur.close()
-                    conn.close()
-
-                    if not logs:
-                        reply = "📜 *LAST 10 TRADE LOGS:*\n\n_Belum ada transaksi yang tereksekusi di database._"
-                    else:
-                        reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        for l in logs:
-                            trade_id = l["id"]
-                            action = l["action"]
-                            entry = float(l["entry_p"])
-                            exit_p = float(l["exit_price"]) if l.get("exit_price") is not None else None
-                            outcome = l["outcome_val"]
-                            date_str = str(l["log_time"])
-
-                            if exit_p is not None:
-                                pips, profit_usd = compute_trade_pips({
-                                    "action": action, "entry_price": entry, "sl_price": l["sl_p"],
-                                    "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p, "outcome": outcome
-                                })
-                                r_multiple = compute_r_multiple(
-                                    action, entry, exit_p, float(l["sl_p"] or 0.0), float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
-                                )
-                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
-                            else:
-                                pip_str = "*ACTIVE / IN PROGRESS*"
-
-                            icon = "🟢" if ("WIN" in outcome or "CLOSED" in outcome) else "🔴" if "LOSS" in outcome else "🟡"
-                            reply += (
-                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
-                                f"• Entry: ${entry:.2f} → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
-                                f"• Outcome: *{outcome}*\n"
-                                f"• Result: {pip_str} | Time: {date_str}\n"
-                                f"──────────────────────────\n"
-                            )
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-                except Exception as log_err:
-                    logging.error(f"[WEBHOOK ERROR /logs] {log_err}")
-                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
-
-            elif raw_text == "/analyze":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(adx_15m, 0) AS adx_val, trend_15m, COALESCE(timestamp, created_at::text, '') AS ts
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
-                    """)
-                    rows = cur.fetchall()
-                    cur.close()
-                    conn.close()
-
-                    if not rows:
-                        reply = "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n_Not enough closed trades yet to analyze._"
-                    else:
-                        segments = {"Strategy": {}, "ADX Regime": {}, "Session": {}, "15m Confluence": {}}
-                        overall_r = []
-
-                        for r in rows:
-                            entry = float(r["entry_p"])
-                            exit_p = float(r["exit_price"])
-                            sl = float(r["sl_p"] or 0.0)
-                            tp1 = float(r["tp1_p"] or 0.0)
-                            tp2 = float(r["tp2_p"] or 0.0)
-                            outcome = str(r["outcome_val"] or "PENDING")
-                            action = r["action"]
-                            adx_val = float(r["adx_val"])
-                            trigger = r["trigger_type"] or ""
-                            trend_15m_val = r.get("trend_15m")
-                            ts = r["ts"] or ""
-
-                            r_mult = compute_r_multiple(action, entry, exit_p, sl, tp1, tp2, outcome)
-                            overall_r.append(r_mult)
-                            segments["Strategy"].setdefault(bucket_strategy(trigger), []).append(r_mult)
-                            segments["ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
-                            segments["Session"].setdefault(bucket_session(ts), []).append(r_mult)
-                            segments["15m Confluence"].setdefault(bucket_confluence(action, trend_15m_val), []).append(r_mult)
-
-                        n_total = len(overall_r)
-                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
-                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
-
-                        reply_parts = [
-                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*",
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                            f"Sample: *{n_total} closed trades*",
-                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*", ""
-                        ]
-
-                        for dim in ["Strategy", "ADX Regime", "Session", "15m Confluence"]:
-                            reply_parts.append(format_performance_segment(dim, segments[dim]))
-                            reply_parts.append("")
-
-                        reply_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                        reply_parts.append("💡 Segments need n≥8 to be flagged ⚠️/✅.")
-                        reply = "\n".join(reply_parts)
-
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-                except Exception as an_err:
-                    logging.error(f"[WEBHOOK ERROR /analyze] {an_err}")
-                    await send_telegram_alert(client, f"⚠️ Error running analysis: {an_err}", target_chat_id=sender_chat_id)
-
-    except Exception as e:
-        logging.error(f"[WEBHOOK ERROR] {e}")
-
+    except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
     return {"status": "ok"}

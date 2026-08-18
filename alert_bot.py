@@ -52,192 +52,44 @@ SYMBOL = "XAU/USD"
 SYSTEM_TRADING_ENABLED = True
 CURRENT_SCAN_CYCLE_ID = None
 
-# --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
-pending_setup = None
-PULLBACK_EXPIRY_MINUTES = 10
-FIB_RETRACE_MIN = 0.382
-FIB_RETRACE_MAX = 0.618
-
 # --- 15M CONFLUENCE CACHE ---
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
-SCAN_INTERVAL_SECONDS = 120  # M1 + M5 refresh every 2 minutes
-ACTIVE_SESSION_START_HOUR = 10  # WIB
-ACTIVE_SESSION_END_HOUR = 22    # WIB
+SCAN_INTERVAL_SECONDS = 300  # 5M strategy scan exactly every 5 minutes
+ACTIVE_SESSION_START_HOUR = 0  # WIB - Adjusted to 0 for all-day trading
+ACTIVE_SESSION_END_HOUR = 24   # WIB - Adjusted to 24 for all-day trading
 MID_SESSION_START_HOUR = 14     # WIB
 MID_SESSION_END_HOUR = 18       # WIB
 
-# With the schedule above, the theoretical maximum is:
-# 10-14: 120 cycles x 2 requests = 240
-# 14-18: 120 cycles x 2 requests = 240
-# 18-22: 120 cycles x 2 requests = 240
-# 15M: 16 refreshes in 10-14 + 16 refreshes in 18-22 = 32
-# TOTAL = 752 Twelve Data requests/day.
-# Keep this below the 800/day plan limit.
+# API schedule: one 5M request every 5 minutes during the active session,
+# plus one 15M request every 15 minutes. The 15M dataframe is cached between refreshes.
 TWELVE_DATA_DAILY_LIMIT = 800
-LEVEL_LOOKBACK_CANDLES = 4
 
 # ==========================================================
-# MOMENTUM BREAKOUT QUALITY FILTERS
+# BASIC EMA 9/15 TREND-PULLBACK STRATEGY
 # ==========================================================
-# These filters apply ONLY to the Momentum Breakout system.
-# Sweep + BOS logic is left unchanged.
+# ONLY ACTIVE ENTRY STRATEGY. All previous sweep/BOS, breakout,
+# continuation and consolidation entry logic is disabled.
+# Execution timeframe: 5 minutes.
+# Confluence timeframe: 15 minutes, refreshed every 15 minutes
+# and cached between refreshes.
+EMA_FAST = 9
+EMA_SLOW = 15
+EMA_TOUCH_TOLERANCE = 0.0
+EMA_REQUIRE_CLOSE_IN_TREND = True
+EMA_15M_REQUIRE_CLOSE_SIDE = True
 
-# ==========================================================
-# MOMENTUM BREAKOUT QUALITY FILTERS
-# ==========================================================
-# Normal breakout quality filters.
-BREAKOUT_MIN_BODY_ATR_MULT = 0.50
-BREAKOUT_MIN_CLOSE_LOCATION = 0.65
-
-# Fresh breakout entries remain conservative for the two-close path.
-# The separate FAST MOMENTUM path can enter earlier, but only within its own ATR cap.
-BREAKOUT_MAX_EXTENSION_ATR_MULT = 1.20
-
-# ----------------------------------------------------------
-# MOMENTUM CONTINUATION MODE
-# ----------------------------------------------------------
-# Used ONLY when an existing setup has failed to pull back
-# and price continues to run in the same direction.
-#
-# Zone:
-#   <= 1.20 ATR  -> normal breakout territory / pullback path
-#   1.20-1.80 ATR -> controlled continuation entry allowed
-#   > 1.80 ATR  -> too extended, reject
-MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT = 1.80
-MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT = 0.35
-MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION = 0.60
-MOMENTUM_CONTINUATION_MIN_ADX = 20.0
-
-# ----------------------------------------------------------
-# FAST 1-MINUTE MOMENTUM ENTRY
-# ----------------------------------------------------------
-# Allows a decisive first M1 close through the previous 5M level
-# instead of waiting for two consecutive closes. This is designed
-# to catch clean XAU/USD impulse moves before they run away.
-FAST_MOMENTUM_MIN_BODY_ATR_MULT = 0.35
-FAST_MOMENTUM_MIN_CLOSE_LOCATION = 0.60
-FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT = 1.35
-FAST_MOMENTUM_PREV_BUFFER_ATR = 0.50
-FAST_MOMENTUM_MIN_ADX = 20.0
-
-# Require the current candle to continue in the breakout direction.
-BREAKOUT_REQUIRE_BODY_DIRECTION = True
-
-# --- STAT-BASED VETOES ---
-# High ADX is a hard veto for TREND-FOLLOWING breakout entries.
-# It is NOT a blanket veto for a confirmed Liquidity Sweep + BOS reversal.
-# In an extreme directional move, the sweep/BOS reversal is specifically the
-# setup we want to allow when price sweeps the trend extreme and breaks back.
-STAT_VETO_ADX_THRESHOLD = 50.0
-STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
-STAT_VETO_MID_SESSION_END_HOUR = 18    # WIB
-
-# Extreme-ADX reversal exception.
-# We require DI direction to confirm that the reversal is fighting the
-# dominant momentum: SELL after a bullish impulse, or BUY after a bearish impulse.
-EXTREME_ADX_REVERSAL_MIN_ADX = 50.0
-EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION = True
+# --- LEGACY STAT-VETO COMPATIBILITY ---
+# Deliberately disabled: the active strategy uses only EMA9/EMA15 direction
+# and EMA-touch entry logic. This function is retained only so older external
+# callers do not break.
+def check_stat_veto(*args, **kwargs):
+    return False, ""
 
 # --- LOSS-COOLDOWN ---
 LOSS_COOLDOWN_MINUTES = 10
-
-
-def check_stat_veto(
-    adx_5m: float,
-    current_hour_wib: int,
-    action: str = "HOLD",
-    trigger_type: str = "",
-    plus_di_5m: float = None,
-    minus_di_5m: float = None,
-):
-    """
-    Direction-aware statistical veto.
-
-    ADX measures trend STRENGTH, not direction. Therefore an extreme ADX
-    reading must not blindly veto every setup.
-
-    Rules:
-      1) ADX >= 50 blocks momentum/breakout continuation entries.
-      2) A confirmed Liquidity Sweep + BOS reversal may bypass the ADX veto
-         ONLY when the reversal is opposite the dominant DI direction.
-         Example: +DI > -DI + SELL Sweep/BOS = bullish exhaustion reversal.
-      3) Mid-session 14:00-18:00 WIB remains a separate hard statistical veto.
-    """
-    action = str(action or "HOLD").upper()
-    trigger_type = str(trigger_type or "")
-
-    is_sweep_reversal = (
-        "Liquidity Sweep" in trigger_type
-        and "BOS" in trigger_type
-        and ("Pullback Confirmed" in trigger_type or "Sweep" in trigger_type)
-    )
-
-    # Mid-session remains a HARD veto and is checked before the extreme-ADX
-    # reversal exception. The exception only changes the ADX rule.
-    if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
-        return True, (
-            f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-            f"forward-tested as underperforming (n=17, WR=29%, AvgR=-0.18)"
-        )
-
-    if adx_5m >= EXTREME_ADX_REVERSAL_MIN_ADX and is_sweep_reversal:
-        di_available = (
-            plus_di_5m is not None
-            and minus_di_5m is not None
-            and np.isfinite(float(plus_di_5m))
-            and np.isfinite(float(minus_di_5m))
-        )
-
-        if di_available:
-            plus_di = float(plus_di_5m)
-            minus_di = float(minus_di_5m)
-
-            bullish_dominant = plus_di > minus_di
-            bearish_dominant = minus_di > plus_di
-
-            # SELL after an extreme bullish impulse = exhaustion/reversal.
-            bearish_reversal = action == "SELL" and bullish_dominant
-            # BUY after an extreme bearish impulse = exhaustion/reversal.
-            bullish_reversal = action == "BUY" and bearish_dominant
-
-            if bearish_reversal or bullish_reversal:
-                return False, (
-                    f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} >= "
-                    f"{EXTREME_ADX_REVERSAL_MIN_ADX:.1f}, but {trigger_type} "
-                    f"is opposite the dominant momentum "
-                    f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}); "
-                    f"allowing structural exhaustion reversal."
-                )
-
-            return True, (
-                f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
-                f"Sweep+BOS direction is not opposite dominant momentum "
-                f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}), so this is not treated as exhaustion reversal."
-            )
-
-        if not EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION:
-            return False, (
-                f"Extreme-ADX reversal exception: 5M ADX {adx_5m:.1f} and "
-                f"confirmed {trigger_type}; DI confirmation disabled."
-            )
-
-        return True, (
-            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
-            f"confirmed Sweep+BOS reversal lacks valid +DI/-DI confirmation."
-        )
-
-    if adx_5m >= STAT_VETO_ADX_THRESHOLD:
-        return True, (
-            f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
-            f"for {trigger_type or 'non-reversal'} entry "
-            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27; "
-            f"high-ADX breakout/continuation entries are treated as late/exhausted)."
-        )
-
-    return False, ""
 
 
 class SignalOutput(BaseModel):
@@ -449,60 +301,6 @@ def log_bot_event(
 
 def log_scan_event(event_type: str, **kwargs):
     return log_bot_event(event_type=event_type, **kwargs)
-
-
-def logged_breakout_check(
-    df_1m: pd.DataFrame,
-    df_5m: pd.DataFrame,
-    allow_momentum_continuation: bool = False
-):
-    """Run the existing detector unchanged, then persist its result."""
-    result = detect_breakout_continuation(
-        df_1m,
-        df_5m,
-        allow_momentum_continuation=allow_momentum_continuation
-    )
-    action, trigger_type, recent_high, recent_low = result
-
-    curr = df_1m.iloc[-1]
-    curr_open = float(curr["open"])
-    curr_high = float(curr["high"])
-    curr_low = float(curr["low"])
-    curr_close = float(curr["close"])
-    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else None
-    atr = float(raw_atr) if raw_atr is not None and not pd.isna(raw_atr) and float(raw_atr) > 0 else None
-    body_atr = abs(curr_close - curr_open) / atr if atr else None
-    candle_range = curr_high - curr_low
-    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
-    extension_atr = None
-    if atr:
-        if action == "BUY":
-            extension_atr = (curr_close - recent_high) / atr
-        elif action == "SELL":
-            extension_atr = (recent_low - curr_close) / atr
-        else:
-            # Estimate directional extension for rejected breakout candidates.
-            extension_atr = max(
-                (curr_close - recent_high) / atr,
-                (recent_low - curr_close) / atr
-            )
-
-    log_bot_event(
-        event_type="BREAKOUT_EVALUATION",
-        stage="MOMENTUM_CONTINUATION" if allow_momentum_continuation else "FRESH_BREAKOUT",
-        action=action,
-        trigger_type=trigger_type,
-        price=float(df_1m["close"].iloc[-1]),
-        recent_high=recent_high,
-        recent_low=recent_low,
-        extension_atr=extension_atr,
-        body_atr=body_atr,
-        close_location=close_location,
-        decision="VALID" if action != "HOLD" else "REJECTED_OR_NONE",
-        reason=trigger_type,
-        details={"continuation_mode": allow_momentum_continuation}
-    )
-    return result
 
 
 def log_trade_signal(
@@ -826,27 +624,25 @@ async def fetch_timeframe_data(
         f"&apikey={TWELVE_DATA_API_KEY}"
     )
 
-    res = await client.get(url)
-
-    if res.status_code != 200 or not res.text:
-        return None
-
     try:
+        res = await client.get(url)
+        if res.status_code != 200 or not res.text:
+            return None
         data = res.json()
-    except Exception:
+    except Exception as e:
+        logging.error(f"[DATA FETCH ERROR] {timeframe}: {e}")
         return None
 
     if "values" not in data:
+        logging.warning(f"[DATA FETCH] {timeframe}: {data}")
         return None
 
     df = pd.DataFrame(data["values"])
+    if df.empty:
+        return None
 
     df["datetime"] = pd.to_datetime(df["datetime"])
-
-    df = (
-        df.sort_values("datetime")
-        .reset_index(drop=True)
-    )
+    df = df.sort_values("datetime").reset_index(drop=True)
 
     for col in ["open", "high", "low", "close"]:
         if col in df.columns:
@@ -855,9 +651,12 @@ async def fetch_timeframe_data(
     return df
 
 
-# --- INDICATOR CALCULATIONS ---
-def calculate_metrics_m1(df: pd.DataFrame):
-    df = df.tail(100).copy()
+# --- EMA / ATR CALCULATIONS ---
+def calculate_ema_metrics(df: pd.DataFrame):
+    df = df.tail(150).copy()
+
+    df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema15"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
     df["tr"] = np.maximum(
         df["high"] - df["low"],
@@ -866,627 +665,143 @@ def calculate_metrics_m1(df: pd.DataFrame):
             abs(df["low"] - df["close"].shift(1))
         )
     )
-
     df["atr"] = df["tr"].rolling(window=14).mean()
 
     return df
+
+
+def calculate_metrics_m1(df: pd.DataFrame):
+    # Kept only for compatibility with legacy helper references.
+    return calculate_ema_metrics(df)
 
 
 def calculate_metrics_5m(df: pd.DataFrame):
-    df = df.tail(100).copy()
-
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift(1)),
-            abs(df["low"] - df["close"].shift(1))
-        )
-    )
-
-    df["up_move"] = (
-        df["high"] - df["high"].shift(1)
-    )
-
-    df["down_move"] = (
-        df["low"].shift(1) - df["low"]
-    )
-
-    df["plus_dm"] = np.where(
-        (df["up_move"] > df["down_move"])
-        & (df["up_move"] > 0),
-        df["up_move"],
-        0.0
-    )
-
-    df["minus_dm"] = np.where(
-        (df["down_move"] > df["up_move"])
-        & (df["down_move"] > 0),
-        df["down_move"],
-        0.0
-    )
-
-    tr14 = df["tr"].rolling(14).sum()
-
-    plus_di = (
-        100
-        * (
-            df["plus_dm"].rolling(14).sum()
-            / (tr14 + 1e-10)
-        )
-    )
-
-    minus_di = (
-        100
-        * (
-            df["minus_dm"].rolling(14).sum()
-            / (tr14 + 1e-10)
-        )
-    )
-
-    dx = (
-        100
-        * (
-            abs(plus_di - minus_di)
-            / (plus_di + minus_di + 1e-10)
-        )
-    )
-
-    df["plus_di"] = plus_di
-    df["minus_di"] = minus_di
-    df["adx"] = dx.rolling(14).mean()
-
-    df["atr"] = df["tr"].rolling(window=14).mean()
-
-    return df
+    # 5M is now the execution timeframe. Keep this function name so the
+    # database/analytics support code remains compatible.
+    return calculate_ema_metrics(df)
 
 
-TREND_15M_MIN_SEPARATION_PCT = 0.02
+TREND_15M_MIN_SEPARATION_PCT = 0.0
 
-
-def compute_ema_trend(
-    df: pd.DataFrame,
-    fast: int = 9,
-    slow: int = 20
-):
+def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SLOW):
     if df is None or len(df) < slow + 1:
         return "NEUTRAL", 0.0
 
-    ema_fast = df["close"].ewm(
-        span=fast,
-        adjust=False
-    ).mean()
+    if "ema9" not in df.columns or "ema15" not in df.columns:
+        df = calculate_ema_metrics(df)
 
-    ema_slow = df["close"].ewm(
-        span=slow,
-        adjust=False
-    ).mean()
-
-    last_fast = float(ema_fast.iloc[-1])
-    last_slow = float(ema_slow.iloc[-1])
-
+    last_fast = float(df["ema9"].iloc[-1])
+    last_slow = float(df["ema15"].iloc[-1])
     if last_slow == 0:
         return "NEUTRAL", 0.0
 
-    separation_pct = (
-        abs(last_fast - last_slow)
-        / last_slow
-        * 100
-    )
-
-    if separation_pct < TREND_15M_MIN_SEPARATION_PCT:
-        return "NEUTRAL", separation_pct
-
-    return (
-        "BULLISH" if last_fast > last_slow else "BEARISH",
-        separation_pct
-    )
+    separation_pct = abs(last_fast - last_slow) / abs(last_slow) * 100.0
+    if last_fast > last_slow:
+        return "BULLISH", separation_pct
+    if last_fast < last_slow:
+        return "BEARISH", separation_pct
+    return "NEUTRAL", separation_pct
 
 
-# --- STRATEGIES ---
-def detect_liquidity_sweep_structure(
-    df_1m: pd.DataFrame,
-    df_5m: pd.DataFrame
-):
-    recent_high = float(
-        df_5m[
-            "high"
-        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
-    )
-
-    recent_low = float(
-        df_5m[
-            "low"
-        ].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
-    )
-
-    prev = df_1m.iloc[-2]
-    curr = df_1m.iloc[-1]
-
-    sweep_high = bool(
-        prev["high"] > recent_high
-        and curr["close"] < recent_high
-    )
-
-    sweep_low = bool(
-        prev["low"] < recent_low
-        and curr["close"] > recent_low
-    )
-
-    bearish_bos = bool(
-        curr["close"] < prev["low"]
-    )
-
-    bullish_bos = bool(
-        curr["close"] > prev["high"]
-    )
-
-    if sweep_high and bearish_bos:
-        return (
-            "SELL",
-            "Liquidity Sweep + Bearish BOS",
-            recent_high,
-            recent_low
-        )
-
-    if sweep_low and bullish_bos:
-        return (
-            "BUY",
-            "Liquidity Sweep + Bullish BOS",
-            recent_high,
-            recent_low
-        )
-
-    return (
-        "HOLD",
-        "No setup",
-        recent_high,
-        recent_low
-    )
-
-
-# ==========================================================
-# IMPROVED MOMENTUM BREAKOUT DETECTION
-# ==========================================================
-def detect_breakout_continuation(
-    df_1m: pd.DataFrame,
-    df_5m: pd.DataFrame,
-    allow_momentum_continuation: bool = False
-):
+# --- ACTIVE STRATEGY: BASIC EMA 9/15 TREND PULLBACK ---
+def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     """
-    Momentum breakout detector, revised to catch fast one-candle moves.
+    Basic trend-following strategy.
 
-    NORMAL / FRESH MODE:
-      1) Preferred path: two consecutive M1 closes beyond the prior 5M level.
-      2) Fast path: one decisive M1 close through the prior 5M level is enough
-         when the candle has real displacement and a strong directional close.
-         This prevents the scanner from waiting for the second candle and
-         missing a clean XAU/USD impulse.
+    5M execution:
+      - EMA9 > EMA15 = bullish trend.
+      - EMA9 < EMA15 = bearish trend.
+      - A completed 5M candle touching EMA15 is the primary trigger.
+      - A completed 5M candle touching EMA9 is a secondary trigger.
+      - The candle must close in the trend direction.
 
-    CONTINUATION MODE:
-      Used when a pending setup has already failed to pull back. It allows
-      controlled continuation in the 1.20-1.80 ATR extension zone.
-
-    The fast path is still protected by ATR, close-quality, extension and ADX
-    checks (ADX is enforced by the caller), so this is not an unrestricted
-    breakout trigger.
+    15M confluence:
+      - BUY requires EMA9 > EMA15.
+      - SELL requires EMA9 < EMA15.
+      - When enabled, the 15M close must also be on the trend side of EMA15.
     """
+    if df_5m is None or df_15m is None or len(df_5m) < 20 or len(df_15m) < 20:
+        return "HOLD", "EMA setup rejected: insufficient 5M/15M data", 0.0, 0.0
 
-    recent_high = float(
-        df_5m["high"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].max()
+    m5 = df_5m.iloc[-1]
+    p5 = df_5m.iloc[-2]
+    m15 = df_15m.iloc[-1]
+
+    ema9_5 = float(m5["ema9"])
+    ema15_5 = float(m5["ema15"])
+    ema9_15 = float(m15["ema9"])
+    ema15_15 = float(m15["ema15"])
+
+    close5 = float(m5["close"])
+    open5 = float(m5["open"])
+    high5 = float(m5["high"])
+    low5 = float(m5["low"])
+
+    # Trend is defined by the current EMA9/EMA15 relationship.
+    trend_5m = "BULLISH" if ema9_5 > ema15_5 else "BEARISH" if ema9_5 < ema15_5 else "NEUTRAL"
+    trend_15m = "BULLISH" if ema9_15 > ema15_15 else "BEARISH" if ema9_15 < ema15_15 else "NEUTRAL"
+
+    # Detect whether this is a fresh EMA interaction rather than simply
+    # repeating a signal while price remains glued to the same EMA.
+    p_high = float(p5["high"])
+    p_low = float(p5["low"])
+    p_ema9 = float(p5["ema9"])
+    p_ema15 = float(p5["ema15"])
+
+    touched_ema15 = (low5 - EMA_TOUCH_TOLERANCE <= ema15_5 <= high5 + EMA_TOUCH_TOLERANCE)
+    touched_ema9 = (low5 - EMA_TOUCH_TOLERANCE <= ema9_5 <= high5 + EMA_TOUCH_TOLERANCE)
+    prev_touched_ema15 = (p_low <= p_ema15 <= p_high)
+    prev_touched_ema9 = (p_low <= p_ema9 <= p_high)
+
+    if trend_5m == "BULLISH" and trend_15m == "BULLISH":
+        close_side_ok = close5 > ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
+        m15_side_ok = (float(m15["close"]) > ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
+
+        if close_side_ok and m15_side_ok and touched_ema15:
+            trigger = "5M EMA15 Touch - Bullish Trend"
+            if prev_touched_ema15:
+                trigger += " (Continuation Touch)"
+            return "BUY", trigger, ema9_5, ema15_5
+
+        if close_side_ok and m15_side_ok and touched_ema9:
+            trigger = "5M EMA9 Touch - Bullish Trend"
+            if prev_touched_ema9:
+                trigger += " (Continuation Touch)"
+            return "BUY", trigger, ema9_5, ema15_5
+
+    if trend_5m == "BEARISH" and trend_15m == "BEARISH":
+        close_side_ok = close5 < ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
+        m15_side_ok = (float(m15["close"]) < ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
+
+        if close_side_ok and m15_side_ok and touched_ema15:
+            trigger = "5M EMA15 Touch - Bearish Trend"
+            if prev_touched_ema15:
+                trigger += " (Continuation Touch)"
+            return "SELL", trigger, ema9_5, ema15_5
+
+        if close_side_ok and m15_side_ok and touched_ema9:
+            trigger = "5M EMA9 Touch - Bearish Trend"
+            if prev_touched_ema9:
+                trigger += " (Continuation Touch)"
+            return "SELL", trigger, ema9_5, ema15_5
+
+    reason = (
+        f"5M {trend_5m}, 15M {trend_15m}; "
+        f"EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch"
     )
-    recent_low = float(
-        df_5m["low"].iloc[-(LEVEL_LOOKBACK_CANDLES + 1):-1].min()
-    )
+    return "HOLD", reason, ema9_5, ema15_5
 
-    if len(df_1m) < 3:
-        return "HOLD", "Breakout rejected: insufficient M1 candles", recent_high, recent_low
 
-    prev = df_1m.iloc[-2]
-    curr = df_1m.iloc[-1]
-
-    raw_atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else np.nan
-    if pd.isna(raw_atr) or float(raw_atr) <= 0:
-        return "HOLD", "Breakout rejected: M1 ATR unavailable", recent_high, recent_low
-
-    atr_1m = float(raw_atr)
-
-    curr_open = float(curr["open"])
-    curr_high = float(curr["high"])
-    curr_low = float(curr["low"])
-    curr_close = float(curr["close"])
-    prev_close = float(prev["close"])
-
-    candle_range = curr_high - curr_low
-    candle_body = abs(curr_close - curr_open)
-    close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
-    body_ratio = candle_body / atr_1m
-
-    # ======================================================
-    # STRUCTURAL BREAKOUTS
-    # ======================================================
-    bullish_two_close = bool(
-        prev_close > recent_high
-        and curr_close > recent_high
-        and curr_close > prev_close
-    )
-    bearish_two_close = bool(
-        prev_close < recent_low
-        and curr_close < recent_low
-        and curr_close < prev_close
-    )
-
-    # Fast one-candle path. This deliberately does NOT require the previous
-    # candle to close beyond the level. The previous close only has to be
-    # reasonably close to the level OR already on the breakout side. This
-    # catches the first decisive impulse without chasing a move that started
-    # several ATRs ago.
-    bullish_fast_cross = bool(
-        curr_close > recent_high
-        and curr_close > curr_open
-        and (
-            prev_close <= recent_high
-            or prev_close <= recent_high + FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m
-        )
-    )
-    bearish_fast_cross = bool(
-        curr_close < recent_low
-        and curr_close < curr_open
-        and (
-            prev_close >= recent_low
-            or prev_close >= recent_low - FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m
-        )
-    )
-
-    # ======================================================
-    # MOMENTUM CONTINUATION MODE
-    # ======================================================
-    if allow_momentum_continuation:
-        min_body_atr = MOMENTUM_CONTINUATION_MIN_BODY_ATR_MULT
-        min_close_location = MOMENTUM_CONTINUATION_MIN_CLOSE_LOCATION
-
-        if bullish_two_close:
-            extension_atr = (curr_close - recent_high) / atr_1m
-            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
-                return "HOLD", "Continuation not active: extension <= normal breakout limit", recent_high, recent_low
-            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-                return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
-            if body_ratio < min_body_atr:
-                return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
-            if close_location < min_close_location:
-                return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
-            return "BUY", "Momentum Continuation - No Pullback (Bullish)", recent_high, recent_low
-
-        if bearish_two_close:
-            extension_atr = (recent_low - curr_close) / atr_1m
-            if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT:
-                return "HOLD", "Continuation not active: extension <= normal breakout limit", recent_high, recent_low
-            if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT:
-                return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
-            if body_ratio < min_body_atr:
-                return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
-            if close_location > (1.0 - min_close_location):
-                return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
-            return "SELL", "Momentum Continuation - No Pullback (Bearish)", recent_high, recent_low
-
-        return "HOLD", "No continuation structure", recent_high, recent_low
-
-    # ======================================================
-    # NORMAL FRESH BREAKOUT — PREFERRED TWO-CLOSE PATH
-    # ======================================================
-    if bullish_two_close:
-        extension_atr = (curr_close - recent_high) / atr_1m
-        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT:
-            return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
-        if close_location < BREAKOUT_MIN_CLOSE_LOCATION:
-            return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
-        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT:
-            # The pending-setup continuation engine can handle 1.20-1.80 ATR.
-            return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
-        return "BUY", "Momentum Breakout Continuation (Bullish)", recent_high, recent_low
-
-    if bearish_two_close:
-        extension_atr = (recent_low - curr_close) / atr_1m
-        if body_ratio < BREAKOUT_MIN_BODY_ATR_MULT:
-            return "HOLD", "Breakout rejected: insufficient displacement", recent_high, recent_low
-        if close_location > (1.0 - BREAKOUT_MIN_CLOSE_LOCATION):
-            return "HOLD", "Breakout rejected: weak candle close", recent_high, recent_low
-        if extension_atr > BREAKOUT_MAX_EXTENSION_ATR_MULT:
-            return "HOLD", "Breakout overextended - continuation check required", recent_high, recent_low
-        return "SELL", "Momentum Breakout Continuation (Bearish)", recent_high, recent_low
-
-    # ======================================================
-    # FAST ONE-CANDLE MOMENTUM PATH
-    # ======================================================
-    if bullish_fast_cross:
-        extension_atr = (curr_close - recent_high) / atr_1m
-
-        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT:
-            return "HOLD", f"Fast momentum rejected: body/ATR {body_ratio:.2f} < {FAST_MOMENTUM_MIN_BODY_ATR_MULT:.2f}", recent_high, recent_low
-
-        if close_location < FAST_MOMENTUM_MIN_CLOSE_LOCATION:
-            return "HOLD", f"Fast momentum rejected: close location {close_location:.2f} < {FAST_MOMENTUM_MIN_CLOSE_LOCATION:.2f}", recent_high, recent_low
-
-        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT:
-            return "HOLD", f"Fast momentum rejected: extension {extension_atr:.2f}x ATR too high", recent_high, recent_low
-
-        logging.info(
-            f"[FAST MOMENTUM] VALID BUY | Level ${recent_high:.2f} | "
-            f"Close ${curr_close:.2f} | Body/ATR {body_ratio:.2f} | "
-            f"CloseLocation {close_location:.2f} | Extension {extension_atr:.2f}x ATR"
-        )
-        return "BUY", "Fast Momentum Breakout (Bullish - 1M impulse)", recent_high, recent_low
-
-    if bearish_fast_cross:
-        extension_atr = (recent_low - curr_close) / atr_1m
-
-        if body_ratio < FAST_MOMENTUM_MIN_BODY_ATR_MULT:
-            return "HOLD", f"Fast momentum rejected: body/ATR {body_ratio:.2f} < {FAST_MOMENTUM_MIN_BODY_ATR_MULT:.2f}", recent_high, recent_low
-
-        if close_location > (1.0 - FAST_MOMENTUM_MIN_CLOSE_LOCATION):
-            return "HOLD", f"Fast momentum rejected: close location {close_location:.2f} too weak for SELL", recent_high, recent_low
-
-        if extension_atr > FAST_MOMENTUM_MAX_EXTENSION_ATR_MULT:
-            return "HOLD", f"Fast momentum rejected: extension {extension_atr:.2f}x ATR too high", recent_high, recent_low
-
-        logging.info(
-            f"[FAST MOMENTUM] VALID SELL | Level ${recent_low:.2f} | "
-            f"Close ${curr_close:.2f} | Body/ATR {body_ratio:.2f} | "
-            f"CloseLocation {close_location:.2f} | Extension {extension_atr:.2f}x ATR"
-        )
-        return "SELL", "Fast Momentum Breakout (Bearish - 1M impulse)", recent_high, recent_low
-
-    return "HOLD", "No setup", recent_high, recent_low
-
-
-CONSOLIDATION_LOOKBACK_5M = 8
-CONSOLIDATION_MAX_RANGE_ATR_MULT = 1.5
-
-
-def detect_consolidation_breakout(
-    df_1m: pd.DataFrame,
-    df_5m: pd.DataFrame
-):
-    if (
-        len(df_5m) < CONSOLIDATION_LOOKBACK_5M + 1
-        or "atr" not in df_5m.columns
-    ):
-        return "HOLD", "No setup", 0.0, 0.0
-
-    bracket = df_5m.iloc[
-        -(CONSOLIDATION_LOOKBACK_5M + 1):-1
-    ]
-
-    bracket_high = float(bracket["high"].max())
-    bracket_low = float(bracket["low"].min())
-
-    bracket_range = (
-        bracket_high - bracket_low
-    )
-
-    atr_5m = df_5m["atr"].iloc[-1]
-
-    if pd.isna(atr_5m) or atr_5m <= 0:
-        return (
-            "HOLD",
-            "No setup",
-            bracket_high,
-            bracket_low
-        )
-
-    is_consolidating = (
-        bracket_range
-        <= (
-            CONSOLIDATION_MAX_RANGE_ATR_MULT
-            * atr_5m
-        )
-    )
-
-    if not is_consolidating:
-        return (
-            "HOLD",
-            "No setup",
-            bracket_high,
-            bracket_low
-        )
-
-    curr = df_1m.iloc[-1]
-
-    candle_body = abs(
-        float(curr["close"])
-        - float(curr["open"])
-    )
-
-    atr_1m = (
-        df_1m["atr"].iloc[-1]
-        if "atr" in df_1m.columns
-        else None
-    )
-
-    strong_candle = (
-        bool(
-            candle_body
-            >= BREAKOUT_MIN_BODY_ATR_MULT * atr_1m
-        )
-        if atr_1m and not pd.isna(atr_1m)
-        else True
-    )
-
-    bullish_break = bool(
-        curr["close"] > bracket_high
-        and curr["close"] > curr["open"]
-        and strong_candle
-    )
-
-    bearish_break = bool(
-        curr["close"] < bracket_low
-        and curr["close"] < curr["open"]
-        and strong_candle
-    )
-
-    if bullish_break:
-        return (
-            "BUY",
-            "Consolidation Bracket Breakout (Bullish)",
-            bracket_high,
-            bracket_low
-        )
-
-    if bearish_break:
-        return (
-            "SELL",
-            "Consolidation Bracket Breakout (Bearish)",
-            bracket_high,
-            bracket_low
-        )
-
-    return (
-        "HOLD",
-        "No setup",
-        bracket_high,
-        bracket_low
-    )
-
-
-# --- FORWARD-TEST ANALYTICS HELPERS ---
-def compute_trade_pips(trade: dict) -> tuple[float, float]:
-    """
-    Calculate the trade result using the bot's two-stage TP model.
-    """
-    action = str(trade.get("action") or "BUY").upper()
-
-    entry = float(
-        trade.get("entry_price")
-        or trade.get("entry_p")
-        or trade.get("price")
-        or 0.0
-    )
-
-    sl = float(
-        trade.get("sl_price")
-        or trade.get("sl")
-        or 0.0
-    )
-
-    tp1 = float(
-        trade.get("tp1_price")
-        or trade.get("tp1")
-        or 0.0
-    )
-
-    tp2 = float(
-        trade.get("tp2_price")
-        or trade.get("tp2")
-        or 0.0
-    )
-
-    exit_p = float(
-        trade.get("exit_price")
-        or entry
-    )
-
-    outcome = str(
-        trade.get("outcome")
-        or trade.get("outcome_val")
-        or "PENDING"
-    ).upper()
-
-    # Legacy fallback: reconstruct missing risk from the actual exit when
-    # possible; otherwise use the bot's standard minimum risk of 2.5 points.
-    sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
-    if sl_dist == 0:
-        sl_dist = 2.5
-
-    tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
-    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
-
-    if "LOSS" in outcome:
-        # Full loss on both legs
-        total_pips = -(sl_dist * 10.0 * 2.0)
-    elif "TP2" in outcome:
-        # TP1 Hit + TP2 Hit
-        total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif "TP1" in outcome or "SL BE" in outcome:
-        # TP1 Hit + Runner stopped at BE (0 pips for runner)
-        total_pips = tp1_dist * 10.0
-    else:
-        # Manual close or other unexpected outcome
-        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0
-
-    profit_usd = total_pips * 0.10
-    return total_pips, profit_usd
-
-
-def compute_r_multiple(
-    action: str,
-    entry: float,
-    exit_price: float,
-    sl: float,
-    tp1: float = 0.0,
-    tp2: float = 0.0,
-    outcome: str = "PENDING"
-) -> float:
-    """Calculate R using the same two-stage TP accounting as pips."""
-    outcome = outcome.upper()
-    risk_dist = abs(entry - sl)
-
-    # Legacy fallback.
-    if risk_dist <= 0:
-        risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
-        if risk_dist == 0:
-            risk_dist = 2.5
-
-    if "LOSS" in outcome:
-        return -2.0
-        
-    if "TP2" in outcome:
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
-        return (tp1_dist + tp2_dist) / risk_dist
-
-    if "TP1" in outcome or "SL BE" in outcome:
-        # +1.5R on first half, 0R on runner = +1.50R total
-        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
-        return tp1_dist / risk_dist
-
-    single_r = (
-        (exit_price - entry) / risk_dist
-        if action == "BUY"
-        else (entry - exit_price) / risk_dist
-    )
-    return single_r * 2.0
-
-
-def bucket_adx(adx: float) -> str:
-    if adx < 20:
-        return "ADX <20"
-
-    if adx < 30:
-        return "ADX 20-30"
-
-    if adx < 40:
-        return "ADX 30-40"
-
-    if adx < 50:
-        return "ADX 40-50"
-
-    return "ADX 50+"
-
+# Legacy strategy names are intentionally disabled. They remain absent from
+# the live scanner path so only the EMA 9/15 strategy can generate entries.
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
-
-    if "Converted" in t:
-        return "No-Pullback Conversion"
-
-    if "Consolidation" in t:
-        return "Consolidation Bracket Breakout"
-
-    if "Breakout" in t:
-        return "Momentum Breakout"
-
-    return "Sweep + BOS"
-
+    if "EMA15" in t:
+        return "EMA15 Trend Pullback"
+    if "EMA9" in t:
+        return "EMA9 Trend Pullback"
+    return "EMA 9/15 Trend Pullback"
 
 def bucket_session(timestamp_str: str) -> str:
     try:
@@ -1573,70 +888,6 @@ def format_performance_segment(
     return "\n".join(lines)
 
 
-def compute_pullback_zone(
-    action: str,
-    swing_high: float,
-    swing_low: float
-):
-    rng = swing_high - swing_low
-
-    if rng <= 0:
-        return None, None
-
-    if action == "BUY":
-        zone_upper = (
-            swing_high
-            - (FIB_RETRACE_MIN * rng)
-        )
-
-        zone_lower = (
-            swing_high
-            - (FIB_RETRACE_MAX * rng)
-        )
-
-    else:
-        zone_lower = (
-            swing_low
-            + (FIB_RETRACE_MIN * rng)
-        )
-
-        zone_upper = (
-            swing_low
-            + (FIB_RETRACE_MAX * rng)
-        )
-
-    return (
-        float(zone_lower),
-        float(zone_upper)
-    )
-
-
-def check_pullback_entry(
-    action: str,
-    zone_lower: float,
-    zone_upper: float,
-    curr_candle
-) -> bool:
-
-    candle_low = float(curr_candle["low"])
-    candle_high = float(curr_candle["high"])
-    candle_open = float(curr_candle["open"])
-    candle_close = float(curr_candle["close"])
-
-    overlaps_zone = (
-        candle_high >= zone_lower
-        and candle_low <= zone_upper
-    )
-
-    if not overlaps_zone:
-        return False
-
-    if action == "BUY":
-        return candle_close > candle_open
-
-    return candle_close < candle_open
-
-
 # --- TELEGRAM NOTIFICATIONS ---
 async def send_telegram_alert(
     client: httpx.AsyncClient,
@@ -1713,127 +964,61 @@ async def analyze_signal_with_ai(
     proposed_action: str,
     trigger_type: str,
     current_price: float,
-    df_1m: pd.DataFrame,
     df_5m: pd.DataFrame,
-    recent_high: float,
-    recent_low: float,
+    df_15m: pd.DataFrame,
+    ema9_5m: float,
+    ema15_5m: float,
     trend_15m: str = "NEUTRAL",
-    adx_15m_true: float = 0.0,
-    plus_di_5m: float = None,
-    minus_di_5m: float = None
+    adx_15m_true: float = 0.0
 ):
-    is_breakout = "Breakout" in trigger_type
-
-    if is_breakout:
-        strategy_label = (
-            "Breakout Continuation "
-            "(trend-following momentum entry)"
-        )
-
-        veto_rules_text = (
-            "- VETO if 5M ADX is below 20.0 "
-            "(trend too weak to sustain a breakout; "
-            "high risk of a false break/fakeout).\n"
-            "- VETO if 5M ADX is above 70.0 "
-            "(parabolic/overextended move, "
-            "high risk of an imminent sharp pullback)."
-        )
-
-    else:
-        strategy_label = (
-            "Liquidity Sweep + Break-of-Structure "
-            "(reversal entry)"
-        )
-
-        veto_rules_text = (
-            "- VETO if 5M ADX is below 12.0 "
-            "(indicating dead market liquidity).\n"
-            "- If 5M ADX is 50+ DO NOT automatically veto a confirmed "
-            "Liquidity Sweep + BOS reversal. ADX measures strength, not direction. "
-            "When +DI > -DI and the setup is SELL after a high-side liquidity sweep "
-            "and Bearish BOS, treat it as potential bullish exhaustion and allow the "
-            "reversal if the structural evidence is clean. Likewise, when -DI > +DI "
-            "and the setup is BUY after a low-side sweep + Bullish BOS, allow the "
-            "bearish-exhaustion reversal.\n"
-            "- Be conservative with high-ADX entries that are NOT a confirmed Sweep + BOS reversal; "
-            "do not chase late breakout/continuation moves."
-        )
-
-    di_text = (
-        f"+DI={float(plus_di_5m):.1f}, -DI={float(minus_di_5m):.1f}"
-        if plus_di_5m is not None and minus_di_5m is not None
-        else "DI unavailable"
-    )
-
-    confluence_text = (
-        f"4. 15-Minute Trend: {trend_15m} "
-        f"(EMA9/EMA20, ADX={adx_15m_true:.1f}). "
-        f"This is a SOFT input, not a hard rule -- "
-        f"weigh it as confluence, don't auto-veto on it alone."
-    )
+    """AI is only a risk-quality gate; it cannot create a trade direction."""
+    m5 = df_5m.iloc[-1]
+    m15 = df_15m.iloc[-1]
 
     prompt = f"""
-Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping.
+Act as a conservative risk manager for Spot Gold (XAU/USD).
 
-Strategy in play: {strategy_label}.
+ONLY strategy in use: 5-minute EMA9/EMA15 trend-following pullback.
+The deterministic strategy has already produced a {proposed_action} trigger.
+Your job is ONLY to approve or veto it; never reverse the direction.
 
-A technical scalp trigger ({trigger_type}) suggests a
-{proposed_action} entry at ${current_price:.2f}.
+5M:
+- Trend: {('BULLISH' if ema9_5m > ema15_5m else 'BEARISH')}
+- EMA9: ${ema9_5m:.2f}
+- EMA15: ${ema15_5m:.2f}
+- Open: ${float(m5['open']):.2f}
+- High: ${float(m5['high']):.2f}
+- Low: ${float(m5['low']):.2f}
+- Close: ${float(m5['close']):.2f}
 
-TECHNICAL CONTEXT:
+15M CONFLUENCE:
+- Trend: {trend_15m}
+- EMA9: ${float(m15['ema9']):.2f}
+- EMA15: ${float(m15['ema15']):.2f}
+- Close: ${float(m15['close']):.2f}
+- ADX: {adx_15m_true:.1f}
 
-1. 1-Minute:
-Close=${float(df_1m['close'].iloc[-1]):.2f},
-Prior Candle High=${float(df_1m['high'].iloc[-2]):.2f},
-Prior Candle Low=${float(df_1m['low'].iloc[-2]):.2f}.
+Trigger: {trigger_type}
+Entry: ${current_price:.2f}
 
-2. 5-Minute Reference Levels:
-Recent High=${recent_high:.2f},
-Recent Low=${recent_low:.2f}.
+Approve only if 5M and 15M direction agree, the candle clearly reacted around EMA9/EMA15,
+and there is no obvious immediate contradiction. Do not invent additional indicators or setups.
 
-3. 5-Minute:
-ADX Trend Strength={float(df_5m['adx'].iloc[-1]):.1f}; {di_text}.
-
-{confluence_text}
-
-CRITICAL SCALP VETO RULES:
-
-{veto_rules_text}
-
-Respond strictly in valid JSON matching schema:
-
-{{"action": "BUY" | "SELL" | "HOLD",
-"confidence": 0.0-1.0,
-"reasoning": "2 concise sentences explaining decision"}}
+Return strict JSON:
+{{"action":"{proposed_action}" or "HOLD", "confidence":0.0-1.0, "reasoning":"2 concise sentences"}}
 """
 
     if GROQ_API_KEY:
         try:
             res = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                response_format={
-                    "type": "json_object"
-                }
+                response_format={"type": "json_object"}
             )
-
-            data = json.loads(
-                res.choices[0].message.content
-            )
-
-            return SignalOutput(**data)
-
+            return SignalOutput(**json.loads(res.choices[0].message.content))
         except Exception as e:
-            logging.warning(
-                f"[AI WARNING] Groq call failed: {e}. "
-                f"Falling back to Gemini."
-            )
+            logging.warning(f"[AI WARNING] Groq call failed: {e}. Falling back to Gemini.")
 
     if GEMINI_API_KEY:
         try:
@@ -1846,1148 +1031,273 @@ Respond strictly in valid JSON matching schema:
                     temperature=0.1,
                 )
             )
-
-            return SignalOutput.model_validate_json(
-                res.text
-            )
-
+            return SignalOutput.model_validate_json(res.text)
         except Exception as e:
-            logging.error(
-                f"[AI ERROR] Gemini call failed: {e}"
-            )
+            logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
     return SignalOutput(
         action=proposed_action,
-        confidence=0.7,
-        reasoning=(
-            "Fallback: Executed on pure liquidity sweep "
-            "+ structure break alignment."
-        )
+        confidence=0.70,
+        reasoning="Fallback approval: 5M EMA9/EMA15 trend and 15M EMA confluence are aligned."
     )
 
 
 # --- BACKGROUND SCANNING LOOP ---
 async def background_scanning_loop():
-    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID
+    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID, cached_15m
 
-    async with httpx.AsyncClient(
-        timeout=15.0,
-        follow_redirects=True
-    ) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        last_5m_candle_time = None
+        last_15m_candle_time = None
 
         while True:
             try:
+                now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
+
                 if not SYSTEM_TRADING_ENABLED:
                     log_scan_event("SYSTEM_PAUSED", stage="SYSTEM", decision="SKIPPED", reason="Kill switch active")
-                    logging.info(
-                        "[PAUSED] System trading currently paused "
-                        "via kill-switch. Skipping scan."
-                    )
+                    await asyncio.sleep(30)
+                    continue
 
+                active_session = ACTIVE_SESSION_START_HOUR <= now_wib.hour < ACTIVE_SESSION_END_HOUR
+                if not active_session:
+                    log_scan_event("OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED", reason="Outside active trading session", details={"wib_time": now_wib.strftime('%H:%M')})
                     await asyncio.sleep(60)
                     continue
 
-                now_wib = (
-                    datetime.now(timezone.utc)
-                    + timedelta(hours=7)
-                )
-
-                current_hour_wib = now_wib.hour
-
-                CURRENT_SCAN_CYCLE_ID = (
-                    f"{now_wib.strftime('%Y%m%d%H%M%S')}-"
-                    f"{uuid.uuid4().hex[:8]}"
-                )
-
-                log_scan_event(
-                    "SCAN_START",
-                    stage="SCAN",
-                    decision="STARTED",
-                    reason="Scanner cycle started",
-                    details={"wib_time": now_wib.strftime('%Y-%m-%d %H:%M:%S')}
-                )
-
-                active_session = (
-                    ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
-                )
-
-                if not active_session:
-                    log_scan_event(
-                        "OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED",
-                        reason="Outside active trading session",
-                        details={"wib_hour": current_hour_wib}
-                    )
-                    logging.info(
-                        f"[SLEEP MODE] WIB Time: "
-                        f"{now_wib.strftime('%H:%M')} | "
-                        f"Outside active trading session. "
-                        f"Pausing API calls..."
-                    )
-
-                    await asyncio.sleep(300)
+                # Run only on 5-minute boundaries. This prevents multiple executions
+                # against the same 5M candle and keeps API usage predictable.
+                if now_wib.minute % 5 != 0 or now_wib.second > 8:
+                    await asyncio.sleep(2)
                     continue
 
-                logging.info(
-                    f"[ACTIVE SCAN] WIB Time: "
-                    f"{now_wib.strftime('%H:%M')} | "
-                    f"Scanning Sweep/BOS + Breakout + "
-                    f"No-Pullback Momentum Continuation..."
-                )
+                CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="5M EMA scan started", details={"wib_time": now_wib.strftime('%Y-%m-%d %H:%M:%S')})
 
-                df_1m = await fetch_timeframe_data(
-                    client,
-                    "1min"
-                )
-
-                df_5m = await fetch_timeframe_data(
-                    client,
-                    "5min"
-                )
-
-                if df_1m is None or df_5m is None:
-                    log_scan_event(
-                        "DATA_FETCH_FAILED", stage="DATA", decision="RETRY",
-                        reason="Failed to fetch M1/M5 candles"
-                    )
-                    logging.warning(
-                        "Failed to fetch M1/M5 candles. "
-                        "Retrying next cycle."
-                    )
-
-                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                # ==========================================================
+                # 5M DATA: FRESH EVERY 5 MINUTES
+                # ==========================================================
+                df_5m_raw = await fetch_timeframe_data(client, "5min", outputsize=100)
+                if df_5m_raw is None or len(df_5m_raw) < 20:
+                    log_scan_event("DATA_FETCH_FAILED", stage="DATA", decision="RETRY", reason="Failed to fetch sufficient 5M candles")
+                    await asyncio.sleep(20)
                     continue
 
-                if len(df_1m) < 3 or len(df_5m) < 6:
-                    log_scan_event(
-                        "DATA_INSUFFICIENT", stage="DATA", decision="RETRY",
-                        reason="Insufficient M1/M5 candle history",
-                        details={"m1_len": len(df_1m), "m5_len": len(df_5m)}
-                    )
-                    logging.warning(
-                        "Insufficient candle history for "
-                        "sweep/BOS detection. Retrying next cycle."
-                    )
-
-                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                df_5m = calculate_ema_metrics(df_5m_raw)
+                # Twelve Data may include the currently-forming interval as the last row.
+                # Use the last completed 5M candle so entries never fire mid-candle.
+                if len(df_5m) >= 2:
+                    df_5m = df_5m.iloc[:-1].copy()
+                if len(df_5m) < 20:
+                    log_scan_event("DATA_INSUFFICIENT", stage="DATA", decision="RETRY", reason="No completed 5M candle available yet")
+                    await asyncio.sleep(10)
                     continue
+                candle_time_5m = df_5m["datetime"].iloc[-1]
 
-                df_1m = calculate_metrics_m1(df_1m)
-                df_5m = calculate_metrics_5m(df_5m)
+                if last_5m_candle_time is not None and candle_time_5m == last_5m_candle_time:
+                    await asyncio.sleep(2)
+                    continue
+                last_5m_candle_time = candle_time_5m
 
-                curr_high = float(
-                    df_1m["high"].tail(3).max()
-                )
-
-                curr_low = float(
-                    df_1m["low"].tail(3).min()
-                )
-
-                update_open_trades(
-                    curr_high,
-                    curr_low
-                )
-
-                curr_price = float(
-                    df_1m["close"].iloc[-1]
-                )
-
-                adx_5m = (
-                    float(df_5m["adx"].iloc[-1])
-                    if not pd.isna(
-                        df_5m["adx"].iloc[-1]
-                    )
-                    else 0.0
-                )
-
-                # ADX is directionless. Use +DI/-DI to determine whether an
-                # extreme-ADX Sweep+BOS is actually reversing the dominant move.
-                plus_di_5m = (
-                    float(df_5m["plus_di"].iloc[-1])
-                    if "plus_di" in df_5m.columns
-                    and not pd.isna(df_5m["plus_di"].iloc[-1])
-                    else None
-                )
-                minus_di_5m = (
-                    float(df_5m["minus_di"].iloc[-1])
-                    if "minus_di" in df_5m.columns
-                    and not pd.isna(df_5m["minus_di"].iloc[-1])
-                    else None
-                )
-
-                global cached_15m
-
-                need_refresh = (
+                # ==========================================================
+                # 15M DATA: FRESH EVERY 15 MINUTES, CACHED BETWEEN
+                # ==========================================================
+                refresh_15m = (
                     cached_15m["df"] is None
+                    or now_wib.minute % 15 == 0
                     or cached_15m["fetched_at"] is None
-                    or (
-                        datetime.now(timezone.utc)
-                        - cached_15m["fetched_at"]
-                        >= timedelta(
-                            minutes=FIFTEEN_M_REFRESH_MINUTES
-                        )
-                    )
+                    or (datetime.now(timezone.utc) - cached_15m["fetched_at"]) >= timedelta(minutes=15)
                 )
 
-                # During the 14:00-18:00 WIB statistical veto window,
-                # keep scanning M1/M5 every 2 minutes but DO NOT spend
-                # Twelve Data requests refreshing the 15M confluence.
-                # The last valid 15M snapshot remains cached until the
-                # normal 15-minute refresh resumes at 18:00 WIB.
-                in_mid_session_veto = (
-                    MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR
-                )
-
-                if in_mid_session_veto:
-                    if cached_15m["df"] is not None:
-                        logging.info(
-                            f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | "
-                            "Scanning M1/M5 normally; 15M API refresh skipped and cached."
-                        )
+                if refresh_15m:
+                    df_15m_raw = await fetch_timeframe_data(client, "15min", outputsize=100)
+                    if df_15m_raw is not None and len(df_15m_raw) >= 20:
+                        df_15m_new = calculate_ema_metrics(df_15m_raw)
+                        # Cache only completed 15M candles.
+                        if len(df_15m_new) >= 2:
+                            df_15m_new = df_15m_new.iloc[:-1].copy()
+                        if len(df_15m_new) < 20:
+                            logging.warning("[15M REFRESH] No completed 15M candle available; retaining previous cache.")
+                        else:
+                            cached_15m["df"] = df_15m_new
+                            cached_15m["fetched_at"] = datetime.now(timezone.utc)
+                            logging.info(f"[15M REFRESH] New completed 15M EMA9/EMA15 snapshot cached at {now_wib.strftime('%H:%M:%S')} WIB")
                     else:
-                        logging.info(
-                            f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | "
-                            "Scanning M1/M5; no 15M cache available."
-                        )
-                elif need_refresh:
-                    df_15m_raw = await fetch_timeframe_data(
-                        client,
-                        "15min"
-                    )
+                        logging.warning("[15M REFRESH] Fetch failed; retaining previous 15M cache.")
 
-                    if (
-                        df_15m_raw is not None
-                        and len(df_15m_raw) >= 21
-                    ):
-                        cached_15m["df"] = (
-                            calculate_metrics_5m(
-                                df_15m_raw
-                            )
-                        )
+                df_15m = cached_15m["df"]
+                if df_15m is None or len(df_15m) < 20:
+                    log_scan_event("DATA_INSUFFICIENT", stage="DATA", decision="HOLD", reason="No valid 15M confluence cache")
+                    await asyncio.sleep(2)
+                    continue
 
-                        cached_15m["fetched_at"] = (
-                            datetime.now(timezone.utc)
-                        )
+                trend_15m, trend_15m_sep = compute_ema_trend(df_15m)
+                adx_15m_true = 0.0
 
-                    else:
-                        logging.warning(
-                            "[15M CONFLUENCE] Fetch failed "
-                            "or insufficient candles -- "
-                            "using stale/neutral cache this cycle."
-                        )
+                # Open-trade management now uses the current 5M candle.
+                update_open_trades(float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
 
-                trend_15m, trend_15m_sep = (
-                    compute_ema_trend(
-                        cached_15m["df"]
-                    )
-                    if cached_15m["df"] is not None
-                    else ("NEUTRAL", 0.0)
-                )
+                curr_price = float(df_5m["close"].iloc[-1])
+                proposed_action, trigger_type, ema9_5m, ema15_5m = detect_ema_touch_signal(df_5m, df_15m)
 
-                adx_15m_true = (
-                    float(
-                        cached_15m["df"]["adx"].iloc[-1]
-                    )
-                    if (
-                        cached_15m["df"] is not None
-                        and not pd.isna(
-                            cached_15m["df"]["adx"].iloc[-1]
-                        )
-                    )
-                    else 0.0
-                )
-
-                global pending_setup
-
-                proposed_action = "HOLD"
-                trigger_type = "None"
-
-                recent_high = 0.0
-                recent_low = 0.0
-                status_note = ""
-
-                # ==================================================
-                # STAGE 2: Pullback confirmation check
-                # ==================================================
-                if pending_setup is not None:
-
-                    # --------------------------------------------------
-                    # If the 10-minute pullback window expires, give the
-                    # original setup ONE FINAL momentum-continuation check
-                    # before discarding it.
-                    # --------------------------------------------------
-                    if (
-                        datetime.now(timezone.utc)
-                        > pending_setup["expires"]
-                    ):
-
-                        expired_action = pending_setup["action"]
-                        expired_trigger = pending_setup["trigger_type"]
-
-                        logging.info(
-                            f"[PULLBACK EXPIRED] "
-                            f"{expired_action} setup "
-                            f"from ${pending_setup['trigger_price']:.2f} "
-                            f"expired without a pullback entry. "
-                            f"Checking final momentum continuation."
-                        )
-
-                        (
-                            b_action,
-                            b_trigger_type,
-                            b_recent_high,
-                            b_recent_low
-                        ) = logged_breakout_check(
-                            df_1m,
-                            df_5m,
-                            allow_momentum_continuation=True
-                        )
-
-                        if (
-                            b_action == expired_action
-                            and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX
-                        ):
-
-                            proposed_action = b_action
-
-                            trigger_type = (
-                                f"No Pullback -> "
-                                f"Momentum Continuation "
-                                f"({b_trigger_type})"
-                            )
-
-                            recent_high = b_recent_high
-                            recent_low = b_recent_low
-
-                            log_scan_event(
-                                "NO_PULLBACK_CONVERSION", stage="MOMENTUM_CONTINUATION",
-                                action=b_action, trigger_type=trigger_type, price=curr_price,
-                                recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
-                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
-                                decision="ENTRY_CANDIDATE",
-                                reason="Momentum continuation passed while pullback was unavailable",
-                                details={"min_adx": MOMENTUM_CONTINUATION_MIN_ADX}
-                            )
-
-                            logging.info(
-                                f"[NO-PULLBACK CONVERSION] "
-                                f"Expired {expired_action} setup "
-                                f"converted into momentum continuation. "
-                                f"ADX={adx_5m:.1f}"
-                            )
-
-                        else:
-                            log_scan_event(
-                                "PULLBACK_EXPIRED", stage="PULLBACK", action=expired_action,
-                                trigger_type=expired_trigger, price=curr_price,
-                                recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
-                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
-                                decision="DISCARDED",
-                                reason="10-minute pullback expired with no valid continuation",
-                                details={"final_action": b_action}
-                            )
-
-                            logging.info(
-                                f"[PULLBACK EXPIRED] "
-                                f"No valid momentum continuation. "
-                                f"Setup discarded. "
-                                f"Final action={b_action}, "
-                                f"ADX={adx_5m:.1f}, "
-                                f"Original={expired_action}."
-                            )
-
-                        pending_setup = None
-
-                    else:
-                        curr_candle = df_1m.iloc[-1]
-
-                        confirmed = check_pullback_entry(
-                            pending_setup["action"],
-                            pending_setup["zone_lower"],
-                            pending_setup["zone_upper"],
-                            curr_candle
-                        )
-
-                        recent_high = pending_setup["recent_high"]
-                        recent_low = pending_setup["recent_low"]
-
-                        if confirmed:
-                            proposed_action = pending_setup["action"]
-
-                            trigger_type = (
-                                pending_setup["trigger_type"]
-                                + " + Pullback Confirmed"
-                            )
-
-                            log_scan_event(
-                                "PULLBACK_CONFIRMED", stage="PULLBACK",
-                                action=proposed_action, trigger_type=trigger_type, price=curr_price,
-                                recent_high=recent_high, recent_low=recent_low, adx_5m=adx_5m,
-                                adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
-                                decision="ENTRY_CANDIDATE",
-                                reason="Pullback candle overlapped zone and confirmed direction"
-                            )
-
-                            logging.info(
-                                f"[PULLBACK CONFIRMED] "
-                                f"{proposed_action} setup entered "
-                                f"inside ${pending_setup['zone_lower']:.2f}-"
-                                f"${pending_setup['zone_upper']:.2f}."
-                            )
-
-                            pending_setup = None
-
-                        else:
-                            # --------------------------------------------------
-                            # No pullback yet. If price is already running,
-                            # allow the controlled 1.20-1.80 ATR continuation
-                            # path. This is the key recovery path for runaway
-                            # moves that refuse to retrace.
-                            # --------------------------------------------------
-                            (
-                                b_action,
-                                b_trigger_type,
-                                b_recent_high,
-                                b_recent_low
-                            ) = logged_breakout_check(
-                                df_1m,
-                                df_5m,
-                                allow_momentum_continuation=True
-                            )
-
-                            if (
-                                b_action != "HOLD"
-                                and adx_5m >= MOMENTUM_CONTINUATION_MIN_ADX
-                            ):
-
-                                if b_action == pending_setup["action"]:
-                                    proposed_action = b_action
-
-                                    trigger_type = (
-                                        f"No Pullback -> "
-                                        f"Converted to "
-                                        f"{b_trigger_type}"
-                                    )
-
-                                    recent_high = b_recent_high
-                                    recent_low = b_recent_low
-
-                                    log_scan_event(
-                                        "NO_PULLBACK_CONVERSION", stage="MOMENTUM_CONTINUATION",
-                                        action=b_action, trigger_type=trigger_type, price=curr_price,
-                                        recent_high=b_recent_high, recent_low=b_recent_low, adx_5m=adx_5m,
-                                        adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
-                                        decision="ENTRY_CANDIDATE",
-                                        reason="Pending setup converted to controlled momentum continuation",
-                                        details={"min_adx": MOMENTUM_CONTINUATION_MIN_ADX}
-                                    )
-
-                                    logging.info(
-                                        f"[NO-PULLBACK CONVERSION] "
-                                        f"{b_action} setup converted to "
-                                        f"{b_trigger_type}. "
-                                        f"ADX={adx_5m:.1f}"
-                                    )
-
-                                    pending_setup = None
-
-                                else:
-                                    invalidated_action = pending_setup["action"]
-                                    invalidated_trigger = pending_setup["trigger_type"]
-
-                                    logging.info(
-                                        f"[SETUP INVALIDATED] "
-                                        f"{invalidated_action} setup "
-                                        f"({invalidated_trigger}) from "
-                                        f"${pending_setup['trigger_price']:.2f} "
-                                        f"invalidated by opposite "
-                                        f"{b_action} breakout continuation."
-                                    )
-
-                                    proposed_action = b_action
-
-                                    trigger_type = (
-                                        f"{b_trigger_type} "
-                                        f"(Invalidated "
-                                        f"{invalidated_action} "
-                                        f"Sweep Setup)"
-                                    )
-
-                                    recent_high = b_recent_high
-                                    recent_low = b_recent_low
-
-                                    pending_setup = None
-
-                            else:
-                                status_note = (
-                                    f" | Awaiting pullback into "
-                                    f"${pending_setup['zone_lower']:.2f}-"
-                                    f"${pending_setup['zone_upper']:.2f}"
-                                )
-
-                # ==================================================
-                # STAGE 1: Fresh Sweep + BOS Check
-                # ==================================================
-                if (
-                    pending_setup is None
-                    and proposed_action == "HOLD"
-                    and not status_note
-                ):
-
-                    new_action, new_trigger_type, new_recent_high, new_recent_low = (
-                        detect_liquidity_sweep_structure(
-                            df_1m,
-                            df_5m
-                        )
-                    )
-
-                    recent_high = new_recent_high
-                    recent_low = new_recent_low
-
-                    if new_action != "HOLD":
-
-                        prev_candle = df_1m.iloc[-2]
-                        curr_candle = df_1m.iloc[-1]
-
-                        if new_action == "BUY":
-                            swing_low = float(
-                                prev_candle["low"]
-                            )
-
-                            swing_high = float(
-                                curr_candle["close"]
-                            )
-
-                        else:
-                            swing_high = float(
-                                prev_candle["high"]
-                            )
-
-                            swing_low = float(
-                                curr_candle["close"]
-                            )
-
-                        zone_lower, zone_upper = (
-                            compute_pullback_zone(
-                                new_action,
-                                swing_high,
-                                swing_low
-                            )
-                        )
-
-                        if zone_lower is not None:
-                            pending_setup = {
-                                "action": new_action,
-                                "trigger_type": new_trigger_type,
-                                "trigger_price": float(curr_price),
-                                "recent_high": new_recent_high,
-                                "recent_low": new_recent_low,
-                                "zone_lower": zone_lower,
-                                "zone_upper": zone_upper,
-                                "expires": (
-                                    datetime.now(timezone.utc)
-                                    + timedelta(
-                                        minutes=PULLBACK_EXPIRY_MINUTES
-                                    )
-                                ),
-                            }
-
-                            log_scan_event(
-                                "PENDING_ARMED", stage="PULLBACK", action=new_action,
-                                trigger_type=new_trigger_type, price=curr_price,
-                                recent_high=new_recent_high, recent_low=new_recent_low,
-                                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                                pending=pending_setup, decision="ARMED",
-                                reason="Sweep + BOS setup armed for pullback",
-                                details={"expiry_minutes": PULLBACK_EXPIRY_MINUTES}
-                            )
-
-                            status_note = (
-                                f" | New {new_action} setup "
-                                f"({new_trigger_type}) armed, "
-                                f"awaiting pullback into "
-                                f"${zone_lower:.2f}-"
-                                f"${zone_upper:.2f}"
-                            )
-
-                # ==================================================
-                # STAGE 1b: Consolidation bracket breakout
-                # ==================================================
-                if (
-                    pending_setup is None
-                    and proposed_action == "HOLD"
-                    and not status_note
-                ):
-
-                    c_action, c_trigger_type, c_bracket_high, c_bracket_low = (
-                        detect_consolidation_breakout(
-                            df_1m,
-                            df_5m
-                        )
-                    )
-
-                    if c_action != "HOLD":
-
-                        if adx_5m >= 20.0:
-                            proposed_action = c_action
-                            trigger_type = c_trigger_type
-
-                            recent_high = (
-                                c_bracket_high
-                            )
-
-                            recent_low = (
-                                c_bracket_low
-                            )
-
-                        else:
-                            status_note = (
-                                f" | Bracket breakout seen "
-                                f"but 5M ADX {adx_5m:.1f} "
-                                f"too weak to confirm"
-                            )
-
-                # ==================================================
-                # STAGE 1c: Improved Momentum breakout continuation
-                # ==================================================
-                if (
-                    pending_setup is None
-                    and proposed_action == "HOLD"
-                    and not status_note
-                ):
-
-                    b_action, b_trigger_type, b_recent_high, b_recent_low = (
-                        logged_breakout_check(
-                            df_1m,
-                            df_5m,
-                            allow_momentum_continuation=False
-                        )
-                    )
-
-                    if b_action != "HOLD":
-
-                        if adx_5m >= 20.0:
-                            proposed_action = b_action
-                            trigger_type = b_trigger_type
-
-                            recent_high = (
-                                b_recent_high
-                            )
-
-                            recent_low = (
-                                b_recent_low
-                            )
-
-                        else:
-                            status_note = (
-                                f" | Breakout seen but "
-                                f"5M ADX {adx_5m:.1f} "
-                                f"too weak to confirm continuation"
-                            )
-
-                # ==================================================
-                # Stat-Veto Check
-                # ==================================================
-                if proposed_action != "HOLD":
-
-                    stat_vetoed, stat_veto_reason = (
-                        check_stat_veto(
-                            adx_5m,
-                            current_hour_wib,
-                            action=proposed_action,
-                            trigger_type=trigger_type,
-                            plus_di_5m=plus_di_5m,
-                            minus_di_5m=minus_di_5m
-                        )
-                    )
-
-                    if stat_vetoed:
-
-                        logging.info(
-                            f"[STAT VETO] "
-                            f"{stat_veto_reason}"
-                        )
-
-                        log_trade_signal(
-                            "VETOED",
-                            proposed_action,
-                            f"{trigger_type} [STAT-VETO]",
-                            curr_price,
-                            0.0,
-                            0.0,
-                            0.0,
-                            1.0,
-                            adx_5m,
-                            0.0,
-                            "None",
-                            stat_veto_reason
-                        )
-
-                        log_scan_event(
-                            "STAT_VETO", stage="STAT_VETO", action=proposed_action,
-                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
-                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
-                            trend_15m=trend_15m, decision="VETOED", reason=stat_veto_reason
-                        )
-
-                        proposed_action = "HOLD"
-
-                # ==================================================
-                # Loss-cooldown Check
-                # ==================================================
-                if proposed_action != "HOLD":
-
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-
-                        cursor.execute("""
-                            SELECT outcome_timestamp
-                            FROM signals
-                            WHERE status = 'EXECUTED'
-                              AND outcome = 'LOSS (SL HIT)'
-                              AND outcome_timestamp IS NOT NULL
-                              AND outcome_timestamp != ''
-                            ORDER BY id DESC
-                            LIMIT 1
-                        """)
-
-                        last_loss = cursor.fetchone()
-
-                        cursor.close()
-                        conn.close()
-
-                        if (
-                            last_loss
-                            and last_loss.get(
-                                "outcome_timestamp"
-                            )
-                        ):
-
-                            ts_str = str(
-                                last_loss[
-                                    "outcome_timestamp"
-                                ]
-                            ).replace(
-                                " WIB",
-                                ""
-                            )
-
-                            last_loss_time = (
-                                datetime.strptime(
-                                    ts_str,
-                                    "%Y-%m-%d %H:%M:%S"
-                                )
-                            )
-
-                            minutes_since_loss = (
-                                now_wib.replace(
-                                    tzinfo=None
-                                )
-                                - last_loss_time
-                            ).total_seconds() / 60.0
-
-                            if (
-                                0 <= minutes_since_loss
-                                < LOSS_COOLDOWN_MINUTES
-                            ):
-
-                                log_scan_event(
-                                    "LOSS_COOLDOWN", stage="RISK_FILTER", action=proposed_action,
-                                    trigger_type=trigger_type, price=curr_price, adx_5m=adx_5m,
-                                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="BLOCKED",
-                                    reason=f"{minutes_since_loss:.1f} minutes since last SL hit",
-                                    details={"cooldown_minutes": LOSS_COOLDOWN_MINUTES}
-                                )
-
-                                logging.info(
-                                    f"[LOSS COOLDOWN] "
-                                    f"Skipping "
-                                    f"{proposed_action}: "
-                                    f"{minutes_since_loss:.1f} "
-                                    f"min since last SL hit "
-                                    f"(< {LOSS_COOLDOWN_MINUTES} "
-                                    f"min cooldown)."
-                                )
-
-                                proposed_action = "HOLD"
-
-                    except Exception as lc_err:
-                        logging.error(
-                            f"[LOSS COOLDOWN ERROR] "
-                            f"{lc_err}"
-                        )
-
-                # ==================================================
-                # Cooldown Distance Check
-                # ==================================================
-                if proposed_action != "HOLD":
-
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-
-                        cursor.execute("""
-                            SELECT
-                                COALESCE(
-                                    entry_price,
-                                    price,
-                                    0
-                                ) AS entry_p,
-                                outcome
-                            FROM signals
-                            WHERE status = 'EXECUTED'
-                              AND action = %s
-                            ORDER BY id DESC
-                            LIMIT 1
-                        """, (
-                            str(proposed_action),
-                        ))
-
-                        last_trade = cursor.fetchone()
-
-                        cursor.close()
-                        conn.close()
-
-                        if last_trade:
-
-                            last_entry_price = float(
-                                last_trade["entry_p"]
-                            )
-
-                            last_outcome = (
-                                str(
-                                    last_trade["outcome"]
-                                )
-                                if last_trade.get("outcome")
-                                else "PENDING"
-                            )
-
-                            required_distance = (
-                                2.00
-                                if last_outcome == "PENDING"
-                                else 1.50
-                            )
-
-                            if (
-                                abs(
-                                    curr_price
-                                    - last_entry_price
-                                )
-                                < required_distance
-                            ):
-
-                                log_scan_event(
-                                    "DISTANCE_COOLDOWN", stage="RISK_FILTER", action=proposed_action,
-                                    trigger_type=trigger_type, price=curr_price, adx_5m=adx_5m,
-                                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="BLOCKED",
-                                    reason=f"Price within ${required_distance:.2f} of previous trade",
-                                    details={"last_entry_price": last_entry_price,
-                                             "required_distance": required_distance,
-                                             "last_outcome": last_outcome}
-                                )
-
-                                logging.info(
-                                    f"[SCALP COOLDOWN] "
-                                    f"Skipping "
-                                    f"{proposed_action}: "
-                                    f"Price within "
-                                    f"${required_distance:.2f} "
-                                    f"of previous trade at "
-                                    f"${last_entry_price:.2f}."
-                                )
-
-                                proposed_action = "HOLD"
-
-                    except Exception as cd_err:
-                        logging.error(
-                            f"[COOLDOWN ERROR] "
-                            f"{cd_err}"
-                        )
-
-                # ==================================================
-                # FINAL DECISION
-                # ==================================================
                 log_scan_event(
-                    "SCAN_DECISION", stage="FINAL_DECISION", action=proposed_action,
-                    trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
-                    recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
-                    trend_15m=trend_15m, pending=pending_setup,
-                    decision="HOLD" if proposed_action == "HOLD" else "AI_REVIEW",
-                    reason=status_note.strip(" |") if status_note else (
-                        trigger_type if proposed_action != "HOLD" else "No entry trigger"
-                    ),
-                    details={"trend_15m_separation_pct": trend_15m_sep}
+                    "EMA_EVALUATION", stage="EMA_STRATEGY", action=proposed_action,
+                    trigger_type=trigger_type, price=curr_price,
+                    adx_15m=adx_15m_true, trend_15m=trend_15m,
+                    decision="ENTRY_CANDIDATE" if proposed_action != "HOLD" else "HOLD",
+                    reason=trigger_type,
+                    details={
+                        "5m_candle_time": str(candle_time_5m),
+                        "ema9_5m": ema9_5m,
+                        "ema15_5m": ema15_5m,
+                        "ema9_15m": float(df_15m["ema9"].iloc[-1]),
+                        "ema15_15m": float(df_15m["ema15"].iloc[-1]),
+                        "trend_15m": trend_15m,
+                        "15m_cached": True,
+                    }
                 )
 
                 if proposed_action == "HOLD":
-
                     logging.info(
-                        f"[MARKET SCAN] "
-                        f"Price: ${curr_price:.2f} | "
-                        f"5M Swept High: ${recent_high:.2f} | "
-                        f"5M Swept Low: ${recent_low:.2f} | "
-                        f"Status: HOLD{status_note}"
+                        f"[EMA SCAN] {now_wib.strftime('%H:%M')} WIB | "
+                        f"Price ${curr_price:.2f} | 5M EMA9 ${ema9_5m:.2f} / EMA15 ${ema15_5m:.2f} | "
+                        f"15M {trend_15m} | HOLD ({trigger_type})"
                     )
+                    log_scan_event("SCAN_END", stage="SCAN", action="HOLD", trigger_type=trigger_type, price=curr_price, adx_15m=adx_15m_true, trend_15m=trend_15m, decision="COMPLETE", reason="No aligned EMA touch")
+                    await asyncio.sleep(2)
+                    continue
 
+                # ==========================================================
+                # EXISTING SUPPORT SYSTEM: LOSS COOLDOWN
+                # ==========================================================
+                try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT outcome_timestamp FROM signals
+                        WHERE status='EXECUTED' AND outcome='LOSS (SL HIT)'
+                        AND outcome_timestamp IS NOT NULL AND outcome_timestamp != ''
+                        ORDER BY id DESC LIMIT 1
+                    """)
+                    last_loss = cursor.fetchone()
+                    cursor.close(); conn.close()
+
+                    if last_loss and last_loss.get("outcome_timestamp"):
+                        ts_str = str(last_loss["outcome_timestamp"]).replace(" WIB", "")
+                        last_loss_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        minutes_since_loss = (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0
+                        if 0 <= minutes_since_loss < LOSS_COOLDOWN_MINUTES:
+                            log_scan_event("LOSS_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"{minutes_since_loss:.1f} minutes since last SL hit")
+                            await asyncio.sleep(2)
+                            continue
+                except Exception as e:
+                    logging.error(f"[LOSS COOLDOWN ERROR] {e}")
+
+                # ==========================================================
+                # EXISTING SUPPORT SYSTEM: DISTANCE COOLDOWN
+                # ==========================================================
+                try:
+                    conn = get_db_connection(); cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome
+                        FROM signals WHERE status='EXECUTED' AND action=%s
+                        ORDER BY id DESC LIMIT 1
+                    """, (str(proposed_action),))
+                    last_trade = cursor.fetchone()
+                    cursor.close(); conn.close()
+                    if last_trade:
+                        last_entry_price = float(last_trade["entry_p"] or 0.0)
+                        required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
+                        if last_entry_price > 0 and abs(curr_price - last_entry_price) < required_distance:
+                            log_scan_event("DISTANCE_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"Price within ${required_distance:.2f} of previous {proposed_action} trade")
+                            await asyncio.sleep(2)
+                            continue
+                except Exception as e:
+                    logging.error(f"[DISTANCE COOLDOWN ERROR] {e}")
+
+                # ==========================================================
+                # AI SUPPORT GATE (strategy remains deterministic)
+                # ==========================================================
+                ai_decision = await analyze_signal_with_ai(
+                    proposed_action, trigger_type, curr_price,
+                    df_5m, df_15m, ema9_5m, ema15_5m,
+                    trend_15m, adx_15m_true
+                )
+
+                log_scan_event(
+                    "AI_DECISION", stage="AI", action=proposed_action, trigger_type=trigger_type,
+                    price=curr_price, trend_15m=trend_15m, decision=ai_decision.action,
+                    reason=ai_decision.reasoning, details={"confidence": float(ai_decision.confidence)}
+                )
+
+                # Risk unit is now based on 5M ATR because 5M is the execution chart.
+                raw_atr = df_5m["atr"].iloc[-1]
+                atr_5m = float(raw_atr) if not pd.isna(raw_atr) and float(raw_atr) > 0 else 2.5
+                risk = max(2.5, atr_5m * 1.2)
+                tp1_r_mult = 1.5
+                tp2_r_mult = 2.5
+
+                if proposed_action == "BUY":
+                    sl_price = curr_price - risk
+                    tp1_price = curr_price + risk * tp1_r_mult
+                    tp2_price = curr_price + risk * tp2_r_mult
                 else:
+                    sl_price = curr_price + risk
+                    tp1_price = curr_price - risk * tp1_r_mult
+                    tp2_price = curr_price - risk * tp2_r_mult
 
-                    logging.info(
-                        f"[MARKET SCAN] Triggered "
-                        f"{proposed_action} "
-                        f"({trigger_type}) at "
-                        f"${curr_price:.2f}. "
-                        f"Running AI Analysis..."
-                    )
-
-                    ai_decision = (
-                        await analyze_signal_with_ai(
-                            proposed_action,
-                            trigger_type,
-                            curr_price,
-                            df_1m,
-                            df_5m,
-                            recent_high,
-                            recent_low,
-                            trend_15m,
-                            adx_15m_true,
-                            plus_di_5m,
-                            minus_di_5m
-                        )
+                if ai_decision.action == proposed_action:
+                    new_id = log_trade_signal(
+                        "EXECUTED", proposed_action, trigger_type, curr_price,
+                        sl_price, tp1_price, tp2_price, float(ai_decision.confidence),
+                        0.0, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true
                     )
 
                     log_scan_event(
-                        "AI_DECISION", stage="AI", action=proposed_action,
-                        trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
-                        recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
-                        trend_15m=trend_15m, decision=ai_decision.action,
-                        reason=ai_decision.reasoning,
-                        details={"confidence": float(ai_decision.confidence)}
+                        "SIGNAL_EXECUTED", stage="TRADE_SIGNAL", action=proposed_action,
+                        trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m,
+                        decision="EXECUTED", reason=ai_decision.reasoning,
+                        details={"signal_id": new_id, "ema9_5m": ema9_5m, "ema15_5m": ema15_5m,
+                                 "ema9_15m": float(df_15m["ema9"].iloc[-1]),
+                                 "ema15_15m": float(df_15m["ema15"].iloc[-1]),
+                                 "risk": risk, "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price}
                     )
 
-                    raw_atr = (
-                        df_1m["atr"].iloc[-1]
+                    msg = (
+                        f"📈 *EMA 9/15 TREND SIGNAL #{new_id}*\n\n"
+                        f"Asset: *XAUUSD (Gold Spot)*\n"
+                        f"Action: *{proposed_action}*\n"
+                        f"Type: *{trigger_type}*\n"
+                        f"Entry Price: *${curr_price:.2f}*\n\n"
+                        f"Stop Loss (SL): *${sl_price:.2f}*\n"
+                        f"Take Profit 1 (1.5R): *${tp1_price:.2f}*\n"
+                        f"Take Profit 2 (2.5R): *${tp2_price:.2f}*\n\n"
+                        f"INDICATOR METRICS:\n"
+                        f"- 5M EMA9: *${ema9_5m:.2f}*\n"
+                        f"- 5M EMA15: *${ema15_5m:.2f}*\n"
+                        f"- 15M Trend: *{trend_15m}*\n"
+                        f"- 15M EMA9: *${float(df_15m['ema9'].iloc[-1]):.2f}*\n"
+                        f"- 15M EMA15: *${float(df_15m['ema15'].iloc[-1]):.2f}*\n"
+                        f"- 5M ATR (risk unit): *${atr_5m:.2f}*\n\n"
+                        f"Reasoning: {ai_decision.reasoning}"
                     )
-
-                    atr_1m = (
-                        float(raw_atr)
-                        if not pd.isna(raw_atr)
-                        else 3.0
+                    await send_telegram_alert(client, msg)
+                else:
+                    log_trade_signal(
+                        "VETOED", proposed_action, trigger_type, curr_price,
+                        sl_price, tp1_price, tp2_price, float(ai_decision.confidence),
+                        0.0, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true
                     )
+                    log_scan_event("AI_VETO", stage="AI", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="VETOED", reason=ai_decision.reasoning)
 
-                    risk = max(
-                        2.5,
-                        atr_1m * 1.2
-                    )
+                log_scan_event("SCAN_END", stage="SCAN", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="COMPLETE", reason="EMA strategy cycle completed")
 
-                    is_breakout_trigger = (
-                        "Breakout" in trigger_type
-                    )
-
-                    tp1_r_mult = 1.5
-
-                    tp2_r_mult = (
-                        3.0
-                        if is_breakout_trigger
-                        else 2.5
-                    )
-
-                    if proposed_action == "BUY":
-
-                        sl_price = (
-                            float(curr_price - risk)
-                        )
-
-                        tp1_price = (
-                            float(
-                                curr_price
-                                + risk * tp1_r_mult
-                            )
-                        )
-
-                        tp2_price = (
-                            float(
-                                curr_price
-                                + risk * tp2_r_mult
-                            )
-                        )
-
-                    else:
-
-                        sl_price = (
-                            float(curr_price + risk)
-                        )
-
-                        tp1_price = (
-                            float(
-                                curr_price
-                                - risk * tp1_r_mult
-                            )
-                        )
-
-                        tp2_price = (
-                            float(
-                                curr_price
-                                - risk * tp2_r_mult
-                            )
-                        )
-
-                    if ai_decision.action == proposed_action:
-
-                        new_id = log_trade_signal(
-                            "EXECUTED",
-                            proposed_action,
-                            trigger_type,
-                            curr_price,
-                            sl_price,
-                            tp1_price,
-                            tp2_price,
-                            float(
-                                ai_decision.confidence
-                            ),
-                            adx_5m,
-                            0.0,
-                            "None",
-                            ai_decision.reasoning,
-                            trend_15m,
-                            adx_15m_true
-                        )
-
-                        log_scan_event(
-                            "SIGNAL_EXECUTED", stage="TRADE_SIGNAL", action=proposed_action,
-                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
-                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
-                            trend_15m=trend_15m, decision="EXECUTED", reason=ai_decision.reasoning,
-                            details={"signal_id": new_id, "confidence": float(ai_decision.confidence),
-                                     "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
-                                     "risk": risk, "tp1_r": tp1_r_mult, "tp2_r": tp2_r_mult}
-                        )
-
-                        id_tag = (
-                            f" #{new_id}"
-                            if new_id
-                            else ""
-                        )
-
-                        header_icon = (
-                            "🚀"
-                            if is_breakout_trigger
-                            else "⚡"
-                        )
-
-                        header_label = (
-                            "BREAKOUT CONTINUATION SIGNAL"
-                            if is_breakout_trigger
-                            else
-                            "LIQUIDITY SWEEP + BOS SIGNAL"
-                        )
-
-                        model_label = (
-                            "5M/1M Momentum Breakout Continuation"
-                            if is_breakout_trigger
-                            else
-                            "5M Liquidity Sweep + "
-                            "1M Break of Structure"
-                        )
-
-                        msg = (
-                            f"{header_icon} "
-                            f"*{header_label}{id_tag}*\n\n"
-
-                            f"Asset: *XAUUSD (Gold Spot)*\n"
-                            f"Action: *{proposed_action}*\n"
-                            f"Type: *{trigger_type}*\n"
-                            f"Entry Price: *${curr_price:.2f}*\n\n"
-
-                            f"Stop Loss (SL): "
-                            f"*${sl_price:.2f}*\n"
-
-                            f"Take Profit 1 "
-                            f"({tp1_r_mult:.1f}R): "
-                            f"*${tp1_price:.2f}*\n"
-
-                            f"Take Profit 2 "
-                            f"({tp2_r_mult:.1f}R): "
-                            f"*${tp2_price:.2f}*\n\n"
-
-                            f"INDICATOR METRICS:\n"
-
-                            f"- Model: {model_label}\n"
-
-                            f"- Reference 5M High: "
-                            f"${recent_high:.2f}\n"
-
-                            f"- Reference 5M Low: "
-                            f"${recent_low:.2f}\n"
-
-                            f"- 1M ATR (risk unit): "
-                            f"${atr_1m:.2f}\n"
-
-                            f"- 5M ADX Trend Strength: "
-                            f"{adx_5m:.1f}\n"
-
-                            f"- 15M Confluence: "
-                            f"{trend_15m} "
-                            f"(ADX {adx_15m_true:.1f})\n\n"
-
-                            f"Reasoning: "
-                            f"{ai_decision.reasoning}"
-                        )
-
-                        await send_telegram_alert(
-                            client,
-                            msg
-                        )
-
-                    else:
-
-                        log_trade_signal(
-                            "VETOED",
-                            proposed_action,
-                            trigger_type,
-                            curr_price,
-                            sl_price,
-                            tp1_price,
-                            tp2_price,
-                            float(
-                                ai_decision.confidence
-                            ),
-                            adx_5m,
-                            0.0,
-                            "None",
-                            ai_decision.reasoning,
-                            trend_15m,
-                            adx_15m_true
-                        )
-
-                        log_scan_event(
-                            "AI_VETO", stage="AI", action=proposed_action,
-                            trigger_type=trigger_type, price=curr_price, recent_high=recent_high,
-                            recent_low=recent_low, adx_5m=adx_5m, adx_15m=adx_15m_true,
-                            trend_15m=trend_15m, decision="VETOED", reason=ai_decision.reasoning,
-                            details={"confidence": float(ai_decision.confidence)}
-                        )
-
-                log_scan_event(
-                    "SCAN_END", stage="SCAN", action=proposed_action, trigger_type=trigger_type,
-                    price=curr_price, recent_high=recent_high, recent_low=recent_low, adx_5m=adx_5m,
-                    adx_15m=adx_15m_true, trend_15m=trend_15m, pending=pending_setup,
-                    decision="COMPLETE", reason="Scanner cycle completed",
-                    details={"status_note": status_note}
-                )
-
-                del df_1m, df_5m
-                gc.collect()
+                await asyncio.sleep(2)
 
             except Exception as e:
-                log_scan_event(
-                    "SCAN_ERROR", stage="SCAN", decision="ERROR", reason=str(e),
-                    details={"exception_type": type(e).__name__}
-                )
-                logging.error(
-                    f"[SCAN LOOP ERROR] {e}"
-                )
-
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                log_scan_event("SCAN_ERROR", stage="SCAN", decision="ERROR", reason=str(e), details={"exception_type": type(e).__name__})
+                logging.error(f"[SCAN LOOP ERROR] {e}")
+                await asyncio.sleep(10)
 
 
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
@@ -3237,13 +1547,7 @@ async def telegram_webhook(
 
                     "• `/help` - Display Command Menu\n\n"
 
-                    f"⚠️ Active stat-vetoes: "
-                    f"ADX ≥ {STAT_VETO_ADX_THRESHOLD:.0f} blocks late breakout/continuation entries; "
-                    f"confirmed Sweep+BOS reversals can receive an extreme-ADX exception when +DI/-DI "
-                    f"confirms the reversal direction. Mid session "
-                    f"({STAT_VETO_MID_SESSION_START_HOUR}-"
-                    f"{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-                    f"remains auto-skipped based on forward-test underperformance.\n"
+                    "📐 Active strategy: 5M EMA9/EMA15 trend-following pullback with 15M EMA9/EMA15 confluence.\n"
 
                     f"⏱️ Loss cooldown: "
                     f"{LOSS_COOLDOWN_MINUTES} min "
@@ -4007,15 +2311,7 @@ async def telegram_webhook(
                             "fib pullback zone, or session windows "
                             "in code.\n\n"
 
-                            f"🚫 Active stat-vetoes: "
-                            f"ADX ≥ "
-                            f"{STAT_VETO_ADX_THRESHOLD:.0f} "
-                            f"and Mid session "
-                            f"({STAT_VETO_MID_SESSION_START_HOUR}-"
-                            f"{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-                            f"are being auto-skipped -- re-check "
-                            f"this report after ~30-40 more trades "
-                            f"to confirm they're actually lifting AvgR.\n"
+                            "📐 Active strategy: EMA9/EMA15 trend pullback; 15M EMA9/EMA15 is used as confluence.\n"
 
                             f"⏱️ Loss cooldown "
                             f"({LOSS_COOLDOWN_MINUTES} min, "
@@ -4058,4 +2354,3 @@ async def telegram_webhook(
     return {
         "status": "ok"
     }
-

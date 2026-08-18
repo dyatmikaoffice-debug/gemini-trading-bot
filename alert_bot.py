@@ -1,3 +1,4 @@
+# EMA STRATEGY CONFIG: ALL DAY TRADING OPEN
 import os
 import json
 import asyncio
@@ -63,30 +64,16 @@ ACTIVE_SESSION_END_HOUR = 24   # WIB - Adjusted to 24 for all-day trading
 MID_SESSION_START_HOUR = 14     # WIB
 MID_SESSION_END_HOUR = 18       # WIB
 
-# API schedule: one 5M request every 5 minutes during the active session,
-# plus one 15M request every 15 minutes. The 15M dataframe is cached between refreshes.
 TWELVE_DATA_DAILY_LIMIT = 800
 
 # ==========================================================
 # BASIC EMA 9/15 TREND-PULLBACK STRATEGY
 # ==========================================================
-# ONLY ACTIVE ENTRY STRATEGY. All previous sweep/BOS, breakout,
-# continuation and consolidation entry logic is disabled.
-# Execution timeframe: 5 minutes.
-# Confluence timeframe: 15 minutes, refreshed every 15 minutes
-# and cached between refreshes.
 EMA_FAST = 9
 EMA_SLOW = 15
 EMA_TOUCH_TOLERANCE = 0.0
 EMA_REQUIRE_CLOSE_IN_TREND = True
 EMA_15M_REQUIRE_CLOSE_SIDE = True
-
-# --- LEGACY STAT-VETO COMPATIBILITY ---
-# Deliberately disabled: the active strategy uses only EMA9/EMA15 direction
-# and EMA-touch entry logic. This function is retained only so older external
-# callers do not break.
-def check_stat_veto(*args, **kwargs):
-    return False, ""
 
 # --- LOSS-COOLDOWN ---
 LOSS_COOLDOWN_MINUTES = 10
@@ -209,7 +196,6 @@ def init_db():
         )
 
 
-
 def log_bot_event(
     event_type: str,
     stage: str = None,
@@ -230,7 +216,6 @@ def log_bot_event(
     details: dict = None,
     cycle_id: str = None
 ):
-    """Best-effort structured audit logging. Never stops the scanner."""
     if not DATABASE_URL:
         return None
 
@@ -338,17 +323,8 @@ def log_trade_signal(
         adx_val = float(adx_15m) if adx_15m is not None else 0.0
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
 
-        trend_15m_val = (
-            str(trend_15m)
-            if trend_15m is not None
-            else None
-        )
-
-        adx_15m_true_val = (
-            float(adx_15m_true)
-            if adx_15m_true is not None
-            else None
-        )
+        trend_15m_val = str(trend_15m) if trend_15m is not None else None
+        adx_15m_true_val = float(adx_15m_true) if adx_15m_true is not None else None
 
         cursor.execute("""
             INSERT INTO signals (
@@ -406,11 +382,7 @@ def log_trade_signal(
         ))
 
         inserted_row = cursor.fetchone()
-        new_id = (
-            inserted_row["id"]
-            if inserted_row and "id" in inserted_row
-            else None
-        )
+        new_id = inserted_row["id"] if inserted_row and "id" in inserted_row else None
 
         conn.commit()
         cursor.close()
@@ -424,9 +396,7 @@ def log_trade_signal(
         return new_id
 
     except Exception as e:
-        logging.error(
-            f"[NEON DB ERROR] Failed to log signal: {e}"
-        )
+        logging.error(f"[NEON DB ERROR] Failed to log signal: {e}")
         return None
 
 
@@ -467,76 +437,47 @@ def update_open_trades(current_high: float, current_low: float):
             trade_id = trade["id"]
             action = trade["action"]
 
-            entry_price = float(
-                trade["entry_price"]
-                if trade.get("entry_price") is not None
-                else trade.get("price", 0.0)
-            )
-
-            sl = float(
-                trade["sl_price"]
-                if trade.get("sl_price") is not None
-                else trade.get("sl", 0.0)
-            )
-
-            tp1 = float(
-                trade["tp1_price"]
-                if trade.get("tp1_price") is not None
-                else trade.get("tp1", 0.0)
-            )
-
-            tp2 = float(
-                trade["tp2_price"]
-                if trade.get("tp2_price") is not None
-                else trade.get("tp2", 0.0)
-            )
+            entry_price = float(trade["entry_price"] if trade.get("entry_price") is not None else trade.get("price", 0.0))
+            sl = float(trade["sl_price"] if trade.get("sl_price") is not None else trade.get("sl", 0.0))
+            tp1 = float(trade["tp1_price"] if trade.get("tp1_price") is not None else trade.get("tp1", 0.0))
+            tp2 = float(trade["tp2_price"] if trade.get("tp2_price") is not None else trade.get("tp2", 0.0))
 
             current_outcome = trade["outcome"]
             new_outcome = None
             exit_price = None
 
             if action == "BUY":
-
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 > 0 and c_high >= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
-
                     elif c_low <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = entry_price
-
                 elif sl > 0 and c_low <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-
                 elif tp2 > 0 and c_high >= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-
                 elif tp1 > 0 and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
 
             elif action == "SELL":
-
                 if current_outcome == "WIN (TP1 HIT)":
                     if tp2 > 0 and c_low <= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
-
                     elif c_high >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = entry_price
-
                 elif sl > 0 and c_high >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
-
                 elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"
                     exit_price = tp2
-
                 elif tp1 > 0 and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"
                     exit_price = tp1
@@ -605,9 +546,7 @@ def update_open_trades(current_high: float, current_low: float):
         conn.close()
 
     except Exception as e:
-        logging.error(
-            f"[NEON DB ERROR] Failed to update trade outcomes: {e}"
-        )
+        logging.error(f"[NEON DB ERROR] Failed to update trade outcomes: {e}")
 
 
 # --- MARKET DATA FETCHING ---
@@ -670,18 +609,9 @@ def calculate_ema_metrics(df: pd.DataFrame):
     return df
 
 
-def calculate_metrics_m1(df: pd.DataFrame):
-    # Kept only for compatibility with legacy helper references.
-    return calculate_ema_metrics(df)
-
-
 def calculate_metrics_5m(df: pd.DataFrame):
-    # 5M is now the execution timeframe. Keep this function name so the
-    # database/analytics support code remains compatible.
     return calculate_ema_metrics(df)
 
-
-TREND_15M_MIN_SEPARATION_PCT = 0.0
 
 def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SLOW):
     if df is None or len(df) < slow + 1:
@@ -703,23 +633,8 @@ def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SL
     return "NEUTRAL", separation_pct
 
 
-# --- ACTIVE STRATEGY: BASIC EMA 9/15 TREND PULLBACK ---
+# --- ACTIVE STRATEGY: EMA 9/15 TREND PULLBACK + CROSSOVER ---
 def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
-    """
-    Basic trend-following strategy.
-
-    5M execution:
-      - EMA9 > EMA15 = bullish trend.
-      - EMA9 < EMA15 = bearish trend.
-      - A completed 5M candle touching EMA15 is the primary trigger.
-      - A completed 5M candle touching EMA9 is a secondary trigger.
-      - The candle must close in the trend direction.
-
-    15M confluence:
-      - BUY requires EMA9 > EMA15.
-      - SELL requires EMA9 < EMA15.
-      - When enabled, the 15M close must also be on the trend side of EMA15.
-    """
     if df_5m is None or df_15m is None or len(df_5m) < 20 or len(df_15m) < 20:
         return "HOLD", "EMA setup rejected: insufficient 5M/15M data", 0.0, 0.0
 
@@ -737,16 +652,16 @@ def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     high5 = float(m5["high"])
     low5 = float(m5["low"])
 
-    # Trend is defined by the current EMA9/EMA15 relationship.
     trend_5m = "BULLISH" if ema9_5 > ema15_5 else "BEARISH" if ema9_5 < ema15_5 else "NEUTRAL"
     trend_15m = "BULLISH" if ema9_15 > ema15_15 else "BEARISH" if ema9_15 < ema15_15 else "NEUTRAL"
 
-    # Detect whether this is a fresh EMA interaction rather than simply
-    # repeating a signal while price remains glued to the same EMA.
     p_high = float(p5["high"])
     p_low = float(p5["low"])
     p_ema9 = float(p5["ema9"])
     p_ema15 = float(p5["ema15"])
+
+    bullish_cross = (p_ema9 <= p_ema15) and (ema9_5 > ema15_5)
+    bearish_cross = (p_ema9 >= p_ema15) and (ema9_5 < ema15_5)
 
     touched_ema15 = (low5 - EMA_TOUCH_TOLERANCE <= ema15_5 <= high5 + EMA_TOUCH_TOLERANCE)
     touched_ema9 = (low5 - EMA_TOUCH_TOLERANCE <= ema9_5 <= high5 + EMA_TOUCH_TOLERANCE)
@@ -757,43 +672,163 @@ def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
         close_side_ok = close5 > ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
         m15_side_ok = (float(m15["close"]) > ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
 
-        if close_side_ok and m15_side_ok and touched_ema15:
+        if not m15_side_ok:
+            return "HOLD", "15M Confluence failed", ema9_5, ema15_5
+
+        if bullish_cross and close5 > ema9_5:
+            return "BUY", "5M EMA Crossover - Bullish Momentum", ema9_5, ema15_5
+
+        if close_side_ok and touched_ema15:
             trigger = "5M EMA15 Touch - Bullish Trend"
-            if prev_touched_ema15:
-                trigger += " (Continuation Touch)"
+            if prev_touched_ema15: trigger += " (Continuation Touch)"
             return "BUY", trigger, ema9_5, ema15_5
 
-        if close_side_ok and m15_side_ok and touched_ema9:
+        if close_side_ok and touched_ema9:
             trigger = "5M EMA9 Touch - Bullish Trend"
-            if prev_touched_ema9:
-                trigger += " (Continuation Touch)"
+            if prev_touched_ema9: trigger += " (Continuation Touch)"
             return "BUY", trigger, ema9_5, ema15_5
 
     if trend_5m == "BEARISH" and trend_15m == "BEARISH":
         close_side_ok = close5 < ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
         m15_side_ok = (float(m15["close"]) < ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
 
-        if close_side_ok and m15_side_ok and touched_ema15:
+        if not m15_side_ok:
+            return "HOLD", "15M Confluence failed", ema9_5, ema15_5
+
+        if bearish_cross and close5 < ema9_5:
+            return "SELL", "5M EMA Crossover - Bearish Momentum", ema9_5, ema15_5
+
+        if close_side_ok and touched_ema15:
             trigger = "5M EMA15 Touch - Bearish Trend"
-            if prev_touched_ema15:
-                trigger += " (Continuation Touch)"
+            if prev_touched_ema15: trigger += " (Continuation Touch)"
             return "SELL", trigger, ema9_5, ema15_5
 
-        if close_side_ok and m15_side_ok and touched_ema9:
+        if close_side_ok and touched_ema9:
             trigger = "5M EMA9 Touch - Bearish Trend"
-            if prev_touched_ema9:
-                trigger += " (Continuation Touch)"
+            if prev_touched_ema9: trigger += " (Continuation Touch)"
             return "SELL", trigger, ema9_5, ema15_5
 
     reason = (
         f"5M {trend_5m}, 15M {trend_15m}; "
-        f"EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch"
+        f"EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch or cross"
     )
     return "HOLD", reason, ema9_5, ema15_5
 
 
-# Legacy strategy names are intentionally disabled. They remain absent from
-# the live scanner path so only the EMA 9/15 strategy can generate entries.
+# --- FORWARD-TEST ANALYTICS HELPERS ---
+def compute_trade_pips(trade: dict) -> tuple[float, float]:
+    """
+    Calculate the trade result using the bot's two-stage TP model.
+    """
+    action = str(trade.get("action") or "BUY").upper()
+
+    entry = float(
+        trade.get("entry_price")
+        or trade.get("entry_p")
+        or trade.get("price")
+        or 0.0
+    )
+
+    sl = float(
+        trade.get("sl_price")
+        or trade.get("sl")
+        or 0.0
+    )
+
+    tp1 = float(
+        trade.get("tp1_price")
+        or trade.get("tp1")
+        or 0.0
+    )
+
+    tp2 = float(
+        trade.get("tp2_price")
+        or trade.get("tp2")
+        or 0.0
+    )
+
+    exit_p = float(
+        trade.get("exit_price")
+        or entry
+    )
+
+    outcome = str(
+        trade.get("outcome")
+        or trade.get("outcome_val")
+        or "PENDING"
+    )
+
+    sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
+    if sl_dist == 0:
+        sl_dist = 2.5
+
+    tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
+    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
+
+    if outcome == "CLOSED (TP1 HIT / SL BE)":
+        total_pips = tp1_dist * 10.0
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        total_pips = (tp1_dist + tp2_dist) * 10.0
+    elif outcome == "WIN (TP1 HIT)":
+        total_pips = tp1_dist * 10.0
+    elif "LOSS" in outcome:
+        total_pips = -(sl_dist * 10.0 * 2.0)
+    else:
+        diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
+        total_pips = diff * 10.0 * 2.0
+
+    profit_usd = total_pips * 0.10
+    return total_pips, profit_usd
+
+
+def compute_r_multiple(
+    action: str,
+    entry: float,
+    exit_price: float,
+    sl: float,
+    tp1: float = 0.0,
+    tp2: float = 0.0,
+    outcome: str = "PENDING"
+) -> float:
+    """Calculate R using the same two-stage TP accounting as pips."""
+    risk_dist = abs(entry - sl)
+
+    if risk_dist <= 0:
+        risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
+        if risk_dist == 0:
+            risk_dist = 2.5
+
+    if outcome == "CLOSED (TP1 HIT / SL BE)":
+        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
+        return tp1_dist / risk_dist
+
+    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
+        tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
+        return (tp1_dist + tp2_dist) / risk_dist
+
+    if outcome == "WIN (TP1 HIT)":
+        tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
+        return tp1_dist / risk_dist
+
+    if "LOSS" in outcome:
+        return -2.0
+
+    single_r = (
+        (exit_price - entry) / risk_dist
+        if action == "BUY"
+        else (entry - exit_price) / risk_dist
+    )
+    return single_r * 2.0
+
+
+def bucket_adx(adx: float) -> str:
+    if adx < 20: return "ADX <20"
+    if adx < 30: return "ADX 20-30"
+    if adx < 40: return "ADX 30-40"
+    if adx < 50: return "ADX 40-50"
+    return "ADX 50+"
+
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
@@ -801,90 +836,43 @@ def bucket_strategy(trigger_type: str) -> str:
         return "EMA15 Trend Pullback"
     if "EMA9" in t:
         return "EMA9 Trend Pullback"
+    if "Crossover" in t:
+        return "EMA Crossover Momentum"
     return "EMA 9/15 Trend Pullback"
+
 
 def bucket_session(timestamp_str: str) -> str:
     try:
-        hour = int(
-            str(timestamp_str)
-            .split(" ")[1]
-            .split(":")[0]
-        )
-
+        hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
     except Exception:
         return "Unknown"
 
-    if 9 <= hour < 14:
-        return "Early (09-14 WIB)"
-
-    if 14 <= hour < 18:
-        return "Mid (14-18 WIB)"
-
-    if 18 <= hour < 22:
-        return "Late (18-22 WIB)"
-
+    if 9 <= hour < 14: return "Early (09-14 WIB)"
+    if 14 <= hour < 18: return "Mid (14-18 WIB)"
+    if 18 <= hour < 22: return "Late (18-22 WIB)"
     return "Outside session"
 
 
-def bucket_confluence(
-    action: str,
-    trend_15m: str
-) -> str:
+def bucket_confluence(action: str, trend_15m: str) -> str:
     t = (trend_15m or "").upper()
-
-    if not t or t == "NEUTRAL":
-        return "15m Neutral"
-
-    if (
-        (action == "BUY" and t == "BULLISH")
-        or
-        (action == "SELL" and t == "BEARISH")
-    ):
+    if not t or t == "NEUTRAL": return "15m Neutral"
+    if ((action == "BUY" and t == "BULLISH") or (action == "SELL" and t == "BEARISH")):
         return "15m Aligned"
-
     return "15m Disagreed"
 
 
-def format_performance_segment(
-    dim_name: str,
-    buckets: dict,
-    min_sample_to_flag: int = 8
-) -> str:
+def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag: int = 8) -> str:
     lines = [f"*{dim_name}:*"]
-
-    for label, r_values in sorted(
-        buckets.items(),
-        key=lambda item: -len(item[1])
-    ):
+    for label, r_values in sorted(buckets.items(), key=lambda item: -len(item[1])):
         n = len(r_values)
-
-        wins = sum(
-            1 for r in r_values if r > 0
-        )
-
-        win_rate = (
-            wins / n * 100
-        ) if n else 0.0
-
-        avg_r = (
-            sum(r_values) / n
-        ) if n else 0.0
-
+        wins = sum(1 for r in r_values if r > 0)
+        win_rate = (wins / n * 100) if n else 0.0
+        avg_r = (sum(r_values) / n) if n else 0.0
         flag = ""
-
         if n >= min_sample_to_flag:
-            if win_rate < 35:
-                flag = " ⚠️ underperforming"
-
-            elif win_rate > 65:
-                flag = " ✅ strong"
-
-        lines.append(
-            f"• {label}: n={n}, "
-            f"WR={win_rate:.0f}%, "
-            f"AvgR={avg_r:+.2f}{flag}"
-        )
-
+            if win_rate < 35: flag = " ⚠️ underperforming"
+            elif win_rate > 65: flag = " ✅ strong"
+        lines.append(f"• {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
     return "\n".join(lines)
 
 
@@ -894,69 +882,27 @@ async def send_telegram_alert(
     text: str,
     target_chat_id: str = None
 ):
-    chat_id = "".join(
-        str(
-            target_chat_id or TELEGRAM_CHAT_ID
-        ).split()
-    )
-
+    chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
     if not TELEGRAM_BOT_TOKEN or not chat_id:
-        logging.error(
-            "[TELEGRAM ERROR] Missing token or chat_id"
-        )
+        logging.error("[TELEGRAM ERROR] Missing token or chat_id")
         return
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
 
     try:
-        res = await client.post(
-            url,
-            json=payload
-        )
-
+        res = await client.post(url, json=payload)
         if res.status_code != 200:
-
-            payload_plain = {
-                "chat_id": chat_id,
-                "text": text
-            }
-
-            res_plain = await client.post(
-                url,
-                json=payload_plain
-            )
-
+            payload_plain = {"chat_id": chat_id, "text": text}
+            res_plain = await client.post(url, json=payload_plain)
             if res_plain.status_code == 200:
-                logging.info(
-                    f"[TELEGRAM SENT] Delivered plain text "
-                    f"to Chat ID {chat_id}"
-                )
-
+                logging.info(f"[TELEGRAM SENT] Delivered plain text to Chat ID {chat_id}")
             else:
-                logging.error(
-                    f"[TELEGRAM ERROR] "
-                    f"Failed sending message: {res_plain.text}"
-                )
-
+                logging.error(f"[TELEGRAM ERROR] Failed sending message: {res_plain.text}")
         else:
-            logging.info(
-                f"[TELEGRAM SENT] Delivered Markdown "
-                f"to Chat ID {chat_id}"
-            )
-
+            logging.info(f"[TELEGRAM SENT] Delivered Markdown to Chat ID {chat_id}")
     except Exception as e:
-        logging.error(
-            f"[TELEGRAM EXCEPTION] {e}"
-        )
+        logging.error(f"[TELEGRAM EXCEPTION] {e}")
 
 
 # --- AI ANALYST EVALUATION ---
@@ -971,14 +917,13 @@ async def analyze_signal_with_ai(
     trend_15m: str = "NEUTRAL",
     adx_15m_true: float = 0.0
 ):
-    """AI is only a risk-quality gate; it cannot create a trade direction."""
     m5 = df_5m.iloc[-1]
     m15 = df_15m.iloc[-1]
 
     prompt = f"""
 Act as a conservative risk manager for Spot Gold (XAU/USD).
 
-ONLY strategy in use: 5-minute EMA9/EMA15 trend-following pullback.
+ONLY strategy in use: 5-minute EMA9/EMA15 trend-following pullback & crossover.
 The deterministic strategy has already produced a {proposed_action} trigger.
 Your job is ONLY to approve or veto it; never reverse the direction.
 
@@ -1048,7 +993,6 @@ async def background_scanning_loop():
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         last_5m_candle_time = None
-        last_15m_candle_time = None
 
         while True:
             try:
@@ -1065,8 +1009,6 @@ async def background_scanning_loop():
                     await asyncio.sleep(60)
                     continue
 
-                # Run only on 5-minute boundaries. This prevents multiple executions
-                # against the same 5M candle and keeps API usage predictable.
                 if now_wib.minute % 5 != 0 or now_wib.second > 8:
                     await asyncio.sleep(2)
                     continue
@@ -1074,9 +1016,6 @@ async def background_scanning_loop():
                 CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="5M EMA scan started", details={"wib_time": now_wib.strftime('%Y-%m-%d %H:%M:%S')})
 
-                # ==========================================================
-                # 5M DATA: FRESH EVERY 5 MINUTES
-                # ==========================================================
                 df_5m_raw = await fetch_timeframe_data(client, "5min", outputsize=100)
                 if df_5m_raw is None or len(df_5m_raw) < 20:
                     log_scan_event("DATA_FETCH_FAILED", stage="DATA", decision="RETRY", reason="Failed to fetch sufficient 5M candles")
@@ -1084,14 +1023,13 @@ async def background_scanning_loop():
                     continue
 
                 df_5m = calculate_ema_metrics(df_5m_raw)
-                # Twelve Data may include the currently-forming interval as the last row.
-                # Use the last completed 5M candle so entries never fire mid-candle.
                 if len(df_5m) >= 2:
                     df_5m = df_5m.iloc[:-1].copy()
                 if len(df_5m) < 20:
                     log_scan_event("DATA_INSUFFICIENT", stage="DATA", decision="RETRY", reason="No completed 5M candle available yet")
                     await asyncio.sleep(10)
                     continue
+                
                 candle_time_5m = df_5m["datetime"].iloc[-1]
 
                 if last_5m_candle_time is not None and candle_time_5m == last_5m_candle_time:
@@ -1099,9 +1037,6 @@ async def background_scanning_loop():
                     continue
                 last_5m_candle_time = candle_time_5m
 
-                # ==========================================================
-                # 15M DATA: FRESH EVERY 15 MINUTES, CACHED BETWEEN
-                # ==========================================================
                 refresh_15m = (
                     cached_15m["df"] is None
                     or now_wib.minute % 15 == 0
@@ -1113,7 +1048,6 @@ async def background_scanning_loop():
                     df_15m_raw = await fetch_timeframe_data(client, "15min", outputsize=100)
                     if df_15m_raw is not None and len(df_15m_raw) >= 20:
                         df_15m_new = calculate_ema_metrics(df_15m_raw)
-                        # Cache only completed 15M candles.
                         if len(df_15m_new) >= 2:
                             df_15m_new = df_15m_new.iloc[:-1].copy()
                         if len(df_15m_new) < 20:
@@ -1134,7 +1068,6 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(df_15m)
                 adx_15m_true = 0.0
 
-                # Open-trade management now uses the current 5M candle.
                 update_open_trades(float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
 
                 curr_price = float(df_5m["close"].iloc[-1])
@@ -1163,13 +1096,10 @@ async def background_scanning_loop():
                         f"Price ${curr_price:.2f} | 5M EMA9 ${ema9_5m:.2f} / EMA15 ${ema15_5m:.2f} | "
                         f"15M {trend_15m} | HOLD ({trigger_type})"
                     )
-                    log_scan_event("SCAN_END", stage="SCAN", action="HOLD", trigger_type=trigger_type, price=curr_price, adx_15m=adx_15m_true, trend_15m=trend_15m, decision="COMPLETE", reason="No aligned EMA touch")
+                    log_scan_event("SCAN_END", stage="SCAN", action="HOLD", trigger_type=trigger_type, price=curr_price, adx_15m=adx_15m_true, trend_15m=trend_15m, decision="COMPLETE", reason="No aligned EMA touch or crossover")
                     await asyncio.sleep(2)
                     continue
 
-                # ==========================================================
-                # EXISTING SUPPORT SYSTEM: LOSS COOLDOWN
-                # ==========================================================
                 try:
                     conn = get_db_connection()
                     cursor = conn.cursor()
@@ -1193,9 +1123,6 @@ async def background_scanning_loop():
                 except Exception as e:
                     logging.error(f"[LOSS COOLDOWN ERROR] {e}")
 
-                # ==========================================================
-                # EXISTING SUPPORT SYSTEM: DISTANCE COOLDOWN
-                # ==========================================================
                 try:
                     conn = get_db_connection(); cursor = conn.cursor()
                     cursor.execute("""
@@ -1215,9 +1142,6 @@ async def background_scanning_loop():
                 except Exception as e:
                     logging.error(f"[DISTANCE COOLDOWN ERROR] {e}")
 
-                # ==========================================================
-                # AI SUPPORT GATE (strategy remains deterministic)
-                # ==========================================================
                 ai_decision = await analyze_signal_with_ai(
                     proposed_action, trigger_type, curr_price,
                     df_5m, df_15m, ema9_5m, ema15_5m,
@@ -1230,7 +1154,6 @@ async def background_scanning_loop():
                     reason=ai_decision.reasoning, details={"confidence": float(ai_decision.confidence)}
                 )
 
-                # Risk unit is now based on 5M ATR because 5M is the execution chart.
                 raw_atr = df_5m["atr"].iloc[-1]
                 atr_5m = float(raw_atr) if not pd.isna(raw_atr) and float(raw_atr) > 0 else 2.5
                 risk = max(2.5, atr_5m * 1.2)
@@ -1307,62 +1230,26 @@ async def lifespan(app: FastAPI):
     init_db()
 
     if TELEGRAM_BOT_TOKEN and APP_URL:
-
         try:
-            webhook_endpoint = (
-                f"{APP_URL.rstrip('/')}"
-                f"/telegram-webhook"
-            )
+            webhook_endpoint = f"{APP_URL.rstrip('/')}/telegram-webhook"
+            set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
 
-            set_url = (
-                f"https://api.telegram.org/"
-                f"bot{TELEGRAM_BOT_TOKEN}"
-                f"/setWebhook?url={webhook_endpoint}"
-            )
-
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                follow_redirects=True
-            ) as client:
-
-                res = await client.get(
-                    set_url
-                )
-
-                logging.info(
-                    f"[AUTO WEBHOOK SETUP] "
-                    f"Response: {res.text}"
-                )
-
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                res = await client.get(set_url)
+                logging.info(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
         except Exception as e:
-            logging.error(
-                f"[AUTO WEBHOOK SETUP ERROR] "
-                f"Failed: {e}"
-            )
+            logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
 
-    scan_task = asyncio.create_task(
-        background_scanning_loop()
-    )
-
+    scan_task = asyncio.create_task(background_scanning_loop())
     yield
-
     scan_task.cancel()
 
 
-app = FastAPI(
-    lifespan=lifespan
-)
-
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {
-        "status": "ok",
-        "message": (
-            "Trading bot scanner and webhook "
-            "server active."
-        )
-    }
+    return {"status": "ok", "message": "Trading bot scanner and webhook server active."}
 
 
 # =====================================================================
@@ -1370,22 +1257,13 @@ def home():
 # =====================================================================
 @app.get("/get-latest-signal")
 async def get_latest_signal():
-
     global SYSTEM_TRADING_ENABLED
 
     if not SYSTEM_TRADING_ENABLED:
-        return {
-            "signal": None,
-            "trading_enabled": False,
-            "status": "PAUSED"
-        }
+        return {"signal": None, "trading_enabled": False, "status": "PAUSED"}
 
     if not DATABASE_URL:
-        return {
-            "signal": None,
-            "error": "DATABASE_URL not set",
-            "trading_enabled": SYSTEM_TRADING_ENABLED
-        }
+        return {"signal": None, "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
 
     try:
         conn = get_db_connection()
@@ -1395,31 +1273,11 @@ async def get_latest_signal():
             SELECT
                 id,
                 action,
-                COALESCE(
-                    entry_price,
-                    price,
-                    0
-                ) AS entry_p,
-                COALESCE(
-                    sl_price,
-                    sl,
-                    0
-                ) AS sl_p,
-                COALESCE(
-                    tp1_price,
-                    tp1,
-                    0
-                ) AS tp1_p,
-                COALESCE(
-                    tp2_price,
-                    tp2,
-                    0
-                ) AS tp2_p,
-                COALESCE(
-                    timestamp,
-                    created_at::text,
-                    ''
-                ) AS log_time
+                COALESCE(entry_price, price, 0) AS entry_p,
+                COALESCE(sl_price, sl, 0) AS sl_p,
+                COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                COALESCE(tp2_price, tp2, 0) AS tp2_p,
+                COALESCE(timestamp, created_at::text, '') AS log_time
             FROM signals
             WHERE status = 'EXECUTED'
             ORDER BY id DESC
@@ -1427,332 +1285,127 @@ async def get_latest_signal():
         """)
 
         row = cur.fetchone()
-
         cur.close()
         conn.close()
 
         if row:
             return {
                 "id": int(row["id"]),
-                "action": str(
-                    row["action"]
-                ).upper(),
-                "entry": float(
-                    row["entry_p"]
-                ),
-                "sl": float(
-                    row["sl_p"]
-                ),
-                "tp1": float(
-                    row["tp1_p"]
-                ),
-                "tp2": float(
-                    row["tp2_p"]
-                ),
-                "timestamp": str(
-                    row["log_time"]
-                ),
+                "action": str(row["action"]).upper(),
+                "entry": float(row["entry_p"]),
+                "sl": float(row["sl_p"]),
+                "tp1": float(row["tp1_p"]),
+                "tp2": float(row["tp2_p"]),
+                "timestamp": str(row["log_time"]),
                 "trading_enabled": True
             }
 
-        return {
-            "signal": None,
-            "trading_enabled": True
-        }
-
+        return {"signal": None, "trading_enabled": True}
     except Exception as e:
-
-        logging.error(
-            f"[MT5 BRIDGE ERROR /get-latest-signal] "
-            f"{e}"
-        )
-
-        return {
-            "error": str(e),
-            "trading_enabled":
-                SYSTEM_TRADING_ENABLED
-        }
+        logging.error(f"[MT5 BRIDGE ERROR /get-latest-signal] {e}")
+        return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
 
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 @app.post("/telegram-webhook")
-async def telegram_webhook(
-    request: Request
-):
-
+async def telegram_webhook(request: Request):
     global SYSTEM_TRADING_ENABLED
 
     try:
         data = await request.json()
-
-        message = data.get(
-            "message",
-            {}
-        )
-
-        raw_text = (
-            message
-            .get("text", "")
-            .strip()
-            .lower()
-        )
-
-        sender_chat_id = str(
-            message
-            .get("chat", {})
-            .get("id", "")
-        )
+        message = data.get("message", {})
+        raw_text = message.get("text", "").strip().lower()
+        sender_chat_id = str(message.get("chat", {}).get("id", ""))
 
         if not sender_chat_id or not raw_text:
-            return {
-                "status": "ignored"
-            }
+            return {"status": "ignored"}
 
-        logging.info(
-            f"[WEBHOOK RECEIVED] "
-            f"Chat ID: {sender_chat_id} | "
-            f"Command: '{raw_text}'"
-        )
+        logging.info(f"[WEBHOOK RECEIVED] Chat ID: {sender_chat_id} | Command: '{raw_text}'")
 
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True
-        ) as client:
-
-            if raw_text in [
-                "/help",
-                "/start"
-            ]:
-
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            if raw_text in ["/help", "/start"]:
                 reply = (
                     "🤖 *TRADING BOT COMMANDS:*\n\n"
-
-                    "• `/stats` - Comprehensive "
-                    "Win-Rate & Risk Analytics Dashboard\n"
-
-                    "• `/pips` - Detailed Gross/Net "
-                    "Pips & USD Profit Breakdown (0.01 Lot)\n"
-
-                    "• `/logs` - Detailed View "
-                    "of Last 10 Trades & Outcomes\n"
-
-                    "• `/analyze` - Forward-Test "
-                    "Breakdown by Strategy, ADX Regime & Session\n"
-
-                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH* "
-                    "(Stop Bot & MT5 auto-trade)\n"
-
-                    "• `/resume` - 🟢 Re-enable "
-                    "Auto-Trading Execution\n"
-
+                    "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
+                    "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
+                    "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
+                    "• `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
+                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
+                    "• `/resume` - 🟢 Re-enable Auto-Trading Execution\n"
                     "• `/help` - Display Command Menu\n\n"
-
-                    "📐 Active strategy: 5M EMA9/EMA15 trend-following pullback with 15M EMA9/EMA15 confluence.\n"
-
-                    f"⏱️ Loss cooldown: "
-                    f"{LOSS_COOLDOWN_MINUTES} min "
-                    f"after any SL hit "
-                    f"(any direction) before a new signal can execute."
+                    "📐 Active strategy: 5M EMA9/EMA15 trend pullback and crossover.\n"
+                    f"⏱️ Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit."
                 )
-
-                await send_telegram_alert(
-                    client,
-                    reply,
-                    target_chat_id=sender_chat_id
-                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/pause":
-
                 SYSTEM_TRADING_ENABLED = False
-
                 reply = (
                     "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
-                    "• Market scanner loop has been "
-                    "**PAUSED**.\n"
-
-                    "• MT5 Signal Copier will "
-                    "**IGNORE** all new signals.\n\n"
-
+                    "• Market scanner loop has been **PAUSED**.\n"
+                    "• MT5 Signal Copier will **IGNORE** all new signals.\n\n"
                     "👉 Send `/resume` to reactivate trading."
                 )
-
-                await send_telegram_alert(
-                    client,
-                    reply,
-                    target_chat_id=sender_chat_id
-                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/resume":
-
                 SYSTEM_TRADING_ENABLED = True
-
                 reply = (
                     "🟢 *AUTO-TRADING SYSTEM RESUMED*\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
                     "• Scanner loop is now **ACTIVE**.\n"
-
-                    "• MT5 bridge is listening "
-                    "for live setups."
+                    "• MT5 bridge is listening for live setups."
                 )
-
-                await send_telegram_alert(
-                    client,
-                    reply,
-                    target_chat_id=sender_chat_id
-                )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/stats":
-
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
 
-                    cur.execute("""
-                        SELECT COUNT(*) AS total
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                    """)
+                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED'")
+                    total_executed = cur.fetchone()["total"] or 0
 
-                    total_executed = (
-                        cur.fetchone()["total"]
-                        or 0
-                    )
+                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED'")
+                    total_vetoes = cur.fetchone()["vetoes"] or 0
 
-                    cur.execute("""
-                        SELECT COUNT(*) AS vetoes
-                        FROM signals
-                        WHERE status = 'VETOED'
-                    """)
+                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+                    total_pending = cur.fetchone()["pending"] or 0
 
-                    total_vetoes = (
-                        cur.fetchone()["vetoes"]
-                        or 0
-                    )
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
+                    tp1_wins = cur.fetchone()["tp1_wins"] or 0
+
+                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
+                    tp2_wins = cur.fetchone()["tp2_wins"] or 0
+
+                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE outcome LIKE 'LOSS%'")
+                    losses = cur.fetchone()["losses"] or 0
 
                     cur.execute("""
-                        SELECT COUNT(*) AS pending
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                          AND outcome = 'PENDING'
+                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
                     """)
-
-                    total_pending = (
-                        cur.fetchone()["pending"]
-                        or 0
-                    )
-
-                    cur.execute("""
-                        SELECT COUNT(*) AS tp1_wins
-                        FROM signals
-                        WHERE outcome LIKE 'WIN (TP1%'
-                           OR outcome LIKE 'CLOSED%'
-                    """)
-
-                    tp1_wins = (
-                        cur.fetchone()["tp1_wins"]
-                        or 0
-                    )
-
-                    cur.execute("""
-                        SELECT COUNT(*) AS tp2_wins
-                        FROM signals
-                        WHERE outcome LIKE 'WIN (TP2%'
-                    """)
-
-                    tp2_wins = (
-                        cur.fetchone()["tp2_wins"]
-                        or 0
-                    )
-
-                    cur.execute("""
-                        SELECT COUNT(*) AS losses
-                        FROM signals
-                        WHERE outcome LIKE 'LOSS%'
-                    """)
-
-                    losses = (
-                        cur.fetchone()["losses"]
-                        or 0
-                    )
-
-                    cur.execute("""
-                        SELECT
-                            action,
-                            COALESCE(entry_price, price, 0) AS entry_p,
-                            COALESCE(sl_price, sl, 0) AS sl_p,
-                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                            exit_price,
-                            COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                          AND exit_price IS NOT NULL
-                    """)
-
                     closed_trades = cur.fetchall()
-
-                    total_pips = 0.0
-                    win_pips = 0.0
-                    loss_pips = 0.0
-
+                    total_pips = win_pips = loss_pips = 0.0
                     total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
                         trade_pips, _trade_usd = compute_trade_pips({
-                            "action": t["action"],
-                            "entry_price": t["entry_p"],
-                            "sl_price": t["sl_p"],
-                            "tp1_price": t["tp1_p"],
-                            "tp2_price": t["tp2_p"],
-                            "exit_price": t["exit_price"],
-                            "outcome": t["outcome_val"]
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]
                         })
-
                         total_pips += trade_pips
+                        if trade_pips > 0: win_pips += trade_pips
+                        elif trade_pips < 0: loss_pips += abs(trade_pips)
 
-                        if trade_pips > 0:
-                            win_pips += trade_pips
-                        elif trade_pips < 0:
-                            loss_pips += abs(trade_pips)
-
-                    win_rate = (
-                        total_wins_count
-                        / total_executed
-                        * 100
-                        if total_executed > 0
-                        else 0.0
-                    )
-
-                    est_dollar = (
-                        total_pips * 0.10
-                    )
-
-                    avg_win = (
-                        win_pips
-                        / total_wins_count
-                        if total_wins_count > 0
-                        else 0.0
-                    )
-
-                    avg_loss = (
-                        loss_pips
-                        / losses
-                        if losses > 0
-                        else 0.0
-                    )
-
-                    profit_factor = (
-                        win_pips / loss_pips
-                        if loss_pips > 0
-                        else (
-                            win_pips
-                            if win_pips > 0
-                            else 0.0
-                        )
-                    )
+                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                    est_dollar = total_pips * 0.10
+                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
 
                     cur.close()
                     conn.close()
@@ -1760,121 +1413,50 @@ async def telegram_webhook(
                     reply = (
                         f"📊 *PERFORMANCE ANALYTICS DASHBOARD*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
                         f"💰 *NET PIPS & PROFIT:*\n"
-
-                        f"• Net Pips: "
-                        f"*{total_pips:+.1f} pips*\n"
-
-                        f"• Est. Profit (0.01 Lot): "
-                        f"*${est_dollar:+.2f}*\n\n"
-
+                        f"• Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"• Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
                         f"📈 *WIN / LOSS BREAKDOWN:*\n"
-
-                        f"• Total Executed: "
-                        f"*{total_executed}*\n"
-
-                        f"• Total Wins: "
-                        f"*{total_wins_count} "
-                        f"({win_rate:.1f}%)*\n"
-
-                        f"  └─ Hit TP1 (BE Runner): "
-                        f"*{tp1_wins}*\n"
-
-                        f"  └─ Hit TP2 (Full Target): "
-                        f"*{tp2_wins}*\n"
-
-                        f"• Total Losses (SL Hit): "
-                        f"*{losses}*\n"
-
-                        f"• Active Pending: "
-                        f"*{total_pending}*\n\n"
-
+                        f"• Total Executed: *{total_executed}*\n"
+                        f"• Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"• Total Losses (SL Hit): *{losses}*\n"
+                        f"• Active Pending: *{total_pending}*\n\n"
                         f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
-
-                        f"• Total Signals: "
-                        f"*{total_executed + total_vetoes}*\n"
-
-                        f"• AI Vetoed Signals: "
-                        f"*{total_vetoes}*\n\n"
-
+                        f"• Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
                         f"🎯 *RISK & TRADE METRICS:*\n"
-
-                        f"• Avg Win: "
-                        f"*+{avg_win:.1f} pips* | "
-
-                        f"Avg Loss: "
-                        f"*-{avg_loss:.1f} pips*\n"
-
-                        f"• Profit Factor: "
-                        f"*{profit_factor:.2f}*\n"
-
-                        f"• Win Rate: "
-                        f"*{win_rate:.1f}%*"
+                        f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"• Profit Factor: *{profit_factor:.2f}*\n"
+                        f"• Win Rate: *{win_rate:.1f}%*"
                     )
-
-                    await send_telegram_alert(
-                        client,
-                        reply,
-                        target_chat_id=sender_chat_id
-                    )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
                 except Exception as db_err:
-
-                    logging.error(
-                        f"[WEBHOOK ERROR /stats] "
-                        f"{db_err}"
-                    )
-
-                    await send_telegram_alert(
-                        client,
-                        f"⚠️ Error querying stats: "
-                        f"{db_err}",
-                        target_chat_id=sender_chat_id
-                    )
+                    logging.error(f"[WEBHOOK ERROR /stats] {db_err}")
+                    await send_telegram_alert(client, f"⚠️ Error querying stats: {db_err}", target_chat_id=sender_chat_id)
 
             elif raw_text == "/pips":
-
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
-
                     cur.execute("""
-                        SELECT
-                            action,
-                            COALESCE(entry_price, price, 0) AS entry_p,
-                            COALESCE(sl_price, sl, 0) AS sl_p,
-                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                            exit_price,
-                            COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                          AND exit_price IS NOT NULL
+                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
                     """)
-
                     trades = cur.fetchall()
-
-                    total_pips = 0.0
-                    gross_win_pips = 0.0
-                    gross_loss_pips = 0.0
-
-                    winning_trades_count = 0
-                    losing_trades_count = 0
+                    
+                    total_pips = gross_win_pips = gross_loss_pips = 0.0
+                    winning_trades_count = losing_trades_count = 0
 
                     for t in trades:
                         pips, _profit_usd = compute_trade_pips({
-                            "action": t["action"],
-                            "entry_price": t["entry_p"],
-                            "sl_price": t["sl_p"],
-                            "tp1_price": t["tp1_p"],
-                            "tp2_price": t["tp2_p"],
-                            "exit_price": t["exit_price"],
-                            "outcome": t["outcome_val"]
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]
                         })
-
                         total_pips += pips
-
                         if pips > 0:
                             gross_win_pips += pips
                             winning_trades_count += 1
@@ -1882,23 +1464,9 @@ async def telegram_webhook(
                             gross_loss_pips += abs(pips)
                             losing_trades_count += 1
 
-                    avg_win_pips = (
-                        gross_win_pips
-                        / winning_trades_count
-                        if winning_trades_count > 0
-                        else 0.0
-                    )
-
-                    avg_loss_pips = (
-                        gross_loss_pips
-                        / losing_trades_count
-                        if losing_trades_count > 0
-                        else 0.0
-                    )
-
-                    est_profit_usd = (
-                        total_pips * 0.10
-                    )
+                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                    est_profit_usd = total_pips * 0.10
 
                     cur.close()
                     conn.close()
@@ -1906,451 +1474,140 @@ async def telegram_webhook(
                     reply = (
                         f"💵 *DETAILED PIPS & EARNINGS REPORT*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
                         f"📊 *SUMMARY:*\n"
-
-                        f"• Total Net Pips: "
-                        f"*{total_pips:+.1f} pips*\n"
-
-                        f"• Net Profit (0.01 Lot): "
-                        f"*${est_profit_usd:+.2f}*\n\n"
-
+                        f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
                         f"📈 *PIPS BREAKDOWN:*\n"
-
-                        f"• Gross Gain: "
-                        f"*+{gross_win_pips:.1f} pips*\n"
-
-                        f"• Gross Loss: "
-                        f"*-{gross_loss_pips:.1f} pips*\n\n"
-
+                        f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
                         f"🎯 *AVERAGE METRICS:*\n"
-
-                        f"• Avg Win Trade: "
-                        f"*+{avg_win_pips:.1f} pips*\n"
-
-                        f"• Avg Loss Trade: "
-                        f"*-{avg_loss_pips:.1f} pips*\n"
-
-                        f"• Pip Efficiency Ratio: "
-                        f"*{(
-                            gross_win_pips
-                            / (gross_loss_pips + 1e-5)
-                        ):.2f}*\n"
-
+                        f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"• Pip Efficiency Ratio: *{(gross_win_pips / (gross_loss_pips + 1e-5)):.2f}*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
-                        f"💡 *Catatan:* "
-                        f"Dihitung pada $0.10/pip "
-                        f"(0.01 lot XAU/USD)."
+                        f"💡 *Catatan:* Dihitung pada $0.10/pip (0.01 lot XAU/USD)."
                     )
-
-                    await send_telegram_alert(
-                        client,
-                        reply,
-                        target_chat_id=sender_chat_id
-                    )
-
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
                 except Exception as err:
-
-                    logging.error(
-                        f"[WEBHOOK ERROR /pips] "
-                        f"{err}"
-                    )
-
-                    await send_telegram_alert(
-                        client,
-                        f"⚠️ Error calculating pips: "
-                        f"{err}",
-                        target_chat_id=sender_chat_id
-                    )
+                    logging.error(f"[WEBHOOK ERROR /pips] {err}")
+                    await send_telegram_alert(client, f"⚠️ Error calculating pips: {err}", target_chat_id=sender_chat_id)
 
             elif raw_text == "/logs":
-
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
-
                     cur.execute("""
-                        SELECT
-                            id,
-                            action,
-                            COALESCE(entry_price, price, 0) AS entry_p,
-                            COALESCE(sl_price, sl, 0) AS sl_p,
-                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                            exit_price,
-                            COALESCE(outcome, 'PENDING') AS outcome_val,
-                            COALESCE(timestamp, created_at::text, 'N/A') AS log_time
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                        ORDER BY id DESC
-                        LIMIT 10
+                        SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(timestamp, created_at::text, 'N/A') AS log_time
+                        FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 10
                     """)
-
                     logs = cur.fetchall()
-
                     cur.close()
                     conn.close()
 
                     if not logs:
-
-                        reply = (
-                            "📜 *LAST 10 TRADE LOGS:*\n\n"
-                            "_Belum ada transaksi yang "
-                            "tereksekusi di database._"
-                        )
-
+                        reply = "📜 *LAST 10 TRADE LOGS:*\n\n_Belum ada transaksi yang tereksekusi di database._"
                     else:
-
-                        reply = (
-                            "📜 *LAST 10 DETAILED TRADE LOGS:*\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        )
-
+                        reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                         for l in logs:
-
                             trade_id = l["id"]
                             action = l["action"]
-
-                            entry = float(
-                                l["entry_p"]
-                            )
-
-                            exit_p = (
-                                float(
-                                    l["exit_price"]
-                                )
-                                if l.get("exit_price")
-                                is not None
-                                else None
-                            )
-
+                            entry = float(l["entry_p"])
+                            exit_p = float(l["exit_price"]) if l.get("exit_price") is not None else None
                             outcome = l["outcome_val"]
-                            date_str = str(
-                                l["log_time"]
-                            )
+                            date_str = str(l["log_time"])
 
                             if exit_p is not None:
-
                                 pips, profit_usd = compute_trade_pips({
-                                    "action": action,
-                                    "entry_price": entry,
-                                    "sl_price": l["sl_p"],
-                                    "tp1_price": l["tp1_p"],
-                                    "tp2_price": l["tp2_p"],
-                                    "exit_price": exit_p,
-                                    "outcome": outcome
+                                    "action": action, "entry_price": entry, "sl_price": l["sl_p"],
+                                    "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p, "outcome": outcome
                                 })
-
                                 r_multiple = compute_r_multiple(
-                                    action,
-                                    entry,
-                                    exit_p,
-                                    float(l["sl_p"] or 0.0),
-                                    float(l["tp1_p"] or 0.0),
-                                    float(l["tp2_p"] or 0.0),
-                                    outcome
+                                    action, entry, exit_p, float(l["sl_p"] or 0.0), float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
                                 )
-
-                                pip_str = (
-                                    f"*{pips:+.1f} pips* | "
-                                    f"{r_multiple:+.2f}R | "
-                                    f"${profit_usd:+.2f}"
-                                )
-
+                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
                             else:
-                                pip_str = (
-                                    "*ACTIVE / IN PROGRESS*"
-                                )
+                                pip_str = "*ACTIVE / IN PROGRESS*"
 
-                            if (
-                                "WIN" in outcome
-                                or "CLOSED" in outcome
-                            ):
-                                icon = "🟢"
-
-                            elif "LOSS" in outcome:
-                                icon = "🔴"
-
-                            else:
-                                icon = "🟡"
-
+                            icon = "🟢" if ("WIN" in outcome or "CLOSED" in outcome) else "🔴" if "LOSS" in outcome else "🟡"
                             reply += (
-                                f"{icon} "
-                                f"*ID #{trade_id} | "
-                                f"{action} XAU/USD*\n"
-
-                                f"• Entry: "
-                                f"${entry:.2f} → Exit: "
-                                f"*${(
-                                    exit_p
-                                    if exit_p
-                                    else 0.0
-                                ):.2f}*\n"
-
-                                f"• Outcome: "
-                                f"*{outcome}*\n"
-
-                                f"• Result: "
-                                f"{pip_str} | "
-                                f"Time: {date_str}\n"
-
+                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                                f"• Entry: ${entry:.2f} → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                                f"• Outcome: *{outcome}*\n"
+                                f"• Result: {pip_str} | Time: {date_str}\n"
                                 f"──────────────────────────\n"
                             )
-
-                    await send_telegram_alert(
-                        client,
-                        reply,
-                        target_chat_id=sender_chat_id
-                    )
-
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
                 except Exception as log_err:
-
-                    logging.error(
-                        f"[WEBHOOK ERROR /logs] "
-                        f"{log_err}"
-                    )
-
-                    await send_telegram_alert(
-                        client,
-                        f"⚠️ Error querying logs: "
-                        f"{log_err}",
-                        target_chat_id=sender_chat_id
-                    )
+                    logging.error(f"[WEBHOOK ERROR /logs] {log_err}")
+                    await send_telegram_alert(client, f"⚠️ Error querying logs: {log_err}", target_chat_id=sender_chat_id)
 
             elif raw_text == "/analyze":
-
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
-
                     cur.execute("""
-                        SELECT
-                            action,
-                            trigger_type,
-                            COALESCE(entry_price, price, 0) AS entry_p,
-                            COALESCE(sl_price, sl, 0) AS sl_p,
-                            COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                            COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                            exit_price,
-                            COALESCE(outcome, 'PENDING') AS outcome_val,
-                            COALESCE(adx_15m, 0) AS adx_val,
-                            trend_15m,
-                            COALESCE(timestamp, created_at::text, '') AS ts
-                        FROM signals
-                        WHERE status = 'EXECUTED'
-                          AND exit_price IS NOT NULL
+                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(adx_15m, 0) AS adx_val, trend_15m, COALESCE(timestamp, created_at::text, '') AS ts
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
                     """)
-
                     rows = cur.fetchall()
-
                     cur.close()
                     conn.close()
 
                     if not rows:
-
-                        reply = (
-                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
-                            "_Not enough closed trades yet "
-                            "to analyze. Check back after "
-                            "more signals complete._"
-                        )
-
+                        reply = "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n_Not enough closed trades yet to analyze._"
                     else:
-
-                        segments = {
-                            "Strategy": {},
-                            "ADX Regime": {},
-                            "Session": {},
-                            "15m Confluence": {}
-                        }
-
+                        segments = {"Strategy": {}, "ADX Regime": {}, "Session": {}, "15m Confluence": {}}
                         overall_r = []
 
                         for r in rows:
-
-                            entry = float(
-                                r["entry_p"]
-                            )
-
-                            exit_p = float(
-                                r["exit_price"]
-                            )
-
+                            entry = float(r["entry_p"])
+                            exit_p = float(r["exit_price"])
                             sl = float(r["sl_p"] or 0.0)
                             tp1 = float(r["tp1_p"] or 0.0)
                             tp2 = float(r["tp2_p"] or 0.0)
                             outcome = str(r["outcome_val"] or "PENDING")
-
                             action = r["action"]
-
                             adx_val = float(r["adx_val"])
-
                             trigger = r["trigger_type"] or ""
-
                             trend_15m_val = r.get("trend_15m")
                             ts = r["ts"] or ""
 
-                            r_mult = compute_r_multiple(
-                                action,
-                                entry,
-                                exit_p,
-                                sl,
-                                tp1,
-                                tp2,
-                                outcome
-                            )
+                            r_mult = compute_r_multiple(action, entry, exit_p, sl, tp1, tp2, outcome)
+                            overall_r.append(r_mult)
+                            segments["Strategy"].setdefault(bucket_strategy(trigger), []).append(r_mult)
+                            segments["ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["Session"].setdefault(bucket_session(ts), []).append(r_mult)
+                            segments["15m Confluence"].setdefault(bucket_confluence(action, trend_15m_val), []).append(r_mult)
 
-                            overall_r.append(
-                                r_mult
-                            )
-
-                            segments[
-                                "Strategy"
-                            ].setdefault(
-                                bucket_strategy(
-                                    trigger
-                                ),
-                                []
-                            ).append(
-                                r_mult
-                            )
-
-                            segments[
-                                "ADX Regime"
-                            ].setdefault(
-                                bucket_adx(
-                                    adx_val
-                                ),
-                                []
-                            ).append(
-                                r_mult
-                            )
-
-                            segments[
-                                "Session"
-                            ].setdefault(
-                                bucket_session(
-                                    ts
-                                ),
-                                []
-                            ).append(
-                                r_mult
-                            )
-
-                            segments[
-                                "15m Confluence"
-                            ].setdefault(
-                                bucket_confluence(
-                                    action,
-                                    trend_15m_val
-                                ),
-                                []
-                            ).append(
-                                r_mult
-                            )
-
-                        n_total = len(
-                            overall_r
-                        )
-
-                        overall_wr = (
-                            sum(
-                                1
-                                for x in overall_r
-                                if x > 0
-                            )
-                            / n_total
-                            * 100
-                            if n_total
-                            else 0.0
-                        )
-
-                        overall_avg_r = (
-                            sum(overall_r)
-                            / n_total
-                            if n_total
-                            else 0.0
-                        )
+                        n_total = len(overall_r)
+                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
+                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
 
                         reply_parts = [
                             "📐 *STRATEGY FORWARD-TEST ANALYSIS*",
                             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
                             f"Sample: *{n_total} closed trades*",
-                            f"Overall Win Rate: *{overall_wr:.1f}%* | "
-                            f"Avg R: *{overall_avg_r:+.2f}*",
-                            "",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*", ""
                         ]
 
-                        for dim in [
-                            "Strategy",
-                            "ADX Regime",
-                            "Session",
-                            "15m Confluence"
-                        ]:
-
-                            reply_parts.append(
-                                format_performance_segment(
-                                    dim,
-                                    segments[dim]
-                                )
-                            )
-
+                        for dim in ["Strategy", "ADX Regime", "Session", "15m Confluence"]:
+                            reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 
-                        reply_parts.append(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        )
+                        reply_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        reply_parts.append("💡 Segments need n≥8 to be flagged ⚠️/✅.")
+                        reply = "\n".join(reply_parts)
 
-                        reply_parts.append(
-                            "💡 Segments need n≥8 to be flagged "
-                            "⚠️/✅ (smaller samples are shown "
-                            "but noisy). This does not auto-adjust "
-                            "the bot -- use it to decide whether "
-                            "to retune the ADX veto thresholds, "
-                            "fib pullback zone, or session windows "
-                            "in code.\n\n"
-
-                            "📐 Active strategy: EMA9/EMA15 trend pullback; 15M EMA9/EMA15 is used as confluence.\n"
-
-                            f"⏱️ Loss cooldown "
-                            f"({LOSS_COOLDOWN_MINUTES} min, "
-                            f"any direction) is also active -- "
-                            f"added after spotting clustered "
-                            f"same-session losing sequences "
-                            f"in the raw trade list."
-                        )
-
-                        reply = "\n".join(
-                            reply_parts
-                        )
-
-                    await send_telegram_alert(
-                        client,
-                        reply,
-                        target_chat_id=sender_chat_id
-                    )
-
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
                 except Exception as an_err:
-
-                    logging.error(
-                        f"[WEBHOOK ERROR /analyze] "
-                        f"{an_err}"
-                    )
-
-                    await send_telegram_alert(
-                        client,
-                        f"⚠️ Error running analysis: "
-                        f"{an_err}",
-                        target_chat_id=sender_chat_id
-                    )
+                    logging.error(f"[WEBHOOK ERROR /analyze] {an_err}")
+                    await send_telegram_alert(client, f"⚠️ Error running analysis: {an_err}", target_chat_id=sender_chat_id)
 
     except Exception as e:
+        logging.error(f"[WEBHOOK ERROR] {e}")
 
-        logging.error(
-            f"[WEBHOOK ERROR] {e}"
-        )
-
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}

@@ -917,6 +917,7 @@ async def analyze_signal_with_ai(
     trend_15m: str = "NEUTRAL",
     adx_15m_true: float = 0.0
 ):
+    """AI is only a risk-quality gate; it cannot create a trade direction."""
     m5 = df_5m.iloc[-1]
     m15 = df_15m.iloc[-1]
 
@@ -968,7 +969,7 @@ Return strict JSON:
     if GEMINI_API_KEY:
         try:
             res = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.7-flash",  # <-- UPDATED TO GEMINI 3.7
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",

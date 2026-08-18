@@ -1,4 +1,3 @@
-# EMA 9/15 STRATEGY: ALL-DAY SCANNER WITH FULL DB, TELEGRAM & MT5 BRIDGE + HEARTBEAT STATUS
 import os
 import json
 import asyncio

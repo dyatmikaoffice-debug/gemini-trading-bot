@@ -1,4 +1,3 @@
-# EMA STRATEGY CONFIG: ALL DAY TRADING OPEN
 import os
 import json
 import asyncio
@@ -30,7 +29,6 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
 
-# Sanitize Telegram Bot Token
 CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
 TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
 
@@ -55,27 +53,23 @@ CURRENT_SCAN_CYCLE_ID = None
 
 # --- 15M CONFLUENCE CACHE ---
 cached_15m = {"df": None, "fetched_at": None}
-FIFTEEN_M_REFRESH_MINUTES = 15
 
-# --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
-SCAN_INTERVAL_SECONDS = 300  # 5M strategy scan exactly every 5 minutes
-ACTIVE_SESSION_START_HOUR = 0  # WIB - Adjusted to 0 for all-day trading
-ACTIVE_SESSION_END_HOUR = 24   # WIB - Adjusted to 24 for all-day trading
-MID_SESSION_START_HOUR = 14     # WIB
-MID_SESSION_END_HOUR = 18       # WIB
-
+# --- SCAN SCHEDULE & BUDGET ---
+SCAN_INTERVAL_SECONDS = 300  # 5-minute candle boundary
+ACTIVE_SESSION_START_HOUR = 0  # 24/7 all-day trading
+ACTIVE_SESSION_END_HOUR = 24
 TWELVE_DATA_DAILY_LIMIT = 800
 
 # ==========================================================
-# BASIC EMA 9/15 TREND-PULLBACK STRATEGY
+# EMA 9/15 STRATEGY PARAMETERS
 # ==========================================================
 EMA_FAST = 9
 EMA_SLOW = 15
 EMA_TOUCH_TOLERANCE = 0.0
 EMA_REQUIRE_CLOSE_IN_TREND = True
-EMA_15M_REQUIRE_CLOSE_SIDE = False
+EMA_15M_REQUIRE_CLOSE_SIDE = False  # Bypasses API lag timing discrepancies
 
-# --- LOSS-COOLDOWN ---
+# --- RISK FILTERS ---
 LOSS_COOLDOWN_MINUTES = 10
 
 
@@ -88,15 +82,11 @@ class SignalOutput(BaseModel):
     )
 
 
-# --- DATABASE CONNECTION & AUTO-MIGRATION INITIALIZATION ---
+# --- DATABASE CONNECTION & SCHEMA AUTO-MIGRATION ---
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is missing.")
-
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=RealDictCursor
-    )
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
@@ -185,15 +175,10 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-
-        logging.info(
-            "[NEON DATABASE] Full schema verified and missing columns auto-migrated."
-        )
+        logging.info("[NEON DATABASE] Full schema verified and missing columns auto-migrated.")
 
     except Exception as e:
-        logging.error(
-            f"[NEON DB ERROR] Failed to initialize database schema: {e}"
-        )
+        logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
 
 
 def log_bot_event(
@@ -223,9 +208,7 @@ def log_bot_event(
     cursor = None
     try:
         now_utc = datetime.now(timezone.utc)
-        wib_time = (now_utc + timedelta(hours=7)).strftime(
-            "%Y-%m-%d %H:%M:%S WIB"
-        )
+        wib_time = (now_utc + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         pending = pending or {}
 
         def f(value):
@@ -311,10 +294,7 @@ def log_trade_signal(
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        wib_time = (
-            datetime.now(timezone.utc) + timedelta(hours=7)
-        ).strftime("%Y-%m-%d %H:%M:%S WIB")
-
+        wib_time = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         price_val = float(price) if price is not None else 0.0
         sl_val = float(sl) if sl is not None else 0.0
         tp1_val = float(tp1) if tp1 is not None else 0.0
@@ -328,28 +308,9 @@ def log_trade_signal(
 
         cursor.execute("""
             INSERT INTO signals (
-                timestamp,
-                status,
-                action,
-                trigger_type,
-                price,
-                entry_price,
-                sl,
-                sl_price,
-                tp1,
-                tp1_price,
-                tp2,
-                tp2_price,
-                confidence,
-                adx_15m,
-                stoch_rsi_15m,
-                divergence_type,
-                reasoning,
-                outcome,
-                outcome_timestamp,
-                trend_15m,
-                adx_15m_true,
-                created_at
+                timestamp, status, action, trigger_type, price, entry_price, sl, sl_price,
+                tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m,
+                divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true, created_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
@@ -358,27 +319,9 @@ def log_trade_signal(
             )
             RETURNING id;
         """, (
-            str(wib_time),
-            str(status),
-            str(action),
-            str(trigger_type),
-            price_val,
-            price_val,
-            sl_val,
-            sl_val,
-            tp1_val,
-            tp1_val,
-            tp2_val,
-            tp2_val,
-            conf_val,
-            adx_val,
-            stoch_val,
-            str(divergence_type),
-            str(reasoning),
-            "PENDING",
-            "",
-            trend_15m_val,
-            adx_15m_true_val
+            str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val,
+            sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val,
+            str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val
         ))
 
         inserted_row = cursor.fetchone()
@@ -388,11 +331,7 @@ def log_trade_signal(
         cursor.close()
         conn.close()
 
-        logging.info(
-            f"[NEON DB LOGGED] Signal ID #{new_id} | "
-            f"Status: {status} | Action: {action} | Price: ${price_val:.2f}"
-        )
-
+        logging.info(f"[NEON DB LOGGED] Signal ID #{new_id} | Status: {status} | Action: {action} | Price: ${price_val:.2f}")
         return new_id
 
     except Exception as e:
@@ -401,7 +340,7 @@ def log_trade_signal(
 
 
 # --- TWO-STAGE TP TRACKING FUNCTION ---
-def update_open_trades(current_high: float, current_low: float):
+def update_open_trades(current_high: float, current_low: float, current_close: float):
     if not DATABASE_URL:
         return
 
@@ -413,25 +352,19 @@ def update_open_trades(current_high: float, current_low: float):
             SELECT *
             FROM signals
             WHERE status = 'EXECUTED'
-              AND (
-                  outcome = 'PENDING'
-                  OR outcome = 'WIN (TP1 HIT)'
-              )
+              AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')
         """)
 
         open_trades = cursor.fetchall()
-
         if not open_trades:
             cursor.close()
             conn.close()
             return
 
-        wib_now = (
-            datetime.now(timezone.utc) + timedelta(hours=7)
-        ).strftime("%Y-%m-%d %H:%M:%S WIB")
-
+        wib_now = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         c_high = float(current_high)
         c_low = float(current_low)
+        c_close = float(current_close)
 
         for trade in open_trades:
             trade_id = trade["id"]
@@ -451,10 +384,10 @@ def update_open_trades(current_high: float, current_low: float):
                     if tp2 > 0 and c_high >= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
-                    elif c_low <= entry_price:
+                    elif c_close <= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = entry_price
-                elif sl > 0 and c_low <= sl:
+                elif sl > 0 and c_close <= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
                 elif tp2 > 0 and c_high >= tp2:
@@ -469,10 +402,10 @@ def update_open_trades(current_high: float, current_low: float):
                     if tp2 > 0 and c_low <= tp2:
                         new_outcome = "WIN (TP2 HIT)"
                         exit_price = tp2
-                    elif c_high >= entry_price:
+                    elif c_close >= entry_price:
                         new_outcome = "CLOSED (TP1 HIT / SL BE)"
                         exit_price = entry_price
-                elif sl > 0 and c_high >= sl:
+                elif sl > 0 and c_close >= sl:
                     new_outcome = "LOSS (SL HIT)"
                     exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
@@ -485,62 +418,30 @@ def update_open_trades(current_high: float, current_low: float):
             if new_outcome and new_outcome != current_outcome:
                 cursor.execute("""
                     UPDATE signals
-                    SET outcome = %s,
-                        exit_price = %s,
-                        outcome_timestamp = %s
+                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s
                     WHERE id = %s
-                """, (
-                    new_outcome,
-                    float(exit_price),
-                    wib_now,
-                    trade_id
-                ))
+                """, (new_outcome, float(exit_price), wib_now, trade_id))
 
                 conn.commit()
 
                 trade_for_calc = {
-                    "action": action,
-                    "entry_price": entry_price,
-                    "sl_price": sl,
-                    "tp1_price": tp1,
-                    "tp2_price": tp2,
-                    "exit_price": float(exit_price),
-                    "outcome": new_outcome,
+                    "action": action, "entry_price": entry_price, "sl_price": sl,
+                    "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome
                 }
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
-                result_r = compute_r_multiple(
-                    action, entry_price, float(exit_price), sl,
-                    tp1, tp2, new_outcome
-                )
+                result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
 
                 log_bot_event(
-                    "TRADE_OUTCOME",
-                    stage="TRADE_MANAGEMENT",
-                    action=action,
-                    price=float(exit_price),
-                    decision=new_outcome,
+                    "TRADE_OUTCOME", stage="TRADE_MANAGEMENT", action=action, price=float(exit_price), decision=new_outcome,
                     reason="Two-stage TP/SL outcome detected",
                     details={
-                        "signal_id": trade_id,
-                        "entry": entry_price,
-                        "sl": sl,
-                        "tp1": tp1,
-                        "tp2": tp2,
-                        "exit": float(exit_price),
-                        "outcome": new_outcome,
-                        "pips": result_pips,
-                        "profit_usd": result_usd,
-                        "r_multiple": result_r,
-                        "legacy_fallback_used": not bool(sl > 0 and tp1 > 0)
+                        "signal_id": trade_id, "entry": entry_price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                        "exit": float(exit_price), "outcome": new_outcome, "pips": result_pips,
+                        "profit_usd": result_usd, "r_multiple": result_r, "legacy_fallback_used": not bool(sl > 0 and tp1 > 0)
                     }
                 )
 
-                logging.info(
-                    f"[TRADE UPDATE] Signal ID {trade_id} "
-                    f"-> {new_outcome} at ${exit_price:.2f} | "
-                    f"Result: {result_pips:+.1f} pips | "
-                    f"{result_r:+.2f}R | ${result_usd:+.2f}"
-                )
+                logging.info(f"[TRADE UPDATE] Signal ID {trade_id} -> {new_outcome} at ${exit_price:.2f} | Result: {result_pips:+.1f} pips | {result_r:+.2f}R | ${result_usd:+.2f}")
 
         cursor.close()
         conn.close()
@@ -550,19 +451,8 @@ def update_open_trades(current_high: float, current_low: float):
 
 
 # --- MARKET DATA FETCHING ---
-async def fetch_timeframe_data(
-    client: httpx.AsyncClient,
-    timeframe: str,
-    outputsize: int = 100
-):
-    url = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={SYMBOL}"
-        f"&interval={timeframe}"
-        f"&outputsize={outputsize}"
-        f"&apikey={TWELVE_DATA_API_KEY}"
-    )
-
+async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100):
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={timeframe}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = await client.get(url)
         if res.status_code != 200 or not res.text:
@@ -573,7 +463,6 @@ async def fetch_timeframe_data(
         return None
 
     if "values" not in data:
-        logging.warning(f"[DATA FETCH] {timeframe}: {data}")
         return None
 
     df = pd.DataFrame(data["values"])
@@ -593,19 +482,13 @@ async def fetch_timeframe_data(
 # --- EMA / ATR CALCULATIONS ---
 def calculate_ema_metrics(df: pd.DataFrame):
     df = df.tail(150).copy()
-
     df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema15"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-
     df["tr"] = np.maximum(
         df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift(1)),
-            abs(df["low"] - df["close"].shift(1))
-        )
+        np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
     )
     df["atr"] = df["tr"].rolling(window=14).mean()
-
     return df
 
 
@@ -616,7 +499,6 @@ def calculate_metrics_5m(df: pd.DataFrame):
 def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SLOW):
     if df is None or len(df) < slow + 1:
         return "NEUTRAL", 0.0
-
     if "ema9" not in df.columns or "ema15" not in df.columns:
         df = calculate_ema_metrics(df)
 
@@ -633,7 +515,7 @@ def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SL
     return "NEUTRAL", separation_pct
 
 
-# --- ACTIVE STRATEGY: EMA 9/15 TREND PULLBACK + CROSSOVER ---
+# --- STRATEGY ENGINE: CROSSOVERS + PULLBACKS ---
 def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     if df_5m is None or df_15m is None or len(df_5m) < 20 or len(df_15m) < 20:
         return "HOLD", "EMA setup rejected: insufficient 5M/15M data", 0.0, 0.0
@@ -668,111 +550,67 @@ def detect_ema_touch_signal(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     prev_touched_ema15 = (p_low <= p_ema15 <= p_high)
     prev_touched_ema9 = (p_low <= p_ema9 <= p_high)
 
+    # 1. CROSSOVER TRIGGER (Independent of 15M Trend Lag)
+    if bullish_cross and close5 > ema9_5:
+        return "BUY", "5M EMA Crossover - Bullish Momentum", ema9_5, ema15_5
+
+    if bearish_cross and close5 < ema9_5:
+        return "SELL", "5M EMA Crossover - Bearish Momentum", ema9_5, ema15_5
+
+    # 2. TOUCH / PULLBACK TRIGGER (Requires 15M Confluence)
     if trend_5m == "BULLISH" and trend_15m == "BULLISH":
         close_side_ok = close5 > ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
         m15_side_ok = (float(m15["close"]) > ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
 
-        if not m15_side_ok:
-            return "HOLD", "15M Confluence failed", ema9_5, ema15_5
+        if m15_side_ok and close_side_ok:
+            if touched_ema15:
+                trigger = "5M EMA15 Touch - Bullish Trend"
+                if prev_touched_ema15: trigger += " (Continuation Touch)"
+                return "BUY", trigger, ema9_5, ema15_5
 
-        if bullish_cross and close5 > ema9_5:
-            return "BUY", "5M EMA Crossover - Bullish Momentum", ema9_5, ema15_5
-
-        if close_side_ok and touched_ema15:
-            trigger = "5M EMA15 Touch - Bullish Trend"
-            if prev_touched_ema15: trigger += " (Continuation Touch)"
-            return "BUY", trigger, ema9_5, ema15_5
-
-        if close_side_ok and touched_ema9:
-            trigger = "5M EMA9 Touch - Bullish Trend"
-            if prev_touched_ema9: trigger += " (Continuation Touch)"
-            return "BUY", trigger, ema9_5, ema15_5
+            if touched_ema9:
+                trigger = "5M EMA9 Touch - Bullish Trend"
+                if prev_touched_ema9: trigger += " (Continuation Touch)"
+                return "BUY", trigger, ema9_5, ema15_5
 
     if trend_5m == "BEARISH" and trend_15m == "BEARISH":
         close_side_ok = close5 < ema15_5 if EMA_REQUIRE_CLOSE_IN_TREND else True
         m15_side_ok = (float(m15["close"]) < ema15_15) if EMA_15M_REQUIRE_CLOSE_SIDE else True
 
-        if not m15_side_ok:
-            return "HOLD", "15M Confluence failed", ema9_5, ema15_5
+        if m15_side_ok and close_side_ok:
+            if touched_ema15:
+                trigger = "5M EMA15 Touch - Bearish Trend"
+                if prev_touched_ema15: trigger += " (Continuation Touch)"
+                return "SELL", trigger, ema9_5, ema15_5
 
-        if bearish_cross and close5 < ema9_5:
-            return "SELL", "5M EMA Crossover - Bearish Momentum", ema9_5, ema15_5
+            if touched_ema9:
+                trigger = "5M EMA9 Touch - Bearish Trend"
+                if prev_touched_ema9: trigger += " (Continuation Touch)"
+                return "SELL", trigger, ema9_5, ema15_5
 
-        if close_side_ok and touched_ema15:
-            trigger = "5M EMA15 Touch - Bearish Trend"
-            if prev_touched_ema15: trigger += " (Continuation Touch)"
-            return "SELL", trigger, ema9_5, ema15_5
-
-        if close_side_ok and touched_ema9:
-            trigger = "5M EMA9 Touch - Bearish Trend"
-            if prev_touched_ema9: trigger += " (Continuation Touch)"
-            return "SELL", trigger, ema9_5, ema15_5
-
-    reason = (
-        f"5M {trend_5m}, 15M {trend_15m}; "
-        f"EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch or cross"
-    )
+    reason = f"5M {trend_5m}, 15M {trend_15m}; EMA9/15=${ema9_5:.2f}/${ema15_5:.2f}; no aligned EMA touch or cross"
     return "HOLD", reason, ema9_5, ema15_5
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
-    """
-    Calculate the trade result using the bot's two-stage TP model.
-    """
     action = str(trade.get("action") or "BUY").upper()
-
-    entry = float(
-        trade.get("entry_price")
-        or trade.get("entry_p")
-        or trade.get("price")
-        or 0.0
-    )
-
-    sl = float(
-        trade.get("sl_price")
-        or trade.get("sl")
-        or 0.0
-    )
-
-    tp1 = float(
-        trade.get("tp1_price")
-        or trade.get("tp1")
-        or 0.0
-    )
-
-    tp2 = float(
-        trade.get("tp2_price")
-        or trade.get("tp2")
-        or 0.0
-    )
-
-    exit_p = float(
-        trade.get("exit_price")
-        or entry
-    )
-
-    outcome = str(
-        trade.get("outcome")
-        or trade.get("outcome_val")
-        or "PENDING"
-    )
+    entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
+    sl = float(trade.get("sl_price") or trade.get("sl") or 0.0)
+    tp1 = float(trade.get("tp1_price") or trade.get("tp1") or 0.0)
+    tp2 = float(trade.get("tp2_price") or trade.get("tp2") or 0.0)
+    exit_p = float(trade.get("exit_price") or entry)
+    outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
 
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
-    if sl_dist == 0:
-        sl_dist = 2.5
-
+    if sl_dist == 0: sl_dist = 2.5
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
 
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        total_pips = tp1_dist * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif outcome == "WIN (TP1 HIT)":
-        total_pips = tp1_dist * 10.0
-    elif "LOSS" in outcome:
-        total_pips = -(sl_dist * 10.0 * 2.0)
+    if outcome == "CLOSED (TP1 HIT / SL BE)": total_pips = tp1_dist * 10.0
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: total_pips = (tp1_dist + tp2_dist) * 10.0
+    elif outcome == "WIN (TP1 HIT)": total_pips = tp1_dist * 10.0
+    elif "LOSS" in outcome: total_pips = -(sl_dist * 10.0 * 2.0)
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
         total_pips = diff * 10.0 * 2.0
@@ -781,44 +619,26 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     return total_pips, profit_usd
 
 
-def compute_r_multiple(
-    action: str,
-    entry: float,
-    exit_price: float,
-    sl: float,
-    tp1: float = 0.0,
-    tp2: float = 0.0,
-    outcome: str = "PENDING"
-) -> float:
-    """Calculate R using the same two-stage TP accounting as pips."""
+def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
     risk_dist = abs(entry - sl)
-
     if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
-        if risk_dist == 0:
-            risk_dist = 2.5
+        if risk_dist == 0: risk_dist = 2.5
 
     if outcome == "CLOSED (TP1 HIT / SL BE)":
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         return tp1_dist / risk_dist
-
     if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         tp2_dist = abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0
         return (tp1_dist + tp2_dist) / risk_dist
-
     if outcome == "WIN (TP1 HIT)":
         tp1_dist = abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5
         return tp1_dist / risk_dist
-
     if "LOSS" in outcome:
         return -2.0
 
-    single_r = (
-        (exit_price - entry) / risk_dist
-        if action == "BUY"
-        else (entry - exit_price) / risk_dist
-    )
+    single_r = ((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)
     return single_r * 2.0
 
 
@@ -832,12 +652,9 @@ def bucket_adx(adx: float) -> str:
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
-    if "EMA15" in t:
-        return "EMA15 Trend Pullback"
-    if "EMA9" in t:
-        return "EMA9 Trend Pullback"
-    if "Crossover" in t:
-        return "EMA Crossover Momentum"
+    if "EMA15" in t: return "EMA15 Trend Pullback"
+    if "EMA9" in t: return "EMA9 Trend Pullback"
+    if "Crossover" in t: return "EMA Crossover Momentum"
     return "EMA 9/15 Trend Pullback"
 
 
@@ -846,7 +663,6 @@ def bucket_session(timestamp_str: str) -> str:
         hour = int(str(timestamp_str).split(" ")[1].split(":")[0])
     except Exception:
         return "Unknown"
-
     if 9 <= hour < 14: return "Early (09-14 WIB)"
     if 14 <= hour < 18: return "Mid (14-18 WIB)"
     if 18 <= hour < 22: return "Late (18-22 WIB)"
@@ -856,8 +672,7 @@ def bucket_session(timestamp_str: str) -> str:
 def bucket_confluence(action: str, trend_15m: str) -> str:
     t = (trend_15m or "").upper()
     if not t or t == "NEUTRAL": return "15m Neutral"
-    if ((action == "BUY" and t == "BULLISH") or (action == "SELL" and t == "BEARISH")):
-        return "15m Aligned"
+    if ((action == "BUY" and t == "BULLISH") or (action == "SELL" and t == "BEARISH")): return "15m Aligned"
     return "15m Disagreed"
 
 
@@ -877,11 +692,7 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
 
 
 # --- TELEGRAM NOTIFICATIONS ---
-async def send_telegram_alert(
-    client: httpx.AsyncClient,
-    text: str,
-    target_chat_id: str = None
-):
+async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
     chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         logging.error("[TELEGRAM ERROR] Missing token or chat_id")
@@ -907,17 +718,9 @@ async def send_telegram_alert(
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
-    proposed_action: str,
-    trigger_type: str,
-    current_price: float,
-    df_5m: pd.DataFrame,
-    df_15m: pd.DataFrame,
-    ema9_5m: float,
-    ema15_5m: float,
-    trend_15m: str = "NEUTRAL",
-    adx_15m_true: float = 0.0
+    proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame,
+    df_15m: pd.DataFrame, ema9_5m: float, ema15_5m: float, trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0
 ):
-    """AI is only a risk-quality gate; it cannot create a trade direction."""
     m5 = df_5m.iloc[-1]
     m15 = df_15m.iloc[-1]
 
@@ -947,9 +750,7 @@ Your job is ONLY to approve or veto it; never reverse the direction.
 Trigger: {trigger_type}
 Entry: ${current_price:.2f}
 
-Approve only if 5M and 15M direction agree, the candle clearly reacted around EMA9/EMA15,
-and there is no obvious immediate contradiction. Do not invent additional indicators or setups.
-
+Approve only if the technical reaction aligns cleanly with the trigger and there is no obvious immediate structural contradiction.
 Return strict JSON:
 {{"action":"{proposed_action}" or "HOLD", "confidence":0.0-1.0, "reasoning":"2 concise sentences"}}
 """
@@ -969,7 +770,7 @@ Return strict JSON:
     if GEMINI_API_KEY:
         try:
             res = genai_client.models.generate_content(
-                model="gemini-3.7-flash",  # <-- UPDATED TO GEMINI 3.7
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -981,11 +782,7 @@ Return strict JSON:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(
-        action=proposed_action,
-        confidence=0.70,
-        reasoning="Fallback approval: 5M EMA9/EMA15 trend and 15M EMA confluence are aligned."
-    )
+    return SignalOutput(action=proposed_action, confidence=0.70, reasoning="Fallback approval: EMA9/EMA15 strategy conditions satisfied.")
 
 
 # --- BACKGROUND SCANNING LOOP ---
@@ -1006,12 +803,13 @@ async def background_scanning_loop():
 
                 active_session = ACTIVE_SESSION_START_HOUR <= now_wib.hour < ACTIVE_SESSION_END_HOUR
                 if not active_session:
-                    log_scan_event("OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED", reason="Outside active trading session", details={"wib_time": now_wib.strftime('%H:%M')})
+                    log_scan_event("OUTSIDE_SESSION", stage="SESSION", decision="SKIPPED", reason="Outside active session", details={"wib_time": now_wib.strftime('%H:%M')})
                     await asyncio.sleep(60)
                     continue
 
-                if now_wib.minute % 5 != 0 or now_wib.second > 8:
-                    await asyncio.sleep(2)
+                # Widened window to prevent MT5 ping delays from skipping scans
+                if now_wib.minute % 5 != 0 or now_wib.second > 45:
+                    await asyncio.sleep(1)
                     continue
 
                 CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -1020,7 +818,7 @@ async def background_scanning_loop():
                 df_5m_raw = await fetch_timeframe_data(client, "5min", outputsize=100)
                 if df_5m_raw is None or len(df_5m_raw) < 20:
                     log_scan_event("DATA_FETCH_FAILED", stage="DATA", decision="RETRY", reason="Failed to fetch sufficient 5M candles")
-                    await asyncio.sleep(20)
+                    await asyncio.sleep(15)
                     continue
 
                 df_5m = calculate_ema_metrics(df_5m_raw)
@@ -1032,33 +830,21 @@ async def background_scanning_loop():
                     continue
                 
                 candle_time_5m = df_5m["datetime"].iloc[-1]
-
                 if last_5m_candle_time is not None and candle_time_5m == last_5m_candle_time:
                     await asyncio.sleep(2)
                     continue
                 last_5m_candle_time = candle_time_5m
 
-                refresh_15m = (
-                    cached_15m["df"] is None
-                    or now_wib.minute % 15 == 0
-                    or cached_15m["fetched_at"] is None
-                    or (datetime.now(timezone.utc) - cached_15m["fetched_at"]) >= timedelta(minutes=15)
-                )
-
-                if refresh_15m:
-                    df_15m_raw = await fetch_timeframe_data(client, "15min", outputsize=100)
-                    if df_15m_raw is not None and len(df_15m_raw) >= 20:
-                        df_15m_new = calculate_ema_metrics(df_15m_raw)
-                        if len(df_15m_new) >= 2:
-                            df_15m_new = df_15m_new.iloc[:-1].copy()
-                        if len(df_15m_new) < 20:
-                            logging.warning("[15M REFRESH] No completed 15M candle available; retaining previous cache.")
-                        else:
-                            cached_15m["df"] = df_15m_new
-                            cached_15m["fetched_at"] = datetime.now(timezone.utc)
-                            logging.info(f"[15M REFRESH] New completed 15M EMA9/EMA15 snapshot cached at {now_wib.strftime('%H:%M:%S')} WIB")
-                    else:
-                        logging.warning("[15M REFRESH] Fetch failed; retaining previous 15M cache.")
+                # Refresh 15M data alongside 5M data
+                df_15m_raw = await fetch_timeframe_data(client, "15min", outputsize=100)
+                if df_15m_raw is not None and len(df_15m_raw) >= 20:
+                    df_15m_new = calculate_ema_metrics(df_15m_raw)
+                    if len(df_15m_new) >= 2:
+                        df_15m_new = df_15m_new.iloc[:-1].copy()
+                    if len(df_15m_new) >= 20:
+                        cached_15m["df"] = df_15m_new
+                        cached_15m["fetched_at"] = datetime.now(timezone.utc)
+                        logging.info(f"[15M REFRESH] New completed 15M EMA snapshot cached at {now_wib.strftime('%H:%M:%S')} WIB")
 
                 df_15m = cached_15m["df"]
                 if df_15m is None or len(df_15m) < 20:
@@ -1069,38 +855,33 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(df_15m)
                 adx_15m_true = 0.0
 
-                update_open_trades(float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
+                update_open_trades(
+                    float(df_5m["high"].iloc[-1]), 
+                    float(df_5m["low"].iloc[-1]), 
+                    float(df_5m["close"].iloc[-1])
+                )
 
                 curr_price = float(df_5m["close"].iloc[-1])
                 proposed_action, trigger_type, ema9_5m, ema15_5m = detect_ema_touch_signal(df_5m, df_15m)
 
                 log_scan_event(
-                    "EMA_EVALUATION", stage="EMA_STRATEGY", action=proposed_action,
-                    trigger_type=trigger_type, price=curr_price,
-                    adx_15m=adx_15m_true, trend_15m=trend_15m,
-                    decision="ENTRY_CANDIDATE" if proposed_action != "HOLD" else "HOLD",
+                    "EMA_EVALUATION", stage="EMA_STRATEGY", action=proposed_action, trigger_type=trigger_type, price=curr_price,
+                    adx_15m=adx_15m_true, trend_15m=trend_15m, decision="ENTRY_CANDIDATE" if proposed_action != "HOLD" else "HOLD",
                     reason=trigger_type,
                     details={
-                        "5m_candle_time": str(candle_time_5m),
-                        "ema9_5m": ema9_5m,
-                        "ema15_5m": ema15_5m,
-                        "ema9_15m": float(df_15m["ema9"].iloc[-1]),
-                        "ema15_15m": float(df_15m["ema15"].iloc[-1]),
-                        "trend_15m": trend_15m,
-                        "15m_cached": True,
+                        "5m_candle_time": str(candle_time_5m), "ema9_5m": ema9_5m, "ema15_5m": ema15_5m,
+                        "ema9_15m": float(df_15m["ema9"].iloc[-1]), "ema15_15m": float(df_15m["ema15"].iloc[-1]),
+                        "trend_15m": trend_15m, "15m_cached": True,
                     }
                 )
 
                 if proposed_action == "HOLD":
-                    logging.info(
-                        f"[EMA SCAN] {now_wib.strftime('%H:%M')} WIB | "
-                        f"Price ${curr_price:.2f} | 5M EMA9 ${ema9_5m:.2f} / EMA15 ${ema15_5m:.2f} | "
-                        f"15M {trend_15m} | HOLD ({trigger_type})"
-                    )
+                    logging.info(f"[EMA SCAN] {now_wib.strftime('%H:%M')} WIB | Price ${curr_price:.2f} | 5M EMA9 ${ema9_5m:.2f} / EMA15 ${ema15_5m:.2f} | 15M {trend_15m} | HOLD ({trigger_type})")
                     log_scan_event("SCAN_END", stage="SCAN", action="HOLD", trigger_type=trigger_type, price=curr_price, adx_15m=adx_15m_true, trend_15m=trend_15m, decision="COMPLETE", reason="No aligned EMA touch or crossover")
                     await asyncio.sleep(2)
                     continue
 
+                # Loss Cooldown Check
                 try:
                     conn = get_db_connection()
                     cursor = conn.cursor()
@@ -1119,11 +900,13 @@ async def background_scanning_loop():
                         minutes_since_loss = (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0
                         if 0 <= minutes_since_loss < LOSS_COOLDOWN_MINUTES:
                             log_scan_event("LOSS_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"{minutes_since_loss:.1f} minutes since last SL hit")
+                            logging.info(f"[RISK FILTER] Valid {proposed_action} blocked by LOSS COOLDOWN. {minutes_since_loss:.1f} mins since last SL hit.")
                             await asyncio.sleep(2)
                             continue
                 except Exception as e:
                     logging.error(f"[LOSS COOLDOWN ERROR] {e}")
 
+                # Distance Cooldown Check
                 try:
                     conn = get_db_connection(); cursor = conn.cursor()
                     cursor.execute("""
@@ -1133,11 +916,13 @@ async def background_scanning_loop():
                     """, (str(proposed_action),))
                     last_trade = cursor.fetchone()
                     cursor.close(); conn.close()
+                    
                     if last_trade:
                         last_entry_price = float(last_trade["entry_p"] or 0.0)
                         required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
                         if last_entry_price > 0 and abs(curr_price - last_entry_price) < required_distance:
                             log_scan_event("DISTANCE_COOLDOWN", stage="RISK_FILTER", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="BLOCKED", reason=f"Price within ${required_distance:.2f} of previous {proposed_action} trade")
+                            logging.info(f"[RISK FILTER] Valid {proposed_action} blocked by DISTANCE COOLDOWN. Price ${curr_price:.2f} is within ${required_distance:.2f} of previous entry.")
                             await asyncio.sleep(2)
                             continue
                 except Exception as e:
@@ -1215,7 +1000,6 @@ async def background_scanning_loop():
                     log_scan_event("AI_VETO", stage="AI", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="VETOED", reason=ai_decision.reasoning)
 
                 log_scan_event("SCAN_END", stage="SCAN", action=proposed_action, trigger_type=trigger_type, price=curr_price, trend_15m=trend_15m, decision="COMPLETE", reason="EMA strategy cycle completed")
-
                 await asyncio.sleep(2)
 
             except Exception as e:
@@ -1227,14 +1011,11 @@ async def background_scanning_loop():
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     init_db()
-
     if TELEGRAM_BOT_TOKEN and APP_URL:
         try:
             webhook_endpoint = f"{APP_URL.rstrip('/')}/telegram-webhook"
             set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
-
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 res = await client.get(set_url)
                 logging.info(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
@@ -1247,6 +1028,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 def home():
@@ -1262,7 +1044,6 @@ async def get_latest_signal():
 
     if not SYSTEM_TRADING_ENABLED:
         return {"signal": None, "trading_enabled": False, "status": "PAUSED"}
-
     if not DATABASE_URL:
         return {"signal": None, "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
 
@@ -1271,18 +1052,9 @@ async def get_latest_signal():
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT
-                id,
-                action,
-                COALESCE(entry_price, price, 0) AS entry_p,
-                COALESCE(sl_price, sl, 0) AS sl_p,
-                COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                COALESCE(timestamp, created_at::text, '') AS log_time
-            FROM signals
-            WHERE status = 'EXECUTED'
-            ORDER BY id DESC
-            LIMIT 1;
+            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
+            FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1;
         """)
 
         row = cur.fetchone()
@@ -1291,16 +1063,10 @@ async def get_latest_signal():
 
         if row:
             return {
-                "id": int(row["id"]),
-                "action": str(row["action"]).upper(),
-                "entry": float(row["entry_p"]),
-                "sl": float(row["sl_p"]),
-                "tp1": float(row["tp1_p"]),
-                "tp2": float(row["tp2_p"]),
-                "timestamp": str(row["log_time"]),
-                "trading_enabled": True
+                "id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]),
+                "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]),
+                "timestamp": str(row["log_time"]), "trading_enabled": True
             }
-
         return {"signal": None, "trading_enabled": True}
     except Exception as e:
         logging.error(f"[MT5 BRIDGE ERROR /get-latest-signal] {e}")
@@ -1311,7 +1077,6 @@ async def get_latest_signal():
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     global SYSTEM_TRADING_ENABLED
-
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -1341,23 +1106,12 @@ async def telegram_webhook(request: Request):
 
             elif raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
-                reply = (
-                    "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "• Market scanner loop has been **PAUSED**.\n"
-                    "• MT5 Signal Copier will **IGNORE** all new signals.\n\n"
-                    "👉 Send `/resume` to reactivate trading."
-                )
+                reply = "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Market scanner loop has been **PAUSED**.\n• MT5 Signal Copier will **IGNORE** all new signals.\n\n👉 Send `/resume` to reactivate trading."
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/resume":
                 SYSTEM_TRADING_ENABLED = True
-                reply = (
-                    "🟢 *AUTO-TRADING SYSTEM RESUMED*\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "• Scanner loop is now **ACTIVE**.\n"
-                    "• MT5 bridge is listening for live setups."
-                )
+                reply = "🟢 *AUTO-TRADING SYSTEM RESUMED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Scanner loop is now **ACTIVE**.\n• MT5 bridge is listening for live setups."
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/stats":

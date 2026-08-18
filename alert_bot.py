@@ -1,4 +1,4 @@
-# V7 MOMENTUM & SWEEP: 5M SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
+# V7 MOMENTUM & SWEEP: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
 import os
 import json
 import asyncio
@@ -72,10 +72,10 @@ cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
-ACTIVE_SESSION_START_HOUR = 10  # WIB
-ACTIVE_SESSION_END_HOUR = 22    # WIB
-MID_SESSION_START_HOUR = 14     # WIB
-MID_SESSION_END_HOUR = 18       # WIB
+ACTIVE_SESSION_START_HOUR = 0   # Changed to 0 for 24/7 trading
+ACTIVE_SESSION_END_HOUR = 24    # Changed to 24 for 24/7 trading
+MID_SESSION_START_HOUR = 14     # WIB (Statistical Veto Window)
+MID_SESSION_END_HOUR = 18       # WIB (Statistical Veto Window)
 TWELVE_DATA_DAILY_LIMIT = 800
 LEVEL_LOOKBACK_CANDLES = 4
 
@@ -870,6 +870,17 @@ async def background_scanning_loop():
                 current_hour_wib = now_wib.hour
 
                 if not SYSTEM_TRADING_ENABLED:
+                    # Print sleep status periodically so console isn't blank
+                    if now_wib.minute % 5 == 0 and now_wib.second < 5:
+                        logging.info("[SLEEP STATUS] Bot is PAUSED via kill switch. Waiting...")
+                    await asyncio.sleep(60)
+                    continue
+
+                active_session = ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
+                if not active_session:
+                    # This won't trigger anymore since it's 24/7, but left as a safety check
+                    if now_wib.minute % 5 == 0 and now_wib.second < 5:
+                        logging.info(f"[SLEEP STATUS] Out of session ({ACTIVE_SESSION_START_HOUR}:00 - {ACTIVE_SESSION_END_HOUR}:00 WIB). Waiting...")
                     await asyncio.sleep(60)
                     continue
 
@@ -879,11 +890,6 @@ async def background_scanning_loop():
                 # Forces the scanner to wait for the exact 5-minute candle marks (00, 05, 10...)
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
                     await asyncio.sleep(1)
-                    continue
-
-                active_session = ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
-                if not active_session:
-                    await asyncio.sleep(60)
                     continue
 
                 # Fetch 5M data first to check the timestamp
@@ -907,7 +913,6 @@ async def background_scanning_loop():
 
                 CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Scanner cycle started")
-                logging.info(f"[ACTIVE SCAN] WIB Time: {now_wib.strftime('%H:%M')} | Scanning Sweep/BOS + Breakout...")
 
                 # Fetch 1M data (Snapshot at the 5-minute boundary)
                 df_1m = await fetch_timeframe_data(client, "1min")
@@ -1042,9 +1047,9 @@ async def background_scanning_loop():
                                 proposed_action = "HOLD"
                     except Exception as e: logging.error(e)
 
-                # --- AI EVALUATION ---
+                # --- AI EVALUATION & FINAL LOGGING ---
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | Status: HOLD{status_note}")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | Status: HOLD{status_note} | Cycle End")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m, recent_high, recent_low, trend_15m, adx_15m_true, plus_di_5m, minus_di_5m)

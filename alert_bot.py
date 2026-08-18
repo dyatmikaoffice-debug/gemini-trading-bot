@@ -1,3 +1,4 @@
+# EMA 9/15 STRATEGY: ALL-DAY SCANNER WITH FULL DB, TELEGRAM & MT5 BRIDGE + HEARTBEAT STATUS
 import os
 import json
 import asyncio
@@ -17,8 +18,15 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# --- LOGGING CONFIGURATION ---
+# --- LOGGING CONFIGURATION & UVICORN FILTER ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Suppress noisy polling requests from flooding the console
+        return "/get-latest-signal" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 # --- ENVIRONMENT VARIABLES & SANITIZATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -47,9 +55,10 @@ groq_client = OpenAI(
 
 SYMBOL = "XAU/USD"
 
-# --- GLOBAL EMERGENCY KILL SWITCH STATE ---
+# --- GLOBAL SYSTEM STATE & HEARTBEAT ---
 SYSTEM_TRADING_ENABLED = True
 CURRENT_SCAN_CYCLE_ID = None
+LAST_MT5_PING_TIME = None  # Tracks live MT5 connection timestamp
 
 # --- 15M CONFLUENCE CACHE ---
 cached_15m = {"df": None, "fetched_at": None}
@@ -807,7 +816,7 @@ async def background_scanning_loop():
                     await asyncio.sleep(60)
                     continue
 
-                # Widened window to prevent MT5 ping delays from skipping scans
+                # Widened window to prevent MT5 polling delays from skipping scans
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
                     await asyncio.sleep(1)
                     continue
@@ -1040,7 +1049,10 @@ def home():
 # =====================================================================
 @app.get("/get-latest-signal")
 async def get_latest_signal():
-    global SYSTEM_TRADING_ENABLED
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
+
+    # Heartbeat: Record the exact time MT5 polled the server
+    LAST_MT5_PING_TIME = datetime.now(timezone.utc) + timedelta(hours=7)
 
     if not SYSTEM_TRADING_ENABLED:
         return {"signal": None, "trading_enabled": False, "status": "PAUSED"}
@@ -1076,7 +1088,7 @@ async def get_latest_signal():
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    global SYSTEM_TRADING_ENABLED
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -1092,6 +1104,7 @@ async def telegram_webhook(request: Request):
             if raw_text in ["/help", "/start"]:
                 reply = (
                     "🤖 *TRADING BOT COMMANDS:*\n\n"
+                    "• `/status` - 📡 Real-Time MT5 & Server Heartbeat Status\n"
                     "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
                     "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
                     "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
@@ -1102,6 +1115,36 @@ async def telegram_webhook(request: Request):
                     "📐 Active strategy: 5M EMA9/EMA15 trend pullback and crossover.\n"
                     f"⏱️ Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit."
                 )
+                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+
+            elif raw_text == "/status":
+                if LAST_MT5_PING_TIME:
+                    now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
+                    seconds_ago = (now_wib.replace(tzinfo=None) - LAST_MT5_PING_TIME.replace(tzinfo=None)).total_seconds()
+                    
+                    if seconds_ago < 60:
+                        status_icon = "🟢"
+                        conn_msg = f"Connected and Active\n• Last ping: *{seconds_ago:.0f}s ago*"
+                    elif seconds_ago < 180:
+                        status_icon = "🟡"
+                        conn_msg = f"Slight Lag\n• Last ping: *{seconds_ago:.0f}s ago*"
+                    else:
+                        status_icon = "🔴"
+                        conn_msg = f"DISCONNECTED\n• Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
+
+                    reply = (
+                        f"{status_icon} *SYSTEM & BRIDGE STATUS*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
+                        f"• MT5 Bridge: *{conn_msg}*\n"
+                        f"• Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`"
+                    )
+                else:
+                    reply = (
+                        "🔴 *MT5 DISCONNECTED*\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "The server is running, but MT5 has not sent any pings since the last reboot."
+                    )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/pause":

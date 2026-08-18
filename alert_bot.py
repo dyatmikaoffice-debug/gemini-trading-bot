@@ -1,4 +1,3 @@
-# V7 MOMENTUM & SWEEP: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
 import os
 import json
 import asyncio

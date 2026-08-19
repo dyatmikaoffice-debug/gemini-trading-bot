@@ -1,10 +1,11 @@
-# V8.1 EMA 9+15 TREND FOLLOWER: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
+# V9 AGGRESSIVE EMA 5+9 IMPULSE CATCHER: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
 # 
-# CHANGES FROM V8.0:
-# 1. FIXED NameError on STAT_VETO_MID_SESSION_START_HOUR in /analyze, /help, and check_stat_veto.
-# 2. Updated /analyze buckets for ADX to specifically track EMA efficiency in Chop (<20), 
-#    Weak Trend (20-25), Solid Trend (25-35), and Overextended (45+) regimes.
-# 3. Streamlined /analyze strategy buckets to strictly track Crossovers vs. Pullback/Touches.
+# CHANGES FROM V8.1:
+# 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
+# 2. Reduced TREND_15M_MIN_SEPARATION_PCT to 0.01 to allow earlier 15M trend confirmation.
+# 3. Added "Aggressive Price Impulse" trigger logic to catch massive candles that 
+#    cross both EMAs before the moving averages have time to untangle.
+# 4. Made EMA column mapping dynamic so logging automatically updates if EMA speeds change.
 
 import os
 import json
@@ -69,10 +70,10 @@ LAST_MT5_PING_TIME = None
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
-# --- EMA TREND FILTER (Both 5M & 15M) ---
-EMA_TREND_FAST = 9
-EMA_TREND_SLOW = 15
-TREND_15M_MIN_SEPARATION_PCT = 0.02
+# --- EMA TREND FILTER (Faster settings for early impulse capture) ---
+EMA_TREND_FAST = 5
+EMA_TREND_SLOW = 9
+TREND_15M_MIN_SEPARATION_PCT = 0.01  # Lowered for instant trend confirmation
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
@@ -92,7 +93,7 @@ def _reset_budget_if_new_day(now_wib: datetime):
     today = now_wib.date()
     if _twelve_data_budget_date != today:
         if _twelve_data_budget_date is not None:
-            logging.info(f"[TWELVE DATA BUDGET] New WIB day. Resetting counter (was {_twelve_data_call_count}: {_twelve_data_calls_by_tf}).")
+            logging.info(f"[TWELVE DATA BUDGET] New WIB day. Resetting counter.")
         _twelve_data_budget_date = today
         _twelve_data_call_count = 0
         _twelve_data_calls_by_tf = {"5min": 0, "15min": 0}
@@ -102,7 +103,7 @@ def twelve_data_budget_ok(now_wib: datetime) -> bool:
     _reset_budget_if_new_day(now_wib)
     remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
     if remaining <= TWELVE_DATA_SAFETY_MARGIN:
-        logging.warning(f"[TWELVE DATA BUDGET] Only {remaining} calls left today ({_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}). Throttling.")
+        logging.warning(f"[TWELVE DATA BUDGET] Only {remaining} calls left today. Throttling.")
         return False
     return True
 
@@ -113,7 +114,7 @@ def note_twelve_data_call(timeframe: str = None):
     if timeframe in _twelve_data_calls_by_tf:
         _twelve_data_calls_by_tf[timeframe] += 1
     if _twelve_data_call_count % 100 == 0:
-        logging.info(f"[TWELVE DATA BUDGET] {_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT} calls used today. Breakdown: {_twelve_data_calls_by_tf}")
+        logging.info(f"[TWELVE DATA BUDGET] {_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT} calls used today.")
 
 
 # ==========================================================
@@ -122,7 +123,6 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    # FIXED: Was throwing NameError. Now correctly references MID_SESSION_START_HOUR
     if MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR:
         return True, (
             f"Stat-veto: Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) "
@@ -226,7 +226,7 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info("[NEON DATABASE] Full schema verified and auto-migrated for EMA setup.")
+        logging.info("[NEON DATABASE] Full schema verified and auto-migrated.")
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
 
@@ -460,17 +460,17 @@ def calculate_metrics_tf(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     df["atr"] = df["tr"].rolling(window=14).mean()
     
-    # EMAs for the 9+15 Strategy
-    df["ema_9"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
-    df["ema_15"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
+    # EMAs dynamically named based on config settings
+    df["ema_fast"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
     
     return df
 
 
 def compute_ema_trend(df: pd.DataFrame):
     if df is None or len(df) < EMA_TREND_SLOW + 1: return "NEUTRAL", 0.0
-    last_fast = float(df["ema_9"].iloc[-1])
-    last_slow = float(df["ema_15"].iloc[-1])
+    last_fast = float(df["ema_fast"].iloc[-1])
+    last_slow = float(df["ema_slow"].iloc[-1])
     if last_slow == 0: return "NEUTRAL", 0.0
     separation_pct = abs(last_fast - last_slow) / last_slow * 100
     if separation_pct < TREND_15M_MIN_SEPARATION_PCT: return "NEUTRAL", separation_pct
@@ -483,34 +483,44 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     curr = df_5m.iloc[-1]
     prev = df_5m.iloc[-2]
     
-    c_ema9 = curr["ema_9"]
-    c_ema15 = curr["ema_15"]
-    p_ema9 = prev["ema_9"]
-    p_ema15 = prev["ema_15"]
+    c_ema_fast = curr["ema_fast"]
+    c_ema_slow = curr["ema_slow"]
+    p_ema_fast = prev["ema_fast"]
+    p_ema_slow = prev["ema_slow"]
     
-    # 1. EMA CROSSOVER
-    bullish_cross = p_ema9 <= p_ema15 and c_ema9 > c_ema15
-    bearish_cross = p_ema9 >= p_ema15 and c_ema9 < c_ema15
+    # 1. PRICE IMPULSE CROSS (Aggressive Early Entry)
+    # Catches massive candles that explode through both EMAs instantly
+    bullish_impulse = prev["close"] <= p_ema_slow and curr["close"] > c_ema_fast and curr["close"] > c_ema_slow and curr["close"] > curr["open"]
+    bearish_impulse = prev["close"] >= p_ema_slow and curr["close"] < c_ema_fast and curr["close"] < c_ema_slow and curr["close"] < curr["open"]
     
-    if bullish_cross and trend_15m == "BULLISH":
-        return "BUY", "EMA 9/15 Bullish Cross"
-    if bearish_cross and trend_15m == "BEARISH":
-        return "SELL", "EMA 9/15 Bearish Cross"
+    # 2. EMA CROSSOVER (The Standard Cross)
+    bullish_cross = p_ema_fast <= p_ema_slow and c_ema_fast > c_ema_slow
+    bearish_cross = p_ema_fast >= p_ema_slow and c_ema_fast < c_ema_slow
         
-    # 2. EMA TOUCH (Trend Continuation)
-    # Price pulls back to the EMA 9, touches it, but closes strong in direction of trend.
-    touch_bullish = c_ema9 > c_ema15 and curr["low"] <= c_ema9 and curr["close"] > c_ema9
-    touch_bearish = c_ema9 < c_ema15 and curr["high"] >= c_ema9 and curr["close"] < c_ema9
+    # 3. EMA TOUCH (Trend Continuation)
+    touch_bullish = c_ema_fast > c_ema_slow and curr["low"] <= c_ema_fast and curr["close"] > c_ema_fast
+    touch_bearish = c_ema_fast < c_ema_slow and curr["high"] >= c_ema_fast and curr["close"] < c_ema_fast
     
+    # Evaluate Hierarchy: Impulse > Crossover > Touch
+    if bullish_impulse and trend_15m == "BULLISH":
+        return "BUY", "Aggressive Price Impulse (Bullish)"
+    if bearish_impulse and trend_15m == "BEARISH":
+        return "SELL", "Aggressive Price Impulse (Bearish)"
+        
+    if bullish_cross and trend_15m == "BULLISH":
+        return "BUY", f"EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} Bullish Cross"
+    if bearish_cross and trend_15m == "BEARISH":
+        return "SELL", f"EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} Bearish Cross"
+        
     if touch_bullish and trend_15m == "BULLISH":
-        return "BUY", "EMA 9 Line Touch (Bullish)"
+        return "BUY", f"EMA {EMA_TREND_FAST} Line Touch (Bullish)"
     if touch_bearish and trend_15m == "BEARISH":
-        return "SELL", "EMA 9 Line Touch (Bearish)"
+        return "SELL", f"EMA {EMA_TREND_FAST} Line Touch (Bearish)"
         
     return "HOLD", "No EMA Setup"
 
 
-# --- FORWARD-TEST ANALYTICS HELPERS (OPTIMIZED FOR EMA STRATEGY) ---
+# --- FORWARD-TEST ANALYTICS HELPERS ---
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
     entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
@@ -547,7 +557,6 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
     return (((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)) * 2.0
 
 def bucket_adx(adx: float) -> str:
-    # Adjusted specifically for measuring EMA strength
     if adx < 20: return "ADX < 20 (Chop)"
     if adx < 25: return "ADX 20-25 (Weak Trend)"
     if adx < 35: return "ADX 25-35 (Solid Trend)"
@@ -556,6 +565,7 @@ def bucket_adx(adx: float) -> str:
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
+    if "Impulse" in t: return "Aggressive Price Impulse"
     if "Cross" in t: return "EMA Crossovers"
     if "Touch" in t: return "EMA Pullback/Touches"
     return "Other EMA Setup"
@@ -610,17 +620,17 @@ async def analyze_signal_with_ai(
     minus_di_5m = float(df_5m['minus_di'].iloc[-1])
     di_text = f"+DI={plus_di_5m:.1f}, -DI={minus_di_5m:.1f}"
     
-    c_ema9 = float(df_5m["ema_9"].iloc[-1])
-    c_ema15 = float(df_5m["ema_15"].iloc[-1])
+    c_ema_fast = float(df_5m["ema_fast"].iloc[-1])
+    c_ema_slow = float(df_5m["ema_slow"].iloc[-1])
 
     prompt = f"""
 Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping.
-Strategy in play: EMA 9+15 Trend Follower (5M Execution + 15M Confluence).
+Strategy in play: EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trend Follower (5M Execution + 15M Confluence).
 Trigger ({trigger_type}): {proposed_action} at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
 1. 5M Close=${float(df_5m['close'].iloc[-1]):.2f}
-2. 5M EMAs: EMA9=${c_ema9:.2f}, EMA15=${c_ema15:.2f}.
+2. 5M EMAs: EMA{EMA_TREND_FAST}=${c_ema_fast:.2f}, EMA{EMA_TREND_SLOW}=${c_ema_slow:.2f}.
 3. 5M ADX={adx_5m:.1f}; {di_text}.
 4. 15M Trend Filter: {trend_15m}
 
@@ -635,14 +645,13 @@ Respond strictly in valid JSON matching schema:
     if GROQ_API_KEY:
         try:
             res = groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",  # <-- Update this line
+                model="openai/gpt-oss-120b",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1, response_format={"type": "json_object"}
             )
             return SignalOutput(**json.loads(res.choices[0].message.content))
         except Exception as e:
             logging.warning(f"[AI WARNING] Groq call failed: {e}. Falling back to Gemini.")
-
 
     if GEMINI_API_KEY:
         try:
@@ -659,7 +668,7 @@ Respond strictly in valid JSON matching schema:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure EMA 9+15 structural alignment.")
+    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure EMA structural alignment.")
 
 
 # --- BACKGROUND SCANNING LOOP (RATE-LIMIT PROTECTED) ---
@@ -694,11 +703,9 @@ async def background_scanning_loop():
 
                 current_bucket = now_wib.strftime("%Y-%m-%d %H:%M")
                 if current_bucket == last_claimed_bucket:
-                    # Already attempted this 5-min window. Sleep past the remainder of the 45s window
                     await asyncio.sleep(20)
                     continue
 
-                # Claim the bucket NOW
                 last_claimed_bucket = current_bucket
 
                 if not twelve_data_budget_ok(now_wib):
@@ -728,6 +735,8 @@ async def background_scanning_loop():
                 update_open_trades(curr_high, curr_low)
 
                 curr_price = float(df_5m["close"].iloc[-1])
+                curr_ema_fast = float(df_5m["ema_fast"].iloc[-1])
+                curr_ema_slow = float(df_5m["ema_slow"].iloc[-1])
                 adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
 
                 need_refresh = (cached_15m["df"] is None or cached_15m["fetched_at"] is None or (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES)))
@@ -781,13 +790,13 @@ async def background_scanning_loop():
 
                 # --- AI EVALUATION & FINAL LOGGING ---
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | ADX5m: {adx_5m:.1f} | 15mTrend: {trend_15m} | Status: HOLD | Cycle End")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | EMA{EMA_TREND_FAST}: ${curr_ema_fast:.2f} | EMA{EMA_TREND_SLOW}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | 15mTrend: {trend_15m} | Status: HOLD | Cycle End")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, trend_15m, adx_15m_true)
 
                     atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
-                    risk = max(2.5, atr_5m * 1.0) # Risk adjusted for 5M ATR
+                    risk = max(2.5, atr_5m * 1.0)
                     tp1_r_mult = 1.5
                     tp2_r_mult = 2.5 
 
@@ -833,7 +842,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "EMA 9+15 Trading bot scanner active."}
+    return {"status": "ok", "message": f"EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trading bot scanner active."}
 
 
 # =====================================================================
@@ -885,7 +894,7 @@ async def telegram_webhook(request: Request):
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             if raw_text in ["/help", "/start"]:
                 reply = (
-                    "\U0001f916 *EMA 9+15 BOT COMMANDS:*\n\n"
+                    f"\U0001f916 *EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} BOT COMMANDS:*\n\n"
                     "\u2022 `/status` - \U0001f4e1 Real-Time MT5, Server & API Budget Status\n"
                     "\u2022 `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
                     "\u2022 `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
@@ -1165,7 +1174,6 @@ async def telegram_webhook(request: Request):
                             reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 
-                        # FIXED: Properly referencing MID_SESSION_START_HOUR
                         reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
                         reply_parts.append(
                             "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "

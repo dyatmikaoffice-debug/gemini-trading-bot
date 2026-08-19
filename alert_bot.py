@@ -1,12 +1,10 @@
-# V8 EMA 9+15 TREND FOLLOWER: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
+# V8.1 EMA 9+15 TREND FOLLOWER: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
 # 
-# CHANGES FROM ORIGINAL:
-# 1. 1M chart entirely removed. All execution and analysis happen on the 5M chart.
-# 2. Strategy overhauled to strict EMA 9 + 15 Line Touch and Crosses.
-# 3. 15M chart strictly used for EMA trend confluence mapping.
-# 4. Telegram analytics commands (/analyze, /stats, /pips) rewritten to categorize
-#    and forward-test EMA-specific triggers (Cross vs. Touch).
-# 5. Liquidity sweep, breakout, and consolidation mechanics completely removed.
+# CHANGES FROM V8.0:
+# 1. FIXED NameError on STAT_VETO_MID_SESSION_START_HOUR in /analyze, /help, and check_stat_veto.
+# 2. Updated /analyze buckets for ADX to specifically track EMA efficiency in Chop (<20), 
+#    Weak Trend (20-25), Solid Trend (25-35), and Overextended (45+) regimes.
+# 3. Streamlined /analyze strategy buckets to strictly track Crossovers vs. Pullback/Touches.
 
 import os
 import json
@@ -124,9 +122,10 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
+    # FIXED: Was throwing NameError. Now correctly references MID_SESSION_START_HOUR
+    if MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR:
         return True, (
-            f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
+            f"Stat-veto: Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) "
             f"forward-tested as underperforming for EMA trends."
         )
 
@@ -511,7 +510,7 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     return "HOLD", "No EMA Setup"
 
 
-# --- FORWARD-TEST ANALYTICS HELPERS ---
+# --- FORWARD-TEST ANALYTICS HELPERS (OPTIMIZED FOR EMA STRATEGY) ---
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
     entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
@@ -548,16 +547,17 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
     return (((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)) * 2.0
 
 def bucket_adx(adx: float) -> str:
-    if adx < 20: return "ADX <20 (Choppy)"
-    if adx < 30: return "ADX 20-30"
-    if adx < 40: return "ADX 30-40"
-    if adx < 50: return "ADX 40-50"
-    return "ADX 50+"
+    # Adjusted specifically for measuring EMA strength
+    if adx < 20: return "ADX < 20 (Chop)"
+    if adx < 25: return "ADX 20-25 (Weak Trend)"
+    if adx < 35: return "ADX 25-35 (Solid Trend)"
+    if adx < 45: return "ADX 35-45 (Strong Trend)"
+    return "ADX 45+ (Overextended)"
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
-    if "Cross" in t: return "EMA 9/15 Cross"
-    if "Touch" in t: return "EMA Line Touch"
+    if "Cross" in t: return "EMA Crossovers"
+    if "Touch" in t: return "EMA Pullback/Touches"
     return "Other EMA Setup"
 
 def bucket_session(timestamp_str: str) -> str:
@@ -894,7 +894,7 @@ async def telegram_webhook(request: Request):
                     "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
                     "\u2022 `/help` - Display Command Menu\n\n"
                     f"\u26a0\ufe0f Active stat-vetoes: ADX < 20.0 (Choppy limits) and "
-                    f"Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
+                    f"Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) "
                     f"are auto-skipped based on forward-test underperformance.\n"
                     f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
                     f"(any direction) before a new signal can execute."
@@ -1164,14 +1164,14 @@ async def telegram_webhook(request: Request):
                             reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 
+                        # FIXED: Properly referencing MID_SESSION_START_HOUR
                         reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
                         reply_parts.append(
                             "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
                             "but noisy).\n\n"
                             f"\U0001f6ab Active stat-vetoes: ADX < 20 (Choppy limits) and Mid session "
-                            f"({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) are being "
-                            f"auto-skipped -- re-check this report after ~30-40 more trades to confirm they're actually "
-                            f"lifting AvgR.\n"
+                            f"({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) are being "
+                            f"auto-skipped.\n"
                             f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
                         )
                         reply = "\n".join(reply_parts)

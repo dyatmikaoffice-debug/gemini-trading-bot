@@ -86,8 +86,6 @@ TREND_15M_MIN_SEPARATION_PCT = 0.02
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
 ACTIVE_SESSION_END_HOUR = 24
-MID_SESSION_START_HOUR = 14
-MID_SESSION_END_HOUR = 18
 TWELVE_DATA_DAILY_LIMIT = 800
 TWELVE_DATA_SAFETY_MARGIN = 40 
 
@@ -131,21 +129,12 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    # FIXED: this used to claim the mid-session window was "forward-tested as
-    # underperforming for EMA trends" -- that forward-test (n=17, WR=29%) was
-    # measured on the OLD liquidity-sweep/breakout strategy in V7. This EMA 5/9
-    # system is a different strategy with no trade history yet, so that claim was
-    # false as stated. Kept as a starting assumption (mid-session chop plausibly
-    # hurts trend-following too) but the wording no longer overclaims validation
-    # it doesn't have. Re-run /analyze after ~30-40 EMA trades to actually confirm
-    # or drop this veto.
-    if MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR:
-        return True, (
-            f"Stat-veto: Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) -- "
-            f"carried over as an untested starting assumption from the prior strategy's "
-            f"forward-test; not yet validated for EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}."
-        )
-
+    # REMOVED: mid-session (14-18 WIB) veto. It was carried over from the old
+    # liquidity-sweep strategy's forward-test and never actually validated for
+    # this EMA system -- removed per request rather than kept on an unverified
+    # assumption. current_hour_wib is kept as a parameter (unused for now) so the
+    # call sites and signature don't need to change if a real, EMA-specific
+    # session filter gets added later based on actual /analyze data.
     if adx_5m < 20.0:
         return True, (
             f"Stat-veto: 5M ADX {adx_5m:.1f} < 20.0 indicates chopping/ranging market. "
@@ -559,6 +548,11 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
+TP1_PARTIAL_CLOSE_RATIO = 0.5  # Fraction of the lot closed at TP1; rest rides to TP2/BE.
+                                # CONFIRM this matches your MT5 EA's actual split -- everything
+                                # below assumes 50/50. If your EA uses a different ratio, change
+                                # only this constant.
+
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
     entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
@@ -571,15 +565,28 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
     if sl_dist == 0: sl_dist = 2.5
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
-    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 3.0
+    tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
+    r = TP1_PARTIAL_CLOSE_RATIO
 
-    if outcome == "CLOSED (TP1 HIT / SL BE)": total_pips = tp1_dist * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: total_pips = (tp1_dist + tp2_dist) * 10.0
-    elif outcome == "WIN (TP1 HIT)": total_pips = tp1_dist * 10.0
-    elif "LOSS" in outcome: total_pips = -(sl_dist * 10.0 * 2.0)
+    # FIXED (partial-close accounting): the old formulas applied the FULL 0.01-lot
+    # rate to both the TP1 leg and the TP2 leg, which double-counts profit under a
+    # partial-close model -- only `r` of the lot actually captured tp1_dist, and
+    # only `(1-r)` of the lot captured tp2_dist. The old flat "LOSS x2" and
+    # "generic x2" multipliers are also gone: a straight SL hit (never reached
+    # TP1) stops the FULL lot at exactly 1R, not 2R -- there's no partial-close
+    # event to justify doubling it.
+    if outcome == "CLOSED (TP1 HIT / SL BE)":
+        total_pips = tp1_dist * r * 10.0
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        total_pips = (tp1_dist * r + tp2_dist * (1 - r)) * 10.0
+    elif outcome == "WIN (TP1 HIT)":
+        # Interim state: only the TP1 leg has actually closed so far.
+        total_pips = tp1_dist * r * 10.0
+    elif "LOSS" in outcome:
+        total_pips = -(sl_dist * 10.0)
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0
+        total_pips = diff * 10.0
     profit_usd = total_pips * 0.10
     return total_pips, profit_usd
 
@@ -588,11 +595,21 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
     if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0: risk_dist = 2.5
-    if outcome == "CLOSED (TP1 HIT / SL BE)": return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
-    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]: return ((abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) + (abs(tp2 - entry) if tp2 > 0 else risk_dist * 3.0)) / risk_dist
-    if outcome == "WIN (TP1 HIT)": return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
-    if "LOSS" in outcome: return -2.0
-    return (((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)) * 2.0
+    r = TP1_PARTIAL_CLOSE_RATIO
+    # FIXED: same partial-close accounting as compute_trade_pips above -- TP1/TP2
+    # legs are weighted by the actual lot fraction each one closes, and a straight
+    # loss (SL hit before TP1) is exactly -1.0R by definition (risk_dist IS 1R),
+    # not the old hardcoded -2.0.
+    if outcome == "CLOSED (TP1 HIT / SL BE)":
+        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r / risk_dist
+    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        tp1_leg = (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r
+        tp2_leg = (abs(tp2 - entry) if tp2 > 0 else risk_dist * 2.5) * (1 - r)
+        return (tp1_leg + tp2_leg) / risk_dist
+    if outcome == "WIN (TP1 HIT)":
+        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r / risk_dist
+    if "LOSS" in outcome: return -1.0
+    return ((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)
 
 def bucket_adx(adx: float) -> str:
     if adx < 20: return "ADX < 20 (Chop)"
@@ -777,12 +794,15 @@ async def background_scanning_loop():
                 curr_ema_slow = float(df_5m["ema_slow"].iloc[-1])
                 adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
 
+                # REMOVED: this used to skip the 15M refresh entirely during the
+                # mid-session veto window, since trades were blocked there anyway
+                # so refreshing was "wasted." Now that the veto is gone, trades can
+                # execute during those hours too -- skipping the refresh would mean
+                # confluence checks run on stale (potentially hours-old) 15M data
+                # exactly when it matters. Refresh logic is now the same 24/7.
                 need_refresh = (cached_15m["df"] is None or cached_15m["fetched_at"] is None or (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES)))
-                in_mid_session_veto = MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR
 
-                if in_mid_session_veto:
-                    logging.info(f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | 15M API refresh skipped.")
-                elif need_refresh and twelve_data_budget_ok(now_wib):
+                if need_refresh and twelve_data_budget_ok(now_wib):
                     df_15m_raw = await fetch_timeframe_data(client, "15min", now_wib=now_wib)
                     if df_15m_raw is not None and len(df_15m_raw) >= 21:
                         cached_15m["df"] = calculate_metrics_tf(df_15m_raw)
@@ -941,9 +961,7 @@ async def telegram_webhook(request: Request):
                     "\u2022 `/pause` - \U0001f6d1 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
                     "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
                     "\u2022 `/help` - Display Command Menu\n\n"
-                    f"\u26a0\ufe0f Active stat-vetoes: ADX < 20.0 (Choppy limits) and "
-                    f"Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) "
-                    f"are auto-skipped based on forward-test underperformance.\n"
+                    f"\u26a0\ufe0f Active stat-vetoes: ADX < 20.0 (Choppy limits).\n"
                     f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
                     f"(any direction) before a new signal can execute."
                 )
@@ -1098,7 +1116,9 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
                         f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4a1 *Note:* Calculated at $0.10/pip (0.01 lot XAU/USD)."
+                        f"\U0001f4a1 *Note:* $0.10/pip = full 0.01 lot. TP1/TP2 legs weighted "
+                        f"{int(TP1_PARTIAL_CLOSE_RATIO*100)}/{int((1-TP1_PARTIAL_CLOSE_RATIO)*100)} "
+                        f"per your partial-close split."
                     )
                     await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
                 except Exception as e:
@@ -1217,9 +1237,7 @@ async def telegram_webhook(request: Request):
                         reply_parts.append(
                             "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
                             "but noisy).\n\n"
-                            f"\U0001f6ab Active stat-vetoes: ADX < 20 (Choppy limits) and Mid session "
-                            f"({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) are being "
-                            f"auto-skipped.\n"
+                            f"\U0001f6ab Active stat-vetoes: ADX < 20 (Choppy limits) only.\n"
                             f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
                         )
                         reply = "\n".join(reply_parts)

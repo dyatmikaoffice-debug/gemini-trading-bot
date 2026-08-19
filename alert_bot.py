@@ -70,10 +70,18 @@ LAST_MT5_PING_TIME = None
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
-# --- EMA TREND FILTER (Faster settings for early impulse capture) ---
+# --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
 EMA_TREND_FAST = 5
 EMA_TREND_SLOW = 9
-TREND_15M_MIN_SEPARATION_PCT = 0.01  # Lowered for instant trend confirmation
+
+# FIXED: the 15M confluence filter previously reused the same 5/9 EMA as the 5M
+# execution signal, so it reacted almost as fast as the thing it was supposed to
+# be filtering -- the confluence check added far less protection than intended.
+# Decoupled to a slower, dedicated pair so it behaves like an actual higher-
+# timeframe trend read.
+TREND_15M_EMA_FAST = 9
+TREND_15M_EMA_SLOW = 20
+TREND_15M_MIN_SEPARATION_PCT = 0.02
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
@@ -123,10 +131,19 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
+    # FIXED: this used to claim the mid-session window was "forward-tested as
+    # underperforming for EMA trends" -- that forward-test (n=17, WR=29%) was
+    # measured on the OLD liquidity-sweep/breakout strategy in V7. This EMA 5/9
+    # system is a different strategy with no trade history yet, so that claim was
+    # false as stated. Kept as a starting assumption (mid-session chop plausibly
+    # hurts trend-following too) but the wording no longer overclaims validation
+    # it doesn't have. Re-run /analyze after ~30-40 EMA trades to actually confirm
+    # or drop this veto.
     if MID_SESSION_START_HOUR <= current_hour_wib < MID_SESSION_END_HOUR:
         return True, (
-            f"Stat-veto: Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) "
-            f"forward-tested as underperforming for EMA trends."
+            f"Stat-veto: Mid session ({MID_SESSION_START_HOUR}-{MID_SESSION_END_HOUR} WIB) -- "
+            f"carried over as an untested starting assumption from the prior strategy's "
+            f"forward-test; not yet validated for EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}."
         )
 
     if adx_5m < 20.0:
@@ -460,22 +477,34 @@ def calculate_metrics_tf(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     df["atr"] = df["tr"].rolling(window=14).mean()
     
-    # EMAs dynamically named based on config settings
+    # 5M execution EMAs (fast -- used for entry signals on df_5m)
     df["ema_fast"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
-    
+
+    # FIXED: separate, slower EMAs for the 15M confluence read. These are computed
+    # on every call (cheap) so the same helper works for both the 5M and 15M frames,
+    # but compute_ema_trend() below now reads THESE columns, not the fast ones.
+    df["trend_ema_fast"] = df["close"].ewm(span=TREND_15M_EMA_FAST, adjust=False).mean()
+    df["trend_ema_slow"] = df["close"].ewm(span=TREND_15M_EMA_SLOW, adjust=False).mean()
+
     return df
 
 
 def compute_ema_trend(df: pd.DataFrame):
-    if df is None or len(df) < EMA_TREND_SLOW + 1: return "NEUTRAL", 0.0
-    last_fast = float(df["ema_fast"].iloc[-1])
-    last_slow = float(df["ema_slow"].iloc[-1])
+    # FIXED: was reading df["ema_fast"]/df["ema_slow"] -- the same 5/9 pair used
+    # for 5M execution -- which made the "15M confluence filter" flip almost as
+    # fast as the signal it was supposed to be filtering. Now reads the dedicated,
+    # slower trend_ema_fast/trend_ema_slow (9/20) columns instead.
+    if df is None or len(df) < TREND_15M_EMA_SLOW + 1: return "NEUTRAL", 0.0
+    last_fast = float(df["trend_ema_fast"].iloc[-1])
+    last_slow = float(df["trend_ema_slow"].iloc[-1])
     if last_slow == 0: return "NEUTRAL", 0.0
     separation_pct = abs(last_fast - last_slow) / last_slow * 100
     if separation_pct < TREND_15M_MIN_SEPARATION_PCT: return "NEUTRAL", separation_pct
     return "BULLISH" if last_fast > last_slow else "BEARISH", separation_pct
 
+
+TOUCH_MIN_BODY_ATR_MULT = 0.15  # FIXED: touch signals previously had zero quality filter
 
 def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
@@ -496,10 +525,19 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     # 2. EMA CROSSOVER (The Standard Cross)
     bullish_cross = p_ema_fast <= p_ema_slow and c_ema_fast > c_ema_slow
     bearish_cross = p_ema_fast >= p_ema_slow and c_ema_fast < c_ema_slow
-        
+
     # 3. EMA TOUCH (Trend Continuation)
-    touch_bullish = c_ema_fast > c_ema_slow and curr["low"] <= c_ema_fast and curr["close"] > c_ema_fast
-    touch_bearish = c_ema_fast < c_ema_slow and curr["high"] >= c_ema_fast and curr["close"] < c_ema_fast
+    # FIXED: this trigger had no candle-quality check at all -- a tiny indecisive
+    # doji sitting on the EMA line qualified exactly the same as a strong reclaim
+    # candle, unlike every other trigger in this file which normalizes body size
+    # against ATR. Require the bounce candle to show at least modest conviction.
+    raw_atr = curr["atr"] if "atr" in curr and not pd.isna(curr["atr"]) else None
+    atr_val = float(raw_atr) if raw_atr is not None and raw_atr > 0 else None
+    candle_body = abs(float(curr["close"]) - float(curr["open"]))
+    touch_body_ok = (atr_val is None) or (candle_body / atr_val >= TOUCH_MIN_BODY_ATR_MULT)
+
+    touch_bullish = c_ema_fast > c_ema_slow and curr["low"] <= c_ema_fast and curr["close"] > c_ema_fast and touch_body_ok
+    touch_bearish = c_ema_fast < c_ema_slow and curr["high"] >= c_ema_fast and curr["close"] < c_ema_fast and touch_body_ok
     
     # Evaluate Hierarchy: Impulse > Crossover > Touch
     if bullish_impulse and trend_15m == "BULLISH":
@@ -939,7 +977,8 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
                         f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
-                        f"\u2022 Core Filters: *EMA {EMA_TREND_FAST} / {EMA_TREND_SLOW}*"
+                        f"\u2022 Execution (5M): *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}*\n"
+                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*"
                     )
                 else:
                     reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."

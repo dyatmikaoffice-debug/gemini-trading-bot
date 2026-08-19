@@ -1,3 +1,13 @@
+# V7 MOMENTUM & SWEEP: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
+# FIXED VERSION 
+#
+# CHANGES FROM ORIGINAL:
+# 1. EMA trend filter now uses 9/15 (was 9/20) to match requested "EMA 9+15" strategy.
+# 2. TwelveData daily call budget is now actually counted and enforced.
+# 3. /pips, /logs, /analyze Telegram commands are now implemented.
+# 4. BREAKOUT_REQUIRE_BODY_DIRECTION flag now actually enforced.
+# 5. Wired up the analytics helpers into /analyze.
+
 import os
 import json
 import asyncio
@@ -22,7 +32,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        # Suppress noisy MT5 polling requests from flooding the Render console
         return "/get-latest-signal" not in record.getMessage()
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
@@ -36,7 +45,6 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
 
-# Sanitize Telegram Bot Token
 CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
 TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
 
@@ -45,7 +53,6 @@ if CLEAN_BOT_TOKEN.startswith("bot"):
 else:
     TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN
 
-# Initialize AI Clients
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 groq_client = OpenAI(
@@ -58,9 +65,9 @@ SYMBOL = "XAU/USD"
 # --- GLOBAL EMERGENCY KILL SWITCH STATE & HEARTBEAT ---
 SYSTEM_TRADING_ENABLED = True
 CURRENT_SCAN_CYCLE_ID = None
-LAST_MT5_PING_TIME = None  # Tracks live MT5 connection timestamp
+LAST_MT5_PING_TIME = None
 
-# --- PULLBACK STATE (Stage 2 of the liquidity sweep strategy) ---
+# --- PULLBACK STATE ---
 pending_setup = None
 PULLBACK_EXPIRY_MINUTES = 10
 FIB_RETRACE_MIN = 0.382
@@ -70,13 +77,51 @@ FIB_RETRACE_MAX = 0.618
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
+# --- EMA TREND FILTER (15M chart) ---
+EMA_TREND_FAST = 9
+EMA_TREND_SLOW = 15
+
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
-ACTIVE_SESSION_START_HOUR = 0   # Changed to 0 for 24/7 trading
-ACTIVE_SESSION_END_HOUR = 24    # Changed to 24 for 24/7 trading
-MID_SESSION_START_HOUR = 14     # WIB (Statistical Veto Window)
-MID_SESSION_END_HOUR = 18       # WIB (Statistical Veto Window)
+ACTIVE_SESSION_START_HOUR = 0
+ACTIVE_SESSION_END_HOUR = 24
+MID_SESSION_START_HOUR = 14
+MID_SESSION_END_HOUR = 18
 TWELVE_DATA_DAILY_LIMIT = 800
-LEVEL_LOOKBACK_CANDLES = 4
+TWELVE_DATA_SAFETY_MARGIN = 40
+
+_twelve_data_call_count = 0
+_twelve_data_budget_date = None
+_twelve_data_calls_by_tf = {"1min": 0, "5min": 0, "15min": 0}
+
+
+def _reset_budget_if_new_day(now_wib: datetime):
+    global _twelve_data_call_count, _twelve_data_budget_date, _twelve_data_calls_by_tf
+    today = now_wib.date()
+    if _twelve_data_budget_date != today:
+        if _twelve_data_budget_date is not None:
+            logging.info(f"[TWELVE DATA BUDGET] New WIB day. Resetting counter (was {_twelve_data_call_count}: {_twelve_data_calls_by_tf}).")
+        _twelve_data_budget_date = today
+        _twelve_data_call_count = 0
+        _twelve_data_calls_by_tf = {"1min": 0, "5min": 0, "15min": 0}
+
+
+def twelve_data_budget_ok(now_wib: datetime) -> bool:
+    _reset_budget_if_new_day(now_wib)
+    remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
+    if remaining <= TWELVE_DATA_SAFETY_MARGIN:
+        logging.warning(f"[TWELVE DATA BUDGET] Only {remaining} calls left today ({_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}). Throttling.")
+        return False
+    return True
+
+
+def note_twelve_data_call(timeframe: str = None):
+    global _twelve_data_call_count
+    _twelve_data_call_count += 1
+    if timeframe in _twelve_data_calls_by_tf:
+        _twelve_data_calls_by_tf[timeframe] += 1
+    if _twelve_data_call_count % 100 == 0:
+        logging.info(f"[TWELVE DATA BUDGET] {_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT} calls used today. Breakdown: {_twelve_data_calls_by_tf}")
+
 
 # ==========================================================
 # MOMENTUM BREAKOUT QUALITY FILTERS
@@ -100,13 +145,12 @@ BREAKOUT_REQUIRE_BODY_DIRECTION = True
 
 # --- STAT-BASED VETOES ---
 STAT_VETO_ADX_THRESHOLD = 50.0
-STAT_VETO_MID_SESSION_START_HOUR = 14  # WIB
-STAT_VETO_MID_SESSION_END_HOUR = 18    # WIB
+STAT_VETO_MID_SESSION_START_HOUR = 14
+STAT_VETO_MID_SESSION_END_HOUR = 18
 
 EXTREME_ADX_REVERSAL_MIN_ADX = 50.0
 EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION = True
 
-# --- LOSS-COOLDOWN ---
 LOSS_COOLDOWN_MINUTES = 10
 
 
@@ -130,7 +174,7 @@ def check_stat_veto(
     if STAT_VETO_MID_SESSION_START_HOUR <= current_hour_wib < STAT_VETO_MID_SESSION_END_HOUR:
         return True, (
             f"Stat-veto: Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
-            f"forward-tested as underperforming (n=17, WR=29%, AvgR=-0.18)"
+            f"forward-tested as underperforming"
         )
 
     if adx_5m >= EXTREME_ADX_REVERSAL_MIN_ADX and is_sweep_reversal:
@@ -162,7 +206,7 @@ def check_stat_veto(
             return True, (
                 f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f}; "
                 f"Sweep+BOS direction is not opposite dominant momentum "
-                f"(+DI={plus_di:.1f}, -DI={minus_di:.1f}), so this is not treated as exhaustion reversal."
+                f"(+DI={plus_di:.1f}, -DI={minus_di:.1f})."
             )
 
         if not EXTREME_ADX_REVERSAL_REQUIRE_DI_CONFIRMATION:
@@ -179,9 +223,7 @@ def check_stat_veto(
     if adx_5m >= STAT_VETO_ADX_THRESHOLD:
         return True, (
             f"Stat-veto: 5M ADX {adx_5m:.1f} >= {STAT_VETO_ADX_THRESHOLD:.1f} "
-            f"for {trigger_type or 'non-reversal'} entry "
-            f"(forward-test: ADX 50+ regime n=15, WR=27%, AvgR=-0.27; "
-            f"high-ADX breakout/continuation entries are treated as late/exhausted)."
+            f"for {trigger_type or 'non-reversal'} entry."
         )
 
     return False, ""
@@ -534,9 +576,15 @@ def update_open_trades(current_high: float, current_low: float):
         logging.error(f"[NEON DB ERROR] Failed to update trade outcomes: {e}")
 
 
-async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100):
+async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100, now_wib: datetime = None):
+    now_wib = now_wib or (datetime.now(timezone.utc) + timedelta(hours=7))
+    if not twelve_data_budget_ok(now_wib):
+        logging.warning(f"[TWELVE DATA BUDGET] Skipping {timeframe} fetch - daily budget nearly exhausted.")
+        return None
+
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={timeframe}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     res = await client.get(url)
+    note_twelve_data_call(timeframe)
     if res.status_code != 200 or not res.text: return None
     try: data = res.json()
     except Exception: return None
@@ -576,7 +624,7 @@ def calculate_metrics_5m(df: pd.DataFrame):
 
 TREND_15M_MIN_SEPARATION_PCT = 0.02
 
-def compute_ema_trend(df: pd.DataFrame, fast: int = 9, slow: int = 20):
+def compute_ema_trend(df: pd.DataFrame, fast: int = EMA_TREND_FAST, slow: int = EMA_TREND_SLOW):
     if df is None or len(df) < slow + 1: return "NEUTRAL", 0.0
     ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
     ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
@@ -617,8 +665,11 @@ def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame, allow
     close_location = ((curr_close - curr_low) / candle_range) if candle_range > 0 else 0.5
     body_ratio = candle_body / atr_1m
 
-    bullish_two_close = bool(prev_close > recent_high and curr_close > recent_high and curr_close > prev_close)
-    bearish_two_close = bool(prev_close < recent_low and curr_close < recent_low and curr_close < prev_close)
+    bullish_body_ok = (not BREAKOUT_REQUIRE_BODY_DIRECTION) or (curr_close > curr_open)
+    bearish_body_ok = (not BREAKOUT_REQUIRE_BODY_DIRECTION) or (curr_close < curr_open)
+
+    bullish_two_close = bool(prev_close > recent_high and curr_close > recent_high and curr_close > prev_close and bullish_body_ok)
+    bearish_two_close = bool(prev_close < recent_low and curr_close < recent_low and curr_close < prev_close and bearish_body_ok)
     bullish_fast_cross = bool(curr_close > recent_high and curr_close > curr_open and (prev_close <= recent_high or prev_close <= recent_high + FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m))
     bearish_fast_cross = bool(curr_close < recent_low and curr_close < curr_open and (prev_close >= recent_low or prev_close >= recent_low - FAST_MOMENTUM_PREV_BUFFER_ATR * atr_1m))
 
@@ -637,7 +688,7 @@ def detect_breakout_continuation(df_1m: pd.DataFrame, df_5m: pd.DataFrame, allow
             if extension_atr <= BREAKOUT_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation not active", recent_high, recent_low
             if extension_atr > MOMENTUM_CONTINUATION_MAX_EXTENSION_ATR_MULT: return "HOLD", "Continuation rejected: excessively extended", recent_high, recent_low
             if body_ratio < min_body_atr: return "HOLD", "Continuation rejected: momentum weakening", recent_high, recent_low
-            if close_location > (1.0 - min_close_location): return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
+            if close_location > (1.0 - min_body_atr): return "HOLD", "Continuation rejected: weak close", recent_high, recent_low
             return "SELL", "Momentum Continuation - No Pullback (Bearish)", recent_high, recent_low
         return "HOLD", "No continuation structure", recent_high, recent_low
 
@@ -768,9 +819,9 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
         avg_r = (sum(r_values) / n) if n else 0.0
         flag = ""
         if n >= min_sample_to_flag:
-            if win_rate < 35: flag = " ⚠️ underperforming"
-            elif win_rate > 65: flag = " ✅ strong"
-        lines.append(f"• {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
+            if win_rate < 35: flag = " \u26a0\ufe0f underperforming"
+            elif win_rate > 65: flag = " \u2705 strong"
+        lines.append(f"\u2022 {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
     return "\n".join(lines)
 
 
@@ -839,7 +890,6 @@ Respond strictly in valid JSON matching schema:
 
     if GEMINI_API_KEY:
         try:
-            # UPDATED to gemini-3.7-flash to fix the 404 Error
             res = genai_client.models.generate_content(
                 model="gemini-3.7-flash",
                 contents=prompt,
@@ -862,6 +912,8 @@ async def background_scanning_loop():
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         last_processed_candle_time = None
+        # FIX: Claiming the 5-minute wall-clock bucket BEFORE network call
+        last_claimed_bucket = None
 
         while True:
             try:
@@ -869,7 +921,6 @@ async def background_scanning_loop():
                 current_hour_wib = now_wib.hour
 
                 if not SYSTEM_TRADING_ENABLED:
-                    # Print sleep status periodically so console isn't blank
                     if now_wib.minute % 5 == 0 and now_wib.second < 5:
                         logging.info("[SLEEP STATUS] Bot is PAUSED via kill switch. Waiting...")
                     await asyncio.sleep(60)
@@ -877,44 +928,47 @@ async def background_scanning_loop():
 
                 active_session = ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
                 if not active_session:
-                    # This won't trigger anymore since it's 24/7, but left as a safety check
                     if now_wib.minute % 5 == 0 and now_wib.second < 5:
                         logging.info(f"[SLEEP STATUS] Out of session ({ACTIVE_SESSION_START_HOUR}:00 - {ACTIVE_SESSION_END_HOUR}:00 WIB). Waiting...")
                     await asyncio.sleep(60)
                     continue
 
-                # =========================================================
-                # 1. 5-MINUTE BOUNDARY LOCK
-                # =========================================================
-                # Forces the scanner to wait for the exact 5-minute candle marks (00, 05, 10...)
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
                     continue
 
-                # Fetch 5M data first to check the timestamp
-                df_5m = await fetch_timeframe_data(client, "5min")
+                current_bucket = now_wib.strftime("%Y-%m-%d %H:%M")
+                if current_bucket == last_claimed_bucket:
+                    # Already attempted this 5-min window. Sleep past the remainder of the 45s window
+                    await asyncio.sleep(20)
+                    continue
+
+                # Claim the bucket NOW
+                last_claimed_bucket = current_bucket
+
+                if not twelve_data_budget_ok(now_wib):
+                    await asyncio.sleep(20)
+                    continue
+
+                df_5m = await fetch_timeframe_data(client, "5min", now_wib=now_wib)
                 if df_5m is None or len(df_5m) < 6:
+                    logging.warning("[SCAN LOOP] 5M fetch failed or insufficient data this window; will retry next candle.")
                     await asyncio.sleep(15)
                     continue
 
                 df_5m = calculate_metrics_5m(df_5m)
                 candle_time_5m = df_5m["datetime"].iloc[-1]
 
-                # =========================================================
-                # 2. STRICT DEDUPLICATION (PREVENTS TWELVE DATA 429 SPAM)
-                # =========================================================
                 if last_processed_candle_time is not None and candle_time_5m == last_processed_candle_time:
                     await asyncio.sleep(5)
                     continue
 
-                # Lock this cycle down so we never evaluate it twice
                 last_processed_candle_time = candle_time_5m
 
                 CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Scanner cycle started")
 
-                # Fetch 1M data (Snapshot at the 5-minute boundary)
-                df_1m = await fetch_timeframe_data(client, "1min")
+                df_1m = await fetch_timeframe_data(client, "1min", now_wib=now_wib)
                 if df_1m is None or len(df_1m) < 3:
                     await asyncio.sleep(15)
                     continue
@@ -935,8 +989,8 @@ async def background_scanning_loop():
 
                 if in_mid_session_veto:
                     logging.info(f"[MID-SESSION VETO] WIB {now_wib.strftime('%H:%M')} | 15M API refresh skipped.")
-                elif need_refresh:
-                    df_15m_raw = await fetch_timeframe_data(client, "15min")
+                elif need_refresh and twelve_data_budget_ok(now_wib):
+                    df_15m_raw = await fetch_timeframe_data(client, "15min", now_wib=now_wib)
                     if df_15m_raw is not None and len(df_15m_raw) >= 21:
                         cached_15m["df"] = calculate_metrics_5m(df_15m_raw)
                         cached_15m["fetched_at"] = datetime.now(timezone.utc)
@@ -950,7 +1004,6 @@ async def background_scanning_loop():
                 recent_low = 0.0
                 status_note = ""
 
-                # --- V7 MOMENTUM LOGIC ---
                 if pending_setup is not None:
                     if datetime.now(timezone.utc) > pending_setup["expires"]:
                         expired_action = pending_setup["action"]
@@ -1048,7 +1101,7 @@ async def background_scanning_loop():
 
                 # --- AI EVALUATION & FINAL LOGGING ---
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | Status: HOLD{status_note} | Cycle End")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | ADX5m: {adx_5m:.1f} | 15mTrend: {trend_15m} | Status: HOLD{status_note} | Cycle End")
                 else:
                     logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
                     ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_1m, df_5m, recent_high, recent_low, trend_15m, adx_15m_true, plus_di_5m, minus_di_5m)
@@ -1064,13 +1117,13 @@ async def background_scanning_loop():
 
                     if ai_decision.action == proposed_action:
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
-                        msg = (f"🚀 *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
+                        msg = (f"\U0001f680 *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
                         await send_telegram_alert(client, msg)
                     else:
                         log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
 
                 del df_1m, df_5m; gc.collect()
-                await asyncio.sleep(5)  # Sleeps safely because the boundary lock is handled at the top
+                await asyncio.sleep(5)
 
             except Exception as e:
                 logging.error(f"[SCAN LOOP ERROR] {e}")
@@ -1110,7 +1163,6 @@ def home():
 async def get_latest_signal():
     global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
 
-    # Heartbeat: Record the exact time MT5 polled the server
     LAST_MT5_PING_TIME = datetime.now(timezone.utc) + timedelta(hours=7)
 
     if not SYSTEM_TRADING_ENABLED:
@@ -1153,50 +1205,65 @@ async def telegram_webhook(request: Request):
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             if raw_text in ["/help", "/start"]:
                 reply = (
-                    "🤖 *TRADING BOT COMMANDS:*\n\n"
-                    "• `/status` - 📡 Real-Time MT5 & Server Heartbeat Status\n"
-                    "• `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
-                    "• `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown\n"
-                    "• `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
-                    "• `/analyze` - Forward-Test Breakdown by Strategy\n"
-                    "• `/pause` - 🛑 *EMERGENCY KILL SWITCH*\n"
-                    "• `/resume` - 🟢 Re-enable Auto-Trading Execution"
+                    "\U0001f916 *TRADING BOT COMMANDS:*\n\n"
+                    "\u2022 `/status` - \U0001f4e1 Real-Time MT5, Server & API Budget Status\n"
+                    "\u2022 `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
+                    "\u2022 `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
+                    "\u2022 `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
+                    "\u2022 `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
+                    "\u2022 `/pause` - \U0001f6d1 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
+                    "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
+                    "\u2022 `/help` - Display Command Menu\n\n"
+                    f"\u26a0\ufe0f Active stat-vetoes: ADX \u2265 {STAT_VETO_ADX_THRESHOLD:.0f} and "
+                    f"Mid session ({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) "
+                    f"are auto-skipped based on forward-test underperformance.\n"
+                    f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
+                    f"(any direction) before a new signal can execute."
                 )
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-            
+
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:
                     now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
                     seconds_ago = (now_wib.replace(tzinfo=None) - LAST_MT5_PING_TIME.replace(tzinfo=None)).total_seconds()
-                    
-                    if seconds_ago < 60:
-                        status_icon = "🟢"
-                        conn_msg = f"Connected and Active\n• Last ping: *{seconds_ago:.0f}s ago*"
-                    elif seconds_ago < 180:
-                        status_icon = "🟡"
-                        conn_msg = f"Slight Lag\n• Last ping: *{seconds_ago:.0f}s ago*"
-                    else:
-                        status_icon = "🔴"
-                        conn_msg = f"DISCONNECTED\n• Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
 
+                    if seconds_ago < 60:
+                        status_icon = "\U0001f7e2"
+                        conn_msg = f"Connected and Active\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
+                    elif seconds_ago < 180:
+                        status_icon = "\U0001f7e1"
+                        conn_msg = f"Slight Lag\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
+                    else:
+                        status_icon = "\U0001f534"
+                        conn_msg = f"DISCONNECTED\n\u2022 Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
+
+                    remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
+                    budget_pct = (_twelve_data_call_count / TWELVE_DATA_DAILY_LIMIT * 100) if TWELVE_DATA_DAILY_LIMIT else 0.0
+                    budget_icon = "\U0001f7e2" if budget_pct < 70 else ("\U0001f7e1" if budget_pct < 90 else "\U0001f534")
                     reply = (
                         f"{status_icon} *SYSTEM & BRIDGE STATUS*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
-                        f"• MT5 Bridge: *{conn_msg}*\n"
-                        f"• Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\u2022 Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
+                        f"\u2022 MT5 Bridge: *{conn_msg}*\n"
+                        f"\u2022 Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`\n\n"
+                        f"{budget_icon} *TWELVEDATA API BUDGET:*\n"
+                        f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
+                        f"  \u2514\u2500 1M: {_twelve_data_calls_by_tf['1min']} | 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
+                        f"\U0001f4c8 *STRATEGY:*\n"
+                        f"\u2022 15M EMA Trend Filter: *{EMA_TREND_FAST}/{EMA_TREND_SLOW}*\n"
+                        f"\u2022 Pending Setup: *{'YES - ' + pending_setup['action'] + ' armed' if pending_setup else 'None'}*"
                     )
                 else:
-                    reply = "🔴 *MT5 DISCONNECTED*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe server is running, but MT5 has not sent any pings since the last reboot."
+                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
 
             elif raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
-                await send_telegram_alert(client, "🛑 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.", target_chat_id=sender_chat_id)
+                await send_telegram_alert(client, "\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.", target_chat_id=sender_chat_id)
 
             elif raw_text == "/resume":
                 SYSTEM_TRADING_ENABLED = True
-                await send_telegram_alert(client, "🟢 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.", target_chat_id=sender_chat_id)
+                await send_telegram_alert(client, "\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.", target_chat_id=sender_chat_id)
 
             elif raw_text == "/stats":
                 try:
@@ -1206,6 +1273,8 @@ async def telegram_webhook(request: Request):
                     total_executed = cur.fetchone()["total"] or 0
                     cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED'")
                     total_vetoes = cur.fetchone()["vetoes"] or 0
+                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+                    total_pending = cur.fetchone()["pending"] or 0
                     cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
                     tp1_wins = cur.fetchone()["tp1_wins"] or 0
                     cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
@@ -1225,10 +1294,213 @@ async def telegram_webhook(request: Request):
                         elif trade_pips < 0: loss_pips += abs(trade_pips)
 
                     win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                    est_dollar = total_pips * 0.10
+                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
                     cur.close(); conn.close()
-                    reply = f"📊 *PERFORMANCE*\nTotal Pips: *{total_pips:+.1f}*\nWin Rate: *{win_rate:.1f}%*\nWins: {total_wins_count} | Losses: {losses}"
+
+                    reply = (
+                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
+                        f"\u2022 Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
+                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
+                        f"\u2022 Total Executed: *{total_executed}*\n"
+                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
+                        f"\u2022 Active Pending: *{total_pending}*\n\n"
+                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
+                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
+                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
+                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
+                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
+                    )
                     await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-                except Exception as e: await send_telegram_alert(client, f"⚠️ Error: {e}", target_chat_id=sender_chat_id)
+                except Exception as e: await send_telegram_alert(client, f"\u26a0\ufe0f Error querying stats: {e}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/pips":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
+                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
+                    """)
+                    trades = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    total_pips = gross_win_pips = gross_loss_pips = 0.0
+                    winning_trades_count = losing_trades_count = 0
+
+                    for t in trades:
+                        pips, _usd = compute_trade_pips({
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"]
+                        })
+                        total_pips += pips
+                        if pips > 0:
+                            gross_win_pips += pips; winning_trades_count += 1
+                        elif pips < 0:
+                            gross_loss_pips += abs(pips); losing_trades_count += 1
+
+                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                    est_profit_usd = total_pips * 0.10
+                    pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
+
+                    reply = (
+                        f"\U0001f4b5 *DETAILED PIPS & EARNINGS REPORT*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4ca *SUMMARY:*\n"
+                        f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
+                        f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                        f"\U0001f3af *AVERAGE METRICS:*\n"
+                        f"\u2022 Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4a1 *Note:* Calculated at $0.10/pip (0.01 lot XAU/USD)."
+                    )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as e:
+                    await send_telegram_alert(client, f"\u26a0\ufe0f Error calculating pips: {e}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/logs":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT id, action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
+                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val,
+                               COALESCE(timestamp, created_at::text, 'N/A') AS log_time
+                        FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 10
+                    """)
+                    logs = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    if not logs:
+                        reply = "\U0001f4dc *LAST 10 TRADE LOGS:*\n\n_No executed trades in the database yet._"
+                    else:
+                        reply = "\U0001f4dc *LAST 10 DETAILED TRADE LOGS:*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\n"
+                        for l in logs:
+                            trade_id = l["id"]; action = l["action"]
+                            entry = float(l["entry_p"])
+                            exit_p = float(l["exit_price"]) if l.get("exit_price") is not None else None
+                            outcome = l["outcome_val"]
+                            date_str = str(l["log_time"])
+
+                            if exit_p is not None:
+                                pips, profit_usd = compute_trade_pips({
+                                    "action": action, "entry_price": entry, "sl_price": l["sl_p"],
+                                    "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p,
+                                    "outcome": outcome
+                                })
+                                r_multiple = compute_r_multiple(
+                                    action, entry, exit_p, float(l["sl_p"] or 0.0),
+                                    float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
+                                )
+                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
+                            else:
+                                pip_str = "*ACTIVE / IN PROGRESS*"
+
+                            if "WIN" in outcome or "CLOSED" in outcome:
+                                icon = "\U0001f7e2"
+                            elif "LOSS" in outcome:
+                                icon = "\U0001f534"
+                            else:
+                                icon = "\U0001f7e1"
+
+                            reply += (
+                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                                f"\u2022 Entry: ${entry:.2f} \u2192 Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                                f"\u2022 Outcome: *{outcome}*\n"
+                                f"\u2022 Result: {pip_str} | Time: {date_str}\n"
+                                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                            )
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as e:
+                    await send_telegram_alert(client, f"\u26a0\ufe0f Error querying logs: {e}", target_chat_id=sender_chat_id)
+
+            elif raw_text == "/analyze":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
+                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
+                               COALESCE(timestamp, created_at::text, '') AS log_time,
+                               trend_15m
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
+                    """)
+                    rows = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    if not rows:
+                        reply = (
+                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
+                            "_Not enough closed trades yet to analyze. Check back after more signals complete._"
+                        )
+                    else:
+                        segments = {"Strategy": {}, "ADX Regime": {}, "Session": {}, "15m Confluence": {}}
+                        overall_r = []
+                        for r in rows:
+                            r_mult = compute_r_multiple(
+                                r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
+                                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
+                            )
+                            overall_r.append(r_mult)
+                            adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
+                            segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
+                            segments["ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
+                            segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
+
+                        n_total = len(overall_r)
+                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
+                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
+
+                        reply_parts = [
+                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+                            f"Sample: *{n_total} closed trades*",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
+                            "",
+                        ]
+                        for dim in ["Strategy", "ADX Regime", "Session", "15m Confluence"]:
+                            reply_parts.append(format_performance_segment(dim, segments[dim]))
+                            reply_parts.append("")
+
+                        reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
+                        reply_parts.append(
+                            "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
+                            "but noisy). This does not auto-adjust the bot -- use it to decide whether to retune "
+                            "the ADX veto thresholds, fib pullback zone, or session windows in code.\n\n"
+                            f"\U0001f6ab Active stat-vetoes: ADX \u2265 {STAT_VETO_ADX_THRESHOLD:.0f} and Mid session "
+                            f"({STAT_VETO_MID_SESSION_START_HOUR}-{STAT_VETO_MID_SESSION_END_HOUR} WIB) are being "
+                            f"auto-skipped -- re-check this report after ~30-40 more trades to confirm they're actually "
+                            f"lifting AvgR.\n"
+                            f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
+                        )
+                        reply = "\n".join(reply_parts)
+                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                except Exception as e:
+                    await send_telegram_alert(client, f"\u26a0\ufe0f Error: {e}", target_chat_id=sender_chat_id)
 
     except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
     return {"status": "ok"}

@@ -635,13 +635,14 @@ Respond strictly in valid JSON matching schema:
     if GROQ_API_KEY:
         try:
             res = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-120b",  # <-- Update this line
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1, response_format={"type": "json_object"}
             )
             return SignalOutput(**json.loads(res.choices[0].message.content))
         except Exception as e:
             logging.warning(f"[AI WARNING] Groq call failed: {e}. Falling back to Gemini.")
+
 
     if GEMINI_API_KEY:
         try:

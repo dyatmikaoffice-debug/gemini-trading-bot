@@ -83,6 +83,17 @@ TREND_15M_EMA_FAST = 9
 TREND_15M_EMA_SLOW = 20
 TREND_15M_MIN_SEPARATION_PCT = 0.02
 
+# --- RANGE / CONSOLIDATION MODE ---
+# Trend mode (EMA cross/touch/impulse) and range mode are mutually exclusive,
+# selected purely by 5M ADX: >= RANGE_MODE_ADX_MAX runs the trend engine,
+# < RANGE_MODE_ADX_MAX runs this fade-the-edges engine instead of going silent.
+RANGE_MODE_ADX_MAX = 20.0
+RANGE_LOOKBACK_5M = 10             # candles defining the current range bracket (~50 min on 5M)
+RANGE_MAX_WIDTH_ATR_MULT = 2.0     # bracket must be no wider than this (in ATR) to count as a real range
+RANGE_MIN_WIDTH_ATR_MULT = 0.8     # bracket must be at least this wide -- too tight isn't tradeable (spread/slippage)
+RANGE_EDGE_ZONE_PCT = 0.20         # price must be within this fraction of the range width from an edge to fade it
+RANGE_SL_BUFFER_ATR_MULT = 0.3     # stop placed this many ATR beyond the bracket edge being faded
+
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
 ACTIVE_SESSION_END_HOUR = 24
@@ -129,18 +140,16 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    # REMOVED: mid-session (14-18 WIB) veto. It was carried over from the old
-    # liquidity-sweep strategy's forward-test and never actually validated for
-    # this EMA system -- removed per request rather than kept on an unverified
-    # assumption. current_hour_wib is kept as a parameter (unused for now) so the
-    # call sites and signature don't need to change if a real, EMA-specific
-    # session filter gets added later based on actual /analyze data.
-    if adx_5m < 20.0:
-        return True, (
-            f"Stat-veto: 5M ADX {adx_5m:.1f} < 20.0 indicates chopping/ranging market. "
-            f"EMA strategies are auto-vetoed to prevent false signals."
-        )
-
+    # REMOVED (mid-session): was carried over from the old liquidity-sweep
+    # strategy's forward-test and never validated for this EMA system.
+    #
+    # REMOVED (ADX < 20 chop veto): this veto is now structurally impossible to
+    # trigger and would be dead code if left in. Trend mode and range mode are
+    # selected by ADX BEFORE either detector even runs (see
+    # background_scanning_loop) -- trend mode only ever calls this with
+    # adx_5m >= RANGE_MODE_ADX_MAX, and range mode (which specifically WANTS
+    # low ADX) never calls this at all. Kept as a shell for any future
+    # stat-based veto that isn't already handled by mode selection.
     return False, ""
 
 
@@ -547,6 +556,61 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     return "HOLD", "No EMA Setup"
 
 
+def detect_range_reversal(df_5m: pd.DataFrame, trend_15m: str):
+    """
+    Fade-the-edges consolidation strategy. Only ever called when 5M ADX is
+    below RANGE_MODE_ADX_MAX (see background_scanning_loop) -- this is the
+    counterpart to detect_ema_signal(), not a supplement to it. The two never
+    run in the same cycle.
+    """
+    if len(df_5m) < RANGE_LOOKBACK_5M + 1:
+        return "HOLD", "Insufficient data for range detection", None, None
+
+    # Bracket is defined by the N candles BEFORE the current one, same pattern
+    # as the old V7 consolidation-breakout detector -- but here we fade INSIDE
+    # the bracket instead of trading a breakout beyond it.
+    bracket = df_5m.iloc[-(RANGE_LOOKBACK_5M + 1):-1]
+    bracket_high = float(bracket["high"].max())
+    bracket_low = float(bracket["low"].min())
+    width = bracket_high - bracket_low
+
+    raw_atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
+    if raw_atr is None or pd.isna(raw_atr) or float(raw_atr) <= 0:
+        return "HOLD", "ATR unavailable", bracket_high, bracket_low
+    atr_5m = float(raw_atr)
+
+    # Reject anything that isn't a genuine tight range: too wide means this is
+    # actually a slow drift/pullback, not consolidation; too tight means the
+    # edges are inside normal noise/spread and not worth trading.
+    if width > RANGE_MAX_WIDTH_ATR_MULT * atr_5m:
+        return "HOLD", "Range too wide -- likely a drift, not consolidation", bracket_high, bracket_low
+    if width < RANGE_MIN_WIDTH_ATR_MULT * atr_5m:
+        return "HOLD", "Range too tight -- inside normal noise/spread", bracket_high, bracket_low
+
+    # Extra safety: don't fade a range if the 15M read still has a clear bias.
+    # A temporary 5M ADX dip inside an intact larger trend is a pullback, not
+    # a real range -- fading it means trading against the bigger picture.
+    if trend_15m != "NEUTRAL":
+        return "HOLD", f"15M trend still {trend_15m} -- skipping fade to avoid trading against it", bracket_high, bracket_low
+
+    curr = df_5m.iloc[-1]
+    curr_open = float(curr["open"]); curr_close = float(curr["close"])
+    curr_high = float(curr["high"]); curr_low = float(curr["low"])
+    edge_zone = width * RANGE_EDGE_ZONE_PCT
+
+    near_bottom = curr_low <= bracket_low + edge_zone
+    near_top = curr_high >= bracket_high - edge_zone
+    bullish_rejection = curr_close > curr_open and curr_close > (bracket_low + edge_zone)
+    bearish_rejection = curr_close < curr_open and curr_close < (bracket_high - edge_zone)
+
+    if near_bottom and bullish_rejection and not near_top:
+        return "BUY", "Range Fade - Bottom Rejection", bracket_high, bracket_low
+    if near_top and bearish_rejection and not near_bottom:
+        return "SELL", "Range Fade - Top Rejection", bracket_high, bracket_low
+
+    return "HOLD", "No range edge rejection", bracket_high, bracket_low
+
+
 # --- FORWARD-TEST ANALYTICS HELPERS ---
 TP1_PARTIAL_CLOSE_RATIO = 0.5  # Fraction of the lot closed at TP1; rest rides to TP2/BE.
                                 # CONFIRM this matches your MT5 EA's actual split -- everything
@@ -620,6 +684,7 @@ def bucket_adx(adx: float) -> str:
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
+    if "Range Fade" in t: return "Range Fade (Consolidation)"
     if "Impulse" in t: return "Aggressive Price Impulse"
     if "Cross" in t: return "EMA Crossovers"
     if "Touch" in t: return "EMA Pullback/Touches"
@@ -668,7 +733,8 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
     proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, 
-    trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0
+    trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0, strategy_mode: str = "TREND",
+    range_high: float = None, range_low: float = None
 ):
     adx_5m = float(df_5m['adx'].iloc[-1])
     plus_di_5m = float(df_5m['plus_di'].iloc[-1])
@@ -678,9 +744,29 @@ async def analyze_signal_with_ai(
     c_ema_fast = float(df_5m["ema_fast"].iloc[-1])
     c_ema_slow = float(df_5m["ema_slow"].iloc[-1])
 
+    # FIXED: the veto-rule text is now mode-aware. Range mode ONLY ever fires
+    # when 5M ADX < RANGE_MODE_ADX_MAX by design -- if this prompt still told
+    # the AI reviewer "VETO if ADX < 20", every single range signal would get
+    # auto-vetoed regardless of quality, silently defeating the whole feature.
+    if strategy_mode == "RANGE":
+        strategy_desc = f"Range Fade / Consolidation (5M Execution, active only when ADX < {RANGE_MODE_ADX_MAX:.0f})"
+        range_text = f"5. Range Bracket: High=${range_high:.2f}, Low=${range_low:.2f}" if range_high else ""
+        veto_rules_text = (
+            f"- VETO if 5M ADX >= {RANGE_MODE_ADX_MAX:.0f} (a real trend has resumed -- fading it is wrong).\n"
+            f"- VETO if the entry isn't clearly near a range edge with a genuine rejection candle, not just noise.\n"
+            f"- This is a mean-reversion fade, not a breakout -- do NOT expect trend-style follow-through."
+        )
+    else:
+        strategy_desc = f"EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trend Follower (5M Execution + 15M Confluence)"
+        range_text = ""
+        veto_rules_text = (
+            f"- VETO if 5M ADX < {RANGE_MODE_ADX_MAX:.0f} (Choppy/Ranging market, EMA setups will fail).\n"
+            f"- Ensure price action agrees with momentum."
+        )
+
     prompt = f"""
 Act as a Senior Institutional Risk Manager for Spot Gold (XAU/USD) intraday scalping.
-Strategy in play: EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trend Follower (5M Execution + 15M Confluence).
+Strategy in play: {strategy_desc}.
 Trigger ({trigger_type}): {proposed_action} at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
@@ -688,10 +774,10 @@ TECHNICAL CONTEXT:
 2. 5M EMAs: EMA{EMA_TREND_FAST}=${c_ema_fast:.2f}, EMA{EMA_TREND_SLOW}=${c_ema_slow:.2f}.
 3. 5M ADX={adx_5m:.1f}; {di_text}.
 4. 15M Trend Filter: {trend_15m}
+{range_text}
 
 CRITICAL SCALP VETO RULES:
-- VETO if 5M ADX < 20.0 (Choppy/Ranging market, EMA setups will fail).
-- Ensure price action agrees with momentum.
+{veto_rules_text}
 
 Respond strictly in valid JSON matching schema:
 {{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0-1.0, "reasoning": "2 concise sentences explaining decision"}}
@@ -811,14 +897,21 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+                # Mode is selected purely by 5M ADX -- trend and range strategies
+                # are mutually exclusive, never evaluated in the same cycle. This
+                # replaces the old "ADX < 20 = go silent" behavior with actual
+                # coverage of both regimes.
+                range_high = range_low = None
+                if adx_5m >= RANGE_MODE_ADX_MAX:
+                    strategy_mode = "TREND"
+                    proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+                else:
+                    strategy_mode = "RANGE"
+                    proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, trend_15m)
 
                 # --- VETO CHECKS ---
-                if proposed_action != "HOLD":
-                    stat_vetoed, stat_veto_reason = check_stat_veto(adx_5m, current_hour_wib)
-                    if stat_vetoed:
-                        logging.info(f"[STAT VETO] {stat_veto_reason}")
-                        proposed_action = "HOLD"
+                # (check_stat_veto's former ADX<20 rule is now handled by the mode
+                # selection above -- see its docstring. No separate call needed.)
 
                 if proposed_action != "HOLD":
                     try:
@@ -848,23 +941,43 @@ async def background_scanning_loop():
 
                 # --- AI EVALUATION & FINAL LOGGING ---
                 if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | EMA{EMA_TREND_FAST}: ${curr_ema_fast:.2f} | EMA{EMA_TREND_SLOW}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | 15mTrend: {trend_15m} | Status: HOLD | Cycle End")
+                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | EMA{EMA_TREND_FAST}: ${curr_ema_fast:.2f} | EMA{EMA_TREND_SLOW}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | 15mTrend: {trend_15m} | Status: HOLD | Cycle End")
                 else:
-                    logging.info(f"[MARKET SCAN] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, trend_15m, adx_15m_true)
+                    logging.info(f"[MARKET SCAN] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
+                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, trend_15m, adx_15m_true, strategy_mode, range_high, range_low)
 
                     atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
-                    risk = max(2.5, atr_5m * 1.0)
-                    tp1_r_mult = 1.5
-                    tp2_r_mult = 2.5 
 
-                    sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
-                    tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
-                    tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
+                    if strategy_mode == "RANGE":
+                        # Structural risk: stop sits just beyond the bracket edge
+                        # being faded, not an arbitrary ATR multiple of entry --
+                        # if the fade is wrong, the range itself is invalidated.
+                        # TP2 (full target) is the opposite edge of the bracket;
+                        # TP1 (partial) is the midpoint, matching the same
+                        # 50/50 partial-close model your MT5 EA already runs.
+                        if proposed_action == "BUY":
+                            sl_price = range_low - RANGE_SL_BUFFER_ATR_MULT * atr_5m
+                            tp2_price = range_high
+                            tp1_price = curr_price + (tp2_price - curr_price) * 0.5
+                        else:
+                            sl_price = range_high + RANGE_SL_BUFFER_ATR_MULT * atr_5m
+                            tp2_price = range_low
+                            tp1_price = curr_price - (curr_price - tp2_price) * 0.5
+                        tp1_r_mult = abs(tp1_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
+                        tp2_r_mult = abs(tp2_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
+                    else:
+                        risk = max(2.5, atr_5m * 1.0)
+                        tp1_r_mult = 1.5
+                        tp2_r_mult = 2.5 
+
+                        sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
+                        tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
+                        tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
 
                     if ai_decision.action == proposed_action:
                         new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
-                        msg = (f"\U0001f680 *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
+                        mode_tag = "\U0001f4ca RANGE FADE" if strategy_mode == "RANGE" else "\U0001f680 TREND"
+                        msg = (f"{mode_tag} *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
                         await send_telegram_alert(client, msg)
                     else:
                         log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
@@ -961,7 +1074,9 @@ async def telegram_webhook(request: Request):
                     "\u2022 `/pause` - \U0001f6d1 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
                     "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
                     "\u2022 `/help` - Display Command Menu\n\n"
-                    f"\u26a0\ufe0f Active stat-vetoes: ADX < 20.0 (Choppy limits).\n"
+                    f"\u2696\ufe0f Strategy mode is chosen automatically by 5M ADX: "
+                    f"\u2265{RANGE_MODE_ADX_MAX:.0f} runs EMA trend-following, "
+                    f"<{RANGE_MODE_ADX_MAX:.0f} runs range-fade (consolidation).\n"
                     f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
                     f"(any direction) before a new signal can execute."
                 )
@@ -995,8 +1110,9 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
                         f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
-                        f"\u2022 Execution (5M): *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}*\n"
-                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*"
+                        f"\u2022 Execution (5M): *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
+                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"\u2022 Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
                     )
                 else:
                     reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
@@ -1236,8 +1352,10 @@ async def telegram_webhook(request: Request):
                         reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
                         reply_parts.append(
                             "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
-                            "but noisy).\n\n"
-                            f"\U0001f6ab Active stat-vetoes: ADX < 20 (Choppy limits) only.\n"
+                            "but noisy). Check the Strategy breakdown for \"Range Fade (Consolidation)\" vs the "
+                            "EMA buckets to see which regime is actually working.\n\n"
+                            f"\u2696\ufe0f Mode is auto-selected by 5M ADX (\u2265{RANGE_MODE_ADX_MAX:.0f} trend, "
+                            f"<{RANGE_MODE_ADX_MAX:.0f} range) -- not a veto, both regimes are live.\n"
                             f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
                         )
                         reply = "\n".join(reply_parts)

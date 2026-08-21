@@ -93,6 +93,7 @@ RANGE_MAX_WIDTH_ATR_MULT = 2.0     # bracket must be no wider than this (in ATR)
 RANGE_MIN_WIDTH_ATR_MULT = 0.8     # bracket must be at least this wide -- too tight isn't tradeable (spread/slippage)
 RANGE_EDGE_ZONE_PCT = 0.20         # price must be within this fraction of the range width from an edge to fade it
 RANGE_SL_BUFFER_ATR_MULT = 0.3     # stop placed this many ATR beyond the bracket edge being faded
+RANGE_MODE_MAX_15M_ADX = 25.0      # skip the fade if the 15M chart itself shows a real trend (ADX >= this)
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
@@ -232,7 +233,9 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS exit_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome_timestamp TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_15m TEXT;",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;"
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_extension_atr REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_climax_ratio REAL;"
         ]
 
         for query in migrations:
@@ -301,7 +304,13 @@ def log_scan_event(event_type: str, **kwargs):
 def log_trade_signal(
     status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float,
     confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str,
-    trend_15m: str = None, adx_15m_true: float = None
+    trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
+    entry_climax_ratio: float = None
+    # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
+    # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
+    # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
+    # this column and is labeled accordingly; don't rename the DB column without
+    # a migration, but don't assume it holds a real 15M value either.
 ):
     if not DATABASE_URL:
         return None
@@ -320,23 +329,28 @@ def log_trade_signal(
         stoch_val = float(stoch_rsi_15m) if stoch_rsi_15m is not None else 0.0
         trend_15m_val = str(trend_15m) if trend_15m is not None else None
         adx_15m_true_val = float(adx_15m_true) if adx_15m_true is not None else None
+        extension_val = float(entry_extension_atr) if entry_extension_atr is not None else None
+        climax_val = float(entry_climax_ratio) if entry_climax_ratio is not None else None
 
         cursor.execute("""
             INSERT INTO signals (
                 timestamp, status, action, trigger_type, price, entry_price, sl, sl_price,
                 tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m,
-                divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true, created_at
+                divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true,
+                entry_extension_atr, entry_climax_ratio, created_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, NOW()
+                %s, %s, %s, %s, %s,
+                %s, %s, NOW()
             )
             RETURNING id;
         """, (
             str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val,
             sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val,
-            str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val
+            str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val,
+            extension_val, climax_val
         ))
 
         inserted_row = cursor.fetchone()
@@ -556,7 +570,7 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
     return "HOLD", "No EMA Setup"
 
 
-def detect_range_reversal(df_5m: pd.DataFrame, trend_15m: str):
+def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
     """
     Fade-the-edges consolidation strategy. Only ever called when 5M ADX is
     below RANGE_MODE_ADX_MAX (see background_scanning_loop) -- this is the
@@ -587,11 +601,16 @@ def detect_range_reversal(df_5m: pd.DataFrame, trend_15m: str):
     if width < RANGE_MIN_WIDTH_ATR_MULT * atr_5m:
         return "HOLD", "Range too tight -- inside normal noise/spread", bracket_high, bracket_low
 
-    # Extra safety: don't fade a range if the 15M read still has a clear bias.
-    # A temporary 5M ADX dip inside an intact larger trend is a pullback, not
-    # a real range -- fading it means trading against the bigger picture.
-    if trend_15m != "NEUTRAL":
-        return "HOLD", f"15M trend still {trend_15m} -- skipping fade to avoid trading against it", bracket_high, bracket_low
+    # FIXED: this used to require compute_ema_trend() to read exactly NEUTRAL,
+    # which needs the 15M 9/20 EMA pair within TREND_15M_MIN_SEPARATION_PCT
+    # (0.02%, roughly $0.90 at $4490 gold) of each other -- a bar so tight it
+    # was almost never met, silently blocking range mode nearly 100% of the
+    # time (confirmed: 0 of 63 closed trades were Range Fade). Gated on 15M ADX
+    # instead -- a properly calibrated "is there a real higher-timeframe trend"
+    # check, using the same ADX language as the 5M gate rather than a brittle
+    # EMA-separation threshold.
+    if adx_15m_true >= RANGE_MODE_MAX_15M_ADX:
+        return "HOLD", f"15M ADX {adx_15m_true:.1f} still shows a real trend -- skipping fade to avoid trading against it", bracket_high, bracket_low
 
     curr = df_5m.iloc[-1]
     curr_open = float(curr["open"]); curr_close = float(curr["close"])
@@ -609,6 +628,58 @@ def detect_range_reversal(df_5m: pd.DataFrame, trend_15m: str):
         return "SELL", "Range Fade - Top Rejection", bracket_high, bracket_low
 
     return "HOLD", "No range edge rejection", bracket_high, bracket_low
+
+
+def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
+    """
+    Instrumentation only -- does NOT affect entry/veto decisions. Measures two
+    things at the moment a signal fires, for both TREND and RANGE signals:
+
+    1. extension_atr: how far price has already traveled beyond the edge of
+       its own recent N-candle bracket (the same bracket concept range mode
+       uses), in ATR units. A large value means the move is already well away
+       from its last consolidation zone -- a proxy for "chasing a move that's
+       already run" rather than catching it at the start.
+
+    2. climax_ratio: the current candle's own range (high-low) relative to
+       ATR. A candle several times the normal ATR is a classic "climax" shape
+       often followed by a shakeout/retracement even when the larger move is
+       intact -- this is the pattern behind stops getting tagged mid-impulse
+       before the move continues.
+
+    Logged to signals.entry_extension_atr / entry_climax_ratio so /analyze can
+    bucket outcomes by these values once enough trades accumulate. Nothing
+    here changes what fires or when -- purely for building the evidence base
+    before any logic changes, per the "track first" approach.
+    """
+    if len(df_5m) < lookback + 1:
+        return None, None
+
+    bracket = df_5m.iloc[-(lookback + 1):-1]
+    bracket_high = float(bracket["high"].max())
+    bracket_low = float(bracket["low"].min())
+
+    curr = df_5m.iloc[-1]
+    curr_close = float(curr["close"])
+    curr_high = float(curr["high"])
+    curr_low = float(curr["low"])
+
+    raw_atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
+    if raw_atr is None or pd.isna(raw_atr) or float(raw_atr) <= 0:
+        return None, None
+    atr_5m = float(raw_atr)
+
+    if action == "BUY":
+        extension_atr = (curr_close - bracket_high) / atr_5m
+    elif action == "SELL":
+        extension_atr = (bracket_low - curr_close) / atr_5m
+    else:
+        extension_atr = None
+
+    candle_range = curr_high - curr_low
+    climax_ratio = candle_range / atr_5m
+
+    return extension_atr, climax_ratio
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
@@ -681,6 +752,17 @@ def bucket_adx(adx: float) -> str:
     if adx < 35: return "ADX 25-35 (Solid Trend)"
     if adx < 45: return "ADX 35-45 (Strong Trend)"
     return "ADX 45+ (Overextended)"
+
+def bucket_extension(extension_atr) -> str:
+    # Instrumentation bucket -- how far price had already moved beyond its
+    # recent consolidation bracket (in ATR) at the moment a signal fired.
+    if extension_atr is None: return "Extension N/A"
+    e = float(extension_atr)
+    if e < 0.5: return "Extension <0.5 ATR (Early)"
+    if e < 1.0: return "Extension 0.5-1.0 ATR"
+    if e < 1.5: return "Extension 1.0-1.5 ATR"
+    if e < 2.0: return "Extension 1.5-2.0 ATR"
+    return "Extension 2.0+ ATR (Chasing)"
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
@@ -907,7 +989,7 @@ async def background_scanning_loop():
                     proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
                 else:
                     strategy_mode = "RANGE"
-                    proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, trend_15m)
+                    proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
 
                 # --- VETO CHECKS ---
                 # (check_stat_veto's former ADX<20 rule is now handled by the mode
@@ -948,6 +1030,10 @@ async def background_scanning_loop():
 
                     atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
 
+                    # Instrumentation only (see compute_entry_extension docstring) --
+                    # does not affect sl_price/tp1_price/tp2_price or any veto below.
+                    entry_extension_atr, entry_climax_ratio = compute_entry_extension(df_5m, proposed_action)
+
                     if strategy_mode == "RANGE":
                         # Structural risk: stop sits just beyond the bracket edge
                         # being faded, not an arbitrary ATR multiple of entry --
@@ -975,12 +1061,12 @@ async def background_scanning_loop():
                         tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
 
                     if ai_decision.action == proposed_action:
-                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
+                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio)
                         mode_tag = "\U0001f4ca RANGE FADE" if strategy_mode == "RANGE" else "\U0001f680 TREND"
                         msg = (f"{mode_tag} *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
                         await send_telegram_alert(client, msg)
                     else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true)
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio)
 
                 del df_5m; gc.collect()
                 await asyncio.sleep(5)
@@ -1308,7 +1394,7 @@ async def telegram_webhook(request: Request):
                                COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
                                COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
                                COALESCE(timestamp, created_at::text, '') AS log_time,
-                               trend_15m
+                               trend_15m, entry_extension_atr
                         FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
                     """)
                     rows = cur.fetchall()
@@ -1316,11 +1402,11 @@ async def telegram_webhook(request: Request):
 
                     if not rows:
                         reply = (
-                            "\U0001f4d0 *EMA STRATEGY FORWARD-TEST ANALYSIS*\n\n"
+                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
                             "_Not enough closed trades yet to analyze. Check back after more signals complete._"
                         )
                     else:
-                        segments = {"Strategy": {}, "ADX Regime": {}, "Session": {}, "15m Confluence": {}}
+                        segments = {"Strategy": {}, "5M ADX Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
                         overall_r = []
                         for r in rows:
                             r_mult = compute_r_multiple(
@@ -1330,7 +1416,8 @@ async def telegram_webhook(request: Request):
                             overall_r.append(r_mult)
                             adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
                             segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
-                            segments["ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["5M ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["Entry Extension"].setdefault(bucket_extension(r["entry_extension_atr"]), []).append(r_mult)
                             segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
                             segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
 
@@ -1345,7 +1432,7 @@ async def telegram_webhook(request: Request):
                             f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
                             "",
                         ]
-                        for dim in ["Strategy", "ADX Regime", "Session", "15m Confluence"]:
+                        for dim in ["Strategy", "5M ADX Regime", "Entry Extension", "Session", "15m Confluence"]:
                             reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 

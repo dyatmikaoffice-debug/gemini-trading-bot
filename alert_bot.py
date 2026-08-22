@@ -128,6 +128,29 @@ BREAKER_RESET_MIN_DI_GAP = 5.0         # +DI/-DI must be separated by at least t
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
 ACTIVE_SESSION_END_HOUR = 24
+
+# V10.1: forex/gold is closed on weekends, but nothing above ever checked for
+# that -- ACTIVE_SESSION_START/END = 0/24 covers every HOUR but not every DAY.
+# Confirmed live: three "Range Fade - Bottom Rejection" signals fired Sat
+# Aug 22 16:45-17:25 WIB on a dead weekend feed (price frozen at ~4608.27,
+# moving <0.01 across 40 minutes) -- the AI reviewer correctly vetoed all
+# three, but the scanner should never have evaluated them in the first
+# place. In WIB (UTC+7), NY's Sun 17:00 EST reopen lands at ~05:00 WIB
+# MONDAY -- so the whole calendar Saturday AND Sunday are closed in WIB,
+# not just Saturday.
+FOREX_MONDAY_OPEN_HOUR_WIB = 5   # approx NY Sunday 17:00 EST reopen, in WIB
+
+
+def is_forex_market_open(now_wib: datetime) -> bool:
+    weekday = now_wib.weekday()  # Monday=0 ... Sunday=6
+    if weekday == 5:  # Saturday: closed all day in WIB
+        return False
+    if weekday == 6:  # Sunday: closed all day in WIB (reopen lands on Monday)
+        return False
+    if weekday == 0 and now_wib.hour < FOREX_MONDAY_OPEN_HOUR_WIB:
+        return False  # Monday, before the weekend reopen has actually happened
+    return True
+
 TWELVE_DATA_DAILY_LIMIT = 800
 TWELVE_DATA_SAFETY_MARGIN = 40 
 
@@ -1185,6 +1208,17 @@ async def background_scanning_loop():
                     if now_wib.minute % 5 == 0 and now_wib.second < 5:
                         logging.info(f"[SLEEP STATUS] Out of session ({ACTIVE_SESSION_START_HOUR}:00 - {ACTIVE_SESSION_END_HOUR}:00 WIB). Waiting...")
                     await asyncio.sleep(60)
+                    continue
+
+                # V10.1: weekend/market-closed gate. Skips the ENTIRE cycle
+                # (no TwelveData call, no signal evaluation, no AI call) when
+                # the forex/gold market is shut -- this is what should have
+                # stopped the Sat Aug 22 16:45-17:25 "Range Fade" signals from
+                # ever being generated on a dead, frozen weekend feed.
+                if not is_forex_market_open(now_wib):
+                    if now_wib.minute % 30 == 0 and now_wib.second < 5:
+                        logging.info(f"[SLEEP STATUS] Market closed (weekend, WIB). Waiting for reopen...")
+                    await asyncio.sleep(120)
                     continue
 
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:

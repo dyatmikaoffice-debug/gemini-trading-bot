@@ -95,6 +95,36 @@ RANGE_EDGE_ZONE_PCT = 0.20         # price must be within this fraction of the r
 RANGE_SL_BUFFER_ATR_MULT = 0.3     # stop placed this many ATR beyond the bracket edge being faded
 RANGE_MODE_MAX_15M_ADX = 25.0      # skip the fade if the 15M chart itself shows a real trend (ADX >= this)
 
+# --- V10: TREND-QUALITY / TRANSITION REGIME ---
+# High 5M ADX no longer means "trade trend setups" by itself. ADX is lagging --
+# it can stay elevated for many bars after a trend has already exhausted into
+# consolidation (this is exactly what produced the ID 86-92 loss cluster: 5M
+# ADX 60-83, 15M BULLISH throughout, six straight BUY signals, six straight
+# SL hits). TRANSITION sits between TREND and RANGE: ADX is still >= 20 (so
+# RANGE mode is not appropriate either), but the move itself has stopped
+# producing clean directional follow-through. TRANSITION -> HOLD, no new
+# trend entries, until the market re-qualifies as TREND.
+TRANSITION_SLOPE_LOOKBACK = 6          # 5M candles (~30 min) used for EMA/ADX slope checks
+TRANSITION_MIN_EMA_SEP_ATR = 0.20      # EMA5/EMA9 separation must be at least this many ATR to count as a live trend
+TRANSITION_MIN_EMA_SLOPE_ATR = 0.15    # EMA5 must have moved at least this many ATR over the lookback (flat = chop)
+TRANSITION_MAX_EMA_CROSSES = 2         # 2+ EMA5/EMA9 crosses in the lookback window = whipsaw, not trend
+TRANSITION_ADX_FALLING_DROP = 1.0      # ADX dropping by at least this much over the lookback = weakening, not fresh
+
+# --- V10: SAME-DIRECTION CONSECUTIVE-LOSS CIRCUIT BREAKER ---
+# Distinct from LOSS_COOLDOWN_MINUTES (which pauses ALL new signals briefly
+# after ANY loss) and from the distance cooldown (which only asks "have we
+# moved far enough from the last entry"). Neither asks "am I still exposed to
+# the same failed thesis". This does: after two consecutive SL losses in the
+# SAME direction, that direction is blocked until a genuine new trend forms
+# in that direction -- not just time passing or ADX still being high. The
+# opposite direction is never affected, and TREND-mode same-direction
+# stacking is intentionally left untouched (it's a source of real profit
+# during genuine strong trends -- see the V10 discussion notes).
+CONSEC_LOSS_BREAKER_THRESHOLD = 2
+BREAKER_RESET_MIN_15M_ADX = 25.0       # 15M ADX must be at least this strong to count as a genuine new trend
+BREAKER_RESET_ADX_LOOKBACK = 3         # 15M candles used to confirm ADX is RISING, not just high
+BREAKER_RESET_MIN_DI_GAP = 5.0         # +DI/-DI must be separated by at least this many points on the 15M chart
+
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
 ACTIVE_SESSION_END_HOUR = 24
@@ -235,7 +265,19 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_15m TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_extension_atr REAL;",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_climax_ratio REAL;"
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_climax_ratio REAL;",
+            # V10: real dual-0.01-lot accounting, stored per-row (not just
+            # computed on the fly in /stats etc). See compute_trade_pips().
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_pips REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_usd REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_r REAL;",
+            # V10: regime/quality instrumentation at signal time, for the
+            # TRANSITION classifier and future analysis.
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime TEXT;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_sep_atr_5m REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_slope_atr_5m REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_slope_5m REAL;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_cross_count_5m INTEGER;",
         ]
 
         for query in migrations:
@@ -245,8 +287,68 @@ def init_db():
         cursor.close()
         conn.close()
         logging.info("[NEON DATABASE] Full schema verified and auto-migrated.")
+
+        # V10: one-time (idempotent) backfill of result_pips/result_usd/result_r
+        # for every historical closed trade that predates these columns. Safe
+        # to run on every boot -- it only ever touches rows where result_pips
+        # IS NULL, so already-backfilled rows are skipped and this stays cheap.
+        backfill_dual_lot_accounting()
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
+
+
+def backfill_dual_lot_accounting():
+    """
+    V10: fills result_pips / result_usd / result_r for any EXECUTED, closed
+    (exit_price IS NOT NULL) signal that doesn't have them yet -- covers every
+    trade logged before this migration, using the SAME compute_trade_pips /
+    compute_r_multiple functions the live bot now uses, so historical and
+    future numbers are computed identically. Idempotent: only ever updates
+    rows where result_pips IS NULL, so re-running on every boot is cheap and
+    harmless once the backfill has completed.
+    """
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p,
+                   COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                   COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                   COALESCE(outcome, 'PENDING') AS outcome_val
+            FROM signals
+            WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND result_pips IS NULL
+        """)
+        rows = cursor.fetchall()
+        if not rows:
+            cursor.close(); conn.close()
+            return
+
+        updated = 0
+        for r in rows:
+            trade = {
+                "action": r["action"], "entry_price": r["entry_p"], "sl_price": r["sl_p"],
+                "tp1_price": r["tp1_p"], "tp2_price": r["tp2_p"], "exit_price": r["exit_price"],
+                "outcome": r["outcome_val"],
+            }
+            pips, usd = compute_trade_pips(trade)
+            r_mult = compute_r_multiple(
+                r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
+                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
+            )
+            cursor.execute(
+                "UPDATE signals SET result_pips = %s, result_usd = %s, result_r = %s WHERE id = %s",
+                (pips, usd, r_mult, r["id"])
+            )
+            updated += 1
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logging.info(f"[V10 BACKFILL] result_pips/result_usd/result_r populated for {updated} historical signal(s).")
+    except Exception as e:
+        logging.error(f"[V10 BACKFILL ERROR] {e}")
 
 
 def log_bot_event(
@@ -305,7 +407,7 @@ def log_trade_signal(
     status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float,
     confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str,
     trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
-    entry_climax_ratio: float = None
+    entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None
     # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
     # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
     # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
@@ -331,17 +433,25 @@ def log_trade_signal(
         adx_15m_true_val = float(adx_15m_true) if adx_15m_true is not None else None
         extension_val = float(entry_extension_atr) if entry_extension_atr is not None else None
         climax_val = float(entry_climax_ratio) if entry_climax_ratio is not None else None
+        regime_val = str(regime) if regime is not None else None
+        rm = regime_metrics or {}
+        ema_sep_val = rm.get("ema_sep_atr")
+        ema_slope_val = rm.get("ema_slope_atr")
+        adx_slope_val = rm.get("adx_slope")
+        cross_count_val = rm.get("cross_count")
 
         cursor.execute("""
             INSERT INTO signals (
                 timestamp, status, action, trigger_type, price, entry_price, sl, sl_price,
                 tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m,
                 divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true,
-                entry_extension_atr, entry_climax_ratio, created_at
+                entry_extension_atr, entry_climax_ratio, regime, ema_sep_atr_5m, ema_slope_atr_5m,
+                adx_slope_5m, ema_cross_count_5m, created_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, NOW()
             )
@@ -350,7 +460,8 @@ def log_trade_signal(
             str(wib_time), str(status), str(action), str(trigger_type), price_val, price_val,
             sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val,
             str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val,
-            extension_val, climax_val
+            extension_val, climax_val, regime_val, ema_sep_val, ema_slope_val,
+            adx_slope_val, cross_count_val
         ))
 
         inserted_row = cursor.fetchone()
@@ -427,17 +538,26 @@ def update_open_trades(current_high: float, current_low: float):
                     new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
-                cursor.execute("""
-                    UPDATE signals SET outcome = %s, exit_price = %s, outcome_timestamp = %s WHERE id = %s
-                """, (new_outcome, float(exit_price), wib_now, trade_id))
-                conn.commit()
-
                 trade_for_calc = {
                     "action": action, "entry_price": entry_price, "sl_price": sl,
                     "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome
                 }
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
                 result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
+
+                # V10: result_pips/result_usd/result_r are only "final" once the
+                # trade is fully closed (LOSS, CLOSED (TP1 HIT / SL BE), or WIN
+                # (TP2 HIT)) -- the interim "WIN (TP1 HIT)" state still has an
+                # open runner leg, so its stored numbers are a running mark, not
+                # yet a settled result. They get overwritten again once the
+                # runner actually closes.
+                cursor.execute("""
+                    UPDATE signals
+                    SET outcome = %s, exit_price = %s, outcome_timestamp = %s,
+                        result_pips = %s, result_usd = %s, result_r = %s
+                    WHERE id = %s
+                """, (new_outcome, float(exit_price), wib_now, result_pips, result_usd, result_r, trade_id))
+                conn.commit()
 
                 log_bot_event(
                     "TRADE_OUTCOME", stage="TRADE_MANAGEMENT", action=action, price=float(exit_price), decision=new_outcome,
@@ -630,6 +750,138 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
     return "HOLD", "No range edge rejection", bracket_high, bracket_low
 
 
+def classify_trend_quality(df_5m: pd.DataFrame, lookback: int = TRANSITION_SLOPE_LOOKBACK):
+    """
+    V10: called ONLY when adx_5m >= RANGE_MODE_ADX_MAX (i.e. inside what used
+    to be the pure TREND branch). Decides whether the market is genuinely
+    TRENDing or has quietly slipped into TRANSITION (high ADX left over from
+    a move that has already stopped producing follow-through -- ADX is a
+    lagging strength measure, not a "is this still happening right now"
+    measure). Returns ("TREND" | "TRANSITION", reason, metrics_dict).
+
+    Checks (any ONE failing is enough to call it TRANSITION):
+      1. EMA5/EMA9 separation, in ATR -- a live trend keeps the fast/slow
+         EMAs meaningfully apart; in chop they collapse toward each other.
+      2. EMA5 slope, in ATR over `lookback` candles -- a live trend keeps
+         pushing the fast EMA in one direction; a flat EMA5 means price is
+         oscillating around it instead of trending through it.
+      3. EMA5/EMA9 cross count over `lookback` candles -- 2+ crosses in a
+         short window is the classic whipsaw signature.
+      4. ADX slope over `lookback` candles -- a meaningfully FALLING ADX
+         (even from a high level) means the move is losing strength right
+         now, regardless of how high the absolute reading still is. This is
+         exactly what ID 86-92 showed: ADX 79->83->83->67->67->61, still
+         "high" throughout, but clearly deteriorating.
+    """
+    metrics = {"ema_sep_atr": None, "ema_slope_atr": None, "cross_count": None, "adx_slope": None}
+
+    if len(df_5m) < lookback + 2:
+        return "TREND", "Insufficient history for quality check -- defaulting to TREND", metrics
+
+    atr_val = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else None
+    if atr_val is None or atr_val <= 0:
+        return "TREND", "ATR unavailable for quality check -- defaulting to TREND", metrics
+
+    ema_fast = df_5m["ema_fast"]
+    ema_slow = df_5m["ema_slow"]
+    adx_series = df_5m["adx"]
+
+    ema_sep_atr = abs(float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])) / atr_val
+    ema_slope_atr = (float(ema_fast.iloc[-1]) - float(ema_fast.iloc[-1 - lookback])) / atr_val
+
+    recent_diff = (ema_fast - ema_slow).iloc[-(lookback + 1):]
+    cross_count = int((np.sign(recent_diff).diff().fillna(0) != 0).sum())
+
+    adx_now = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
+    adx_then = float(adx_series.iloc[-1 - lookback]) if not pd.isna(adx_series.iloc[-1 - lookback]) else adx_now
+    adx_slope = adx_now - adx_then
+
+    metrics.update({
+        "ema_sep_atr": round(ema_sep_atr, 3), "ema_slope_atr": round(ema_slope_atr, 3),
+        "cross_count": cross_count, "adx_slope": round(adx_slope, 2),
+    })
+
+    if ema_sep_atr < TRANSITION_MIN_EMA_SEP_ATR:
+        return "TRANSITION", f"EMA5/9 separation only {ema_sep_atr:.2f} ATR (< {TRANSITION_MIN_EMA_SEP_ATR}) -- lines have converged", metrics
+    if abs(ema_slope_atr) < TRANSITION_MIN_EMA_SLOPE_ATR:
+        return "TRANSITION", f"EMA5 slope only {ema_slope_atr:+.2f} ATR over {lookback} candles -- flattening, not trending", metrics
+    if cross_count >= TRANSITION_MAX_EMA_CROSSES:
+        return "TRANSITION", f"{cross_count} EMA5/9 crosses in last {lookback} candles -- whipsaw pattern", metrics
+    if adx_slope <= -TRANSITION_ADX_FALLING_DROP:
+        return "TRANSITION", f"ADX falling {adx_slope:+.1f} over {lookback} candles despite still-high level -- trend exhausting", metrics
+
+    return "TREND", f"EMA sep {ema_sep_atr:.2f} ATR, slope {ema_slope_atr:+.2f} ATR, {cross_count} crosses, ADX slope {adx_slope:+.1f} -- genuine trend", metrics
+
+
+def get_recent_signals_for_direction(action: str, limit: int = CONSEC_LOSS_BREAKER_THRESHOLD):
+    """V10: last `limit` EXECUTED, closed signals in one direction, newest first."""
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db_connection(); cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, outcome FROM signals
+            WHERE status = 'EXECUTED' AND action = %s
+              AND outcome IS NOT NULL AND outcome NOT IN ('PENDING', 'WIN (TP1 HIT)')
+            ORDER BY id DESC LIMIT %s
+        """, (str(action), int(limit)))
+        rows = cursor.fetchall()
+        cursor.close(); conn.close()
+        return rows or []
+    except Exception as e:
+        logging.error(f"[V10 BREAKER ERROR] {e}")
+        return []
+
+
+def consecutive_loss_breaker_active(action: str) -> bool:
+    """
+    V10: True if the last CONSEC_LOSS_BREAKER_THRESHOLD closed trades in this
+    SAME direction were all SL losses -- i.e. we're still exposed to a thesis
+    that has now failed twice in a row. Only that direction is blocked; the
+    opposite direction is untouched (a failed BUY thesis says nothing about
+    whether a fresh SELL setup is valid).
+    """
+    recent = get_recent_signals_for_direction(action, CONSEC_LOSS_BREAKER_THRESHOLD)
+    if len(recent) < CONSEC_LOSS_BREAKER_THRESHOLD:
+        return False
+    return all(str(r["outcome"]) == "LOSS (SL HIT)" for r in recent)
+
+
+def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_true: float, trend_15m: str) -> tuple[bool, str]:
+    """
+    V10: what it takes to release the breaker for `action`. Deliberately
+    stricter than "10 minutes passed" or "ADX still high" -- both of those
+    were true throughout the ID 86-92 loss cluster and neither stopped it.
+    Requires a genuinely fresh directional read on the HIGHER timeframe:
+      - 15M trend filter must agree with the direction being released
+      - 15M ADX must clear BREAKER_RESET_MIN_15M_ADX
+      - 15M ADX must be RISING over the last few candles (not just high)
+      - 15M +DI/-DI must show clear directional dominance, matching direction
+    """
+    wanted_trend = "BULLISH" if action == "BUY" else "BEARISH"
+    if trend_15m != wanted_trend:
+        return False, f"15M trend is {trend_15m}, not {wanted_trend}"
+    if adx_15m_true < BREAKER_RESET_MIN_15M_ADX:
+        return False, f"15M ADX {adx_15m_true:.1f} < required {BREAKER_RESET_MIN_15M_ADX:.0f}"
+
+    if df_15m is None or len(df_15m) < BREAKER_RESET_ADX_LOOKBACK + 1:
+        return False, "Insufficient 15M history to confirm ADX is rising"
+
+    adx_series = df_15m["adx"]
+    adx_now = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
+    adx_then = float(adx_series.iloc[-1 - BREAKER_RESET_ADX_LOOKBACK]) if not pd.isna(adx_series.iloc[-1 - BREAKER_RESET_ADX_LOOKBACK]) else adx_now
+    if adx_now <= adx_then:
+        return False, f"15M ADX not rising ({adx_then:.1f} -> {adx_now:.1f})"
+
+    plus_di = float(df_15m["plus_di"].iloc[-1]) if not pd.isna(df_15m["plus_di"].iloc[-1]) else 0.0
+    minus_di = float(df_15m["minus_di"].iloc[-1]) if not pd.isna(df_15m["minus_di"].iloc[-1]) else 0.0
+    di_gap = (plus_di - minus_di) if action == "BUY" else (minus_di - plus_di)
+    if di_gap < BREAKER_RESET_MIN_DI_GAP:
+        return False, f"15M DI gap only {di_gap:+.1f} (< {BREAKER_RESET_MIN_DI_GAP:.0f}) -- direction not dominant"
+
+    return True, f"15M {trend_15m}, ADX {adx_then:.1f}->{adx_now:.1f} (rising), DI gap {di_gap:+.1f} -- genuine reset"
+
+
 def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
     """
     Instrumentation only -- does NOT affect entry/veto decisions. Measures two
@@ -683,10 +935,25 @@ def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RA
 
 
 # --- FORWARD-TEST ANALYTICS HELPERS ---
-TP1_PARTIAL_CLOSE_RATIO = 0.5  # Fraction of the lot closed at TP1; rest rides to TP2/BE.
-                                # CONFIRM this matches your MT5 EA's actual split -- everything
-                                # below assumes 50/50. If your EA uses a different ratio, change
-                                # only this constant.
+# V10 (REPLACES partial-close model): your MT5 EA does not run a single
+# 0.01 lot with a 50/50 partial close. It opens TWO separate 0.01-lot
+# positions per signal -- lot 1 targets TP1 and closes there in full, lot 2
+# ("the runner") either rides to TP2 or has its SL moved to breakeven once
+# lot 1 hits TP1. If price never reaches TP1 at all, BOTH lots are still
+# live and BOTH get stopped out at the original SL. Every dollar figure
+# below now reflects that two-position reality:
+#
+#   Outcome                        | pips (2x0.01 lot)          | R
+#   --------------------------------------------------------------------
+#   LOSS (SL HIT, before TP1)      | -2 x sl_dist                | -2.0
+#   CLOSED (TP1 HIT / SL BE)       | +tp1_dist (lot2 nets 0 @BE) | +tp1_r_mult
+#   WIN (TP1 HIT) [interim/open]   | +tp1_dist (lot2 still open) | +tp1_r_mult
+#   WIN (TP2 HIT)                  | +tp1_dist +tp2_dist         | +tp1_r_mult+tp2_r_mult
+#
+# 1 pip = $0.10 on a single 0.01 lot (confirmed against your own bot's SL
+# alert messages, e.g. ID#79: 43.5 pips SL = $4.35 on one 0.01 lot). Two
+# lots at $0.10/pip each is $0.20/pip combined -- captured below by simply
+# not halving the distances the way the old TP1_PARTIAL_CLOSE_RATIO did.
 
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
@@ -701,27 +968,26 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     if sl_dist == 0: sl_dist = 2.5
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
-    r = TP1_PARTIAL_CLOSE_RATIO
 
-    # FIXED (partial-close accounting): the old formulas applied the FULL 0.01-lot
-    # rate to both the TP1 leg and the TP2 leg, which double-counts profit under a
-    # partial-close model -- only `r` of the lot actually captured tp1_dist, and
-    # only `(1-r)` of the lot captured tp2_dist. The old flat "LOSS x2" and
-    # "generic x2" multipliers are also gone: a straight SL hit (never reached
-    # TP1) stops the FULL lot at exactly 1R, not 2R -- there's no partial-close
-    # event to justify doubling it.
-    if outcome == "CLOSED (TP1 HIT / SL BE)":
-        total_pips = tp1_dist * r * 10.0
-    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        total_pips = (tp1_dist * r + tp2_dist * (1 - r)) * 10.0
+    if "LOSS" in outcome:
+        # Neither lot ever reached TP1 -- both close at SL. Two 0.01 lots,
+        # each risking sl_dist, so the combined loss is 2x a single-lot SL.
+        total_pips = -(sl_dist * 10.0) * 2.0
+    elif outcome == "CLOSED (TP1 HIT / SL BE)":
+        # Lot 1 banked tp1_dist in full. Lot 2 (the runner) was stopped at
+        # breakeven -- zero pips, not a loss and not additional profit.
+        total_pips = tp1_dist * 10.0
     elif outcome == "WIN (TP1 HIT)":
-        # Interim state: only the TP1 leg has actually closed so far.
-        total_pips = tp1_dist * r * 10.0
-    elif "LOSS" in outcome:
-        total_pips = -(sl_dist * 10.0)
+        # Interim state: lot 1 has closed at TP1; lot 2 is still open and
+        # not yet resolved, so only lot 1's pips are realized so far.
+        total_pips = tp1_dist * 10.0
+    elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        # Lot 1 closed at TP1, lot 2 (the runner) continued on to TP2 --
+        # both legs are realized profit, so both are counted in full.
+        total_pips = (tp1_dist + tp2_dist) * 10.0
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0
+        total_pips = diff * 10.0 * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
     profit_usd = total_pips * 0.10
     return total_pips, profit_usd
 
@@ -730,21 +996,22 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
     if risk_dist <= 0:
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0: risk_dist = 2.5
-    r = TP1_PARTIAL_CLOSE_RATIO
-    # FIXED: same partial-close accounting as compute_trade_pips above -- TP1/TP2
-    # legs are weighted by the actual lot fraction each one closes, and a straight
-    # loss (SL hit before TP1) is exactly -1.0R by definition (risk_dist IS 1R),
-    # not the old hardcoded -2.0.
+
+    # V10: same dual-0.01-lot model as compute_trade_pips. R is expressed
+    # per unit of SINGLE-LOT risk (risk_dist), so a full loss on both lots
+    # is exactly -2.0R, matching "every signal risks 1R per lot, two lots
+    # per signal" rather than the old hardcoded -1.0.
+    if "LOSS" in outcome:
+        return -2.0
     if outcome == "CLOSED (TP1 HIT / SL BE)":
-        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r / risk_dist
-    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        tp1_leg = (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r
-        tp2_leg = (abs(tp2 - entry) if tp2 > 0 else risk_dist * 2.5) * (1 - r)
-        return (tp1_leg + tp2_leg) / risk_dist
+        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
     if outcome == "WIN (TP1 HIT)":
-        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) * r / risk_dist
-    if "LOSS" in outcome: return -1.0
-    return ((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)
+        return (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5) / risk_dist
+    if outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
+        tp1_leg = (abs(tp1 - entry) if tp1 > 0 else risk_dist * 1.5)
+        tp2_leg = (abs(tp2 - entry) if tp2 > 0 else risk_dist * 2.5)
+        return (tp1_leg + tp2_leg) / risk_dist
+    return 2.0 * ((exit_price - entry) / risk_dist if action == "BUY" else (entry - exit_price) / risk_dist)
 
 def bucket_adx(adx: float) -> str:
     if adx < 20: return "ADX < 20 (Chop)"
@@ -979,14 +1246,26 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                # Mode is selected purely by 5M ADX -- trend and range strategies
-                # are mutually exclusive, never evaluated in the same cycle. This
-                # replaces the old "ADX < 20 = go silent" behavior with actual
-                # coverage of both regimes.
+                # Mode is selected by 5M ADX, same as V9 -- but ADX >= 20 no
+                # longer means "run trend setups" unconditionally. V10 adds a
+                # trend-QUALITY check on top: high ADX left over from an
+                # already-exhausted move (the ID 86-92 pattern) now classifies
+                # as TRANSITION and holds instead of trading. RANGE mode is
+                # untouched (< RANGE_MODE_ADX_MAX still goes straight to fade).
                 range_high = range_low = None
+                regime_metrics = {}
                 if adx_5m >= RANGE_MODE_ADX_MAX:
-                    strategy_mode = "TREND"
-                    proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+                    strategy_mode, regime_reason, regime_metrics = classify_trend_quality(df_5m)
+                    if strategy_mode == "TREND":
+                        proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+                    else:
+                        proposed_action, trigger_type = "HOLD", "TRANSITION regime -- trend quality checks failed"
+                        log_scan_event(
+                            "TRANSITION_HOLD", stage="REGIME", action="HOLD", price=curr_price,
+                            adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                            decision="HOLD", reason=regime_reason, details=regime_metrics
+                        )
+                        logging.info(f"[TRANSITION] {regime_reason} | {regime_metrics}")
                 else:
                     strategy_mode = "RANGE"
                     proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
@@ -994,6 +1273,27 @@ async def background_scanning_loop():
                 # --- VETO CHECKS ---
                 # (check_stat_veto's former ADX<20 rule is now handled by the mode
                 # selection above -- see its docstring. No separate call needed.)
+
+                # V10: same-direction consecutive-loss circuit breaker. Checked
+                # before the loss/distance cooldowns below since it's a
+                # different question ("am I still exposed to a thesis that just
+                # failed twice in this exact direction") -- it does not affect
+                # the opposite direction and does not affect TREND-mode
+                # same-direction stacking while the breaker is inactive.
+                if proposed_action in ("BUY", "SELL") and consecutive_loss_breaker_active(proposed_action):
+                    reset_ok, reset_reason = genuine_trend_reset_confirmed(
+                        proposed_action, cached_15m.get("df"), adx_15m_true, trend_15m
+                    )
+                    if not reset_ok:
+                        log_scan_event(
+                            "BREAKER_BLOCKED", stage="RISK", action=proposed_action, price=curr_price,
+                            adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                            decision="HOLD", reason=f"2-loss breaker active, reset not confirmed: {reset_reason}"
+                        )
+                        logging.info(f"[BREAKER] Blocking {proposed_action}: 2 consecutive SL losses, reset not confirmed ({reset_reason}).")
+                        proposed_action = "HOLD"
+                    else:
+                        logging.info(f"[BREAKER] {proposed_action} breaker released: {reset_reason}")
 
                 if proposed_action != "HOLD":
                     try:
@@ -1061,12 +1361,12 @@ async def background_scanning_loop():
                         tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
 
                     if ai_decision.action == proposed_action:
-                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio)
+                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio, strategy_mode, regime_metrics)
                         mode_tag = "\U0001f4ca RANGE FADE" if strategy_mode == "RANGE" else "\U0001f680 TREND"
                         msg = (f"{mode_tag} *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
                         await send_telegram_alert(client, msg)
                     else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio)
+                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio, strategy_mode, regime_metrics)
 
                 del df_5m; gc.collect()
                 await asyncio.sleep(5)
@@ -1160,9 +1460,13 @@ async def telegram_webhook(request: Request):
                     "\u2022 `/pause` - \U0001f6d1 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
                     "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
                     "\u2022 `/help` - Display Command Menu\n\n"
-                    f"\u2696\ufe0f Strategy mode is chosen automatically by 5M ADX: "
-                    f"\u2265{RANGE_MODE_ADX_MAX:.0f} runs EMA trend-following, "
-                    f"<{RANGE_MODE_ADX_MAX:.0f} runs range-fade (consolidation).\n"
+                    f"\u2696\ufe0f Strategy mode: 5M ADX \u2265{RANGE_MODE_ADX_MAX:.0f} is TREND-eligible, "
+                    f"<{RANGE_MODE_ADX_MAX:.0f} runs range-fade. TREND-eligible doesn't mean TREND, though -- "
+                    f"a trend-quality check (EMA separation/slope, cross count, ADX slope) can still "
+                    f"reclassify it as TRANSITION and hold, even with high ADX.\n"
+                    f"\U0001f6a7 2-loss breaker: 2 consecutive SL losses in the SAME direction blocks that "
+                    f"direction until a genuine new 15M trend forms (ADX\u2265{BREAKER_RESET_MIN_15M_ADX:.0f} "
+                    f"and rising, DI dominant). Opposite direction unaffected.\n"
                     f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
                     f"(any direction) before a new signal can execute."
                 )
@@ -1251,8 +1555,8 @@ async def telegram_webhook(request: Request):
                         f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
                         f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
-                        f"\u2022 Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Est. Profit (0.01 Lot): *${est_dollar:+.2f}*\n\n"
+                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
                         f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
                         f"\u2022 Total Executed: *{total_executed}*\n"
                         f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
@@ -1318,9 +1622,9 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
                         f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4a1 *Note:* $0.10/pip = full 0.01 lot. TP1/TP2 legs weighted "
-                        f"{int(TP1_PARTIAL_CLOSE_RATIO*100)}/{int((1-TP1_PARTIAL_CLOSE_RATIO)*100)} "
-                        f"per your partial-close split."
+                        f"\U0001f4a1 *Note:* Reflects your actual 2x0.01 lot execution -- "
+                        f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
+                        f"TP2 = lot1 @ TP1 + lot2 @ TP2."
                     )
                     await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
                 except Exception as e:
@@ -1394,7 +1698,7 @@ async def telegram_webhook(request: Request):
                                COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
                                COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
                                COALESCE(timestamp, created_at::text, '') AS log_time,
-                               trend_15m, entry_extension_atr
+                               trend_15m, entry_extension_atr, regime
                         FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
                     """)
                     rows = cur.fetchall()
@@ -1406,7 +1710,7 @@ async def telegram_webhook(request: Request):
                             "_Not enough closed trades yet to analyze. Check back after more signals complete._"
                         )
                     else:
-                        segments = {"Strategy": {}, "5M ADX Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
+                        segments = {"Strategy": {}, "5M ADX Regime": {}, "V10 Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
                         overall_r = []
                         for r in rows:
                             r_mult = compute_r_multiple(
@@ -1417,6 +1721,7 @@ async def telegram_webhook(request: Request):
                             adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
                             segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
                             segments["5M ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["V10 Regime"].setdefault(r["regime"] or "Pre-V10 (unlabeled)", []).append(r_mult)
                             segments["Entry Extension"].setdefault(bucket_extension(r["entry_extension_atr"]), []).append(r_mult)
                             segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
                             segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
@@ -1432,7 +1737,7 @@ async def telegram_webhook(request: Request):
                             f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
                             "",
                         ]
-                        for dim in ["Strategy", "5M ADX Regime", "Entry Extension", "Session", "15m Confluence"]:
+                        for dim in ["Strategy", "5M ADX Regime", "V10 Regime", "Entry Extension", "Session", "15m Confluence"]:
                             reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 

@@ -122,7 +122,9 @@ TRANSITION_ADX_FALLING_DROP = 1.0      # ADX dropping by at least this much over
 # during genuine strong trends -- see the V10 discussion notes).
 CONSEC_LOSS_BREAKER_THRESHOLD = 2
 BREAKER_RESET_MIN_15M_ADX = 25.0       # 15M ADX must be at least this strong to count as a genuine new trend
-BREAKER_RESET_ADX_LOOKBACK = 3         # 15M candles used to confirm ADX is RISING, not just high
+# NOTE: the reset check no longer requires 15M ADX to be RISING (too laggy --
+# see genuine_trend_reset_confirmed's docstring) -- freshness is now judged by
+# the SAME 5M classify_trend_quality() used for normal entries instead.
 BREAKER_RESET_MIN_DI_GAP = 5.0         # +DI/-DI must be separated by at least this many points on the 15M chart
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
@@ -870,16 +872,38 @@ def consecutive_loss_breaker_active(action: str) -> bool:
     return all(str(r["outcome"]) == "LOSS (SL HIT)" for r in recent)
 
 
-def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_true: float, trend_15m: str) -> tuple[bool, str]:
+def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_true: float, trend_15m: str, df_5m: pd.DataFrame = None) -> tuple[bool, str]:
     """
-    V10: what it takes to release the breaker for `action`. Deliberately
-    stricter than "10 minutes passed" or "ADX still high" -- both of those
-    were true throughout the ID 86-92 loss cluster and neither stopped it.
-    Requires a genuinely fresh directional read on the HIGHER timeframe:
-      - 15M trend filter must agree with the direction being released
-      - 15M ADX must clear BREAKER_RESET_MIN_15M_ADX
-      - 15M ADX must be RISING over the last few candles (not just high)
-      - 15M +DI/-DI must show clear directional dominance, matching direction
+    V10.2 (FIXES a real inconsistency, not just a timeframe swap): what it
+    takes to release the breaker for `action`. The ORIGINAL version required
+    15M ADX to be RISING as its freshness check -- but 15M ADX is built from
+    15-minute bars, so it takes multiple 15M candles (30-45+ min) to reflect
+    a fresh 5M impulse. Confirmed live: a genuine new impulsive move started
+    on 5M (ADX5m 21.8->31.7 rising, EMA5/9 separation widening sharply) and
+    the entry-side classifier had ALREADY tagged it Mode: TREND -- yet the
+    breaker blocked it anyway because 15M ADX was still decaying from the
+    PREVIOUS (exhausted) trend (48.4->41.8). Two parts of the same bot
+    disagreeing about the same market, with the laggier one blocking.
+
+    FIX: reuse classify_trend_quality() -- the SAME 5M check that already
+    gates every normal entry -- as the freshness signal here too, instead of
+    a second, laggier, redundant ADX-slope check invented separately for the
+    breaker. This is deliberately NOT "just check bare 5M ADX rising": a raw
+    ADX-slope blip on 5M is exactly the kind of noise the breaker exists to
+    filter out. classify_trend_quality already combines EMA separation, EMA
+    slope, cross count, AND ADX slope -- so it's both faster than 15M ADX and
+    more robust than a single noisy 5M metric.
+
+    Genuine reset now requires:
+      - 15M trend filter must agree with the direction being released (cheap
+        directional anchor -- a snapshot classification, not slope-dependent,
+        so it isn't laggy the way "15M ADX rising" was)
+      - 15M ADX clears BREAKER_RESET_MIN_15M_ADX (absolute floor only -- the
+        "and rising" requirement is gone, since that was the laggy part)
+      - 15M +DI/-DI shows clear directional dominance (also a snapshot check,
+        not slope-based)
+      - The 5M regime classifier itself says TREND, matching direction via
+        its EMA slope sign (not just "not TRANSITION")
     """
     wanted_trend = "BULLISH" if action == "BUY" else "BEARISH"
     if trend_15m != wanted_trend:
@@ -887,14 +911,8 @@ def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_tru
     if adx_15m_true < BREAKER_RESET_MIN_15M_ADX:
         return False, f"15M ADX {adx_15m_true:.1f} < required {BREAKER_RESET_MIN_15M_ADX:.0f}"
 
-    if df_15m is None or len(df_15m) < BREAKER_RESET_ADX_LOOKBACK + 1:
-        return False, "Insufficient 15M history to confirm ADX is rising"
-
-    adx_series = df_15m["adx"]
-    adx_now = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
-    adx_then = float(adx_series.iloc[-1 - BREAKER_RESET_ADX_LOOKBACK]) if not pd.isna(adx_series.iloc[-1 - BREAKER_RESET_ADX_LOOKBACK]) else adx_now
-    if adx_now <= adx_then:
-        return False, f"15M ADX not rising ({adx_then:.1f} -> {adx_now:.1f})"
+    if df_15m is None or len(df_15m) < 2:
+        return False, "Insufficient 15M history to confirm DI dominance"
 
     plus_di = float(df_15m["plus_di"].iloc[-1]) if not pd.isna(df_15m["plus_di"].iloc[-1]) else 0.0
     minus_di = float(df_15m["minus_di"].iloc[-1]) if not pd.isna(df_15m["minus_di"].iloc[-1]) else 0.0
@@ -902,7 +920,19 @@ def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_tru
     if di_gap < BREAKER_RESET_MIN_DI_GAP:
         return False, f"15M DI gap only {di_gap:+.1f} (< {BREAKER_RESET_MIN_DI_GAP:.0f}) -- direction not dominant"
 
-    return True, f"15M {trend_15m}, ADX {adx_then:.1f}->{adx_now:.1f} (rising), DI gap {di_gap:+.1f} -- genuine reset"
+    if df_5m is None or len(df_5m) < TRANSITION_SLOPE_LOOKBACK + 2:
+        return False, "Insufficient 5M history to confirm fresh trend quality"
+
+    regime, regime_reason, regime_metrics = classify_trend_quality(df_5m)
+    if regime != "TREND":
+        return False, f"5M regime is {regime}, not TREND yet ({regime_reason})"
+
+    ema_slope = regime_metrics.get("ema_slope_atr") or 0.0
+    wanted_sign = 1 if action == "BUY" else -1
+    if (ema_slope > 0) != (wanted_sign > 0):
+        return False, f"5M EMA slope {ema_slope:+.2f} ATR doesn't match {action} direction"
+
+    return True, f"15M {trend_15m} (DI gap {di_gap:+.1f}), 5M regime TREND ({regime_reason}) -- genuine reset"
 
 
 def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
@@ -1316,7 +1346,7 @@ async def background_scanning_loop():
                 # same-direction stacking while the breaker is inactive.
                 if proposed_action in ("BUY", "SELL") and consecutive_loss_breaker_active(proposed_action):
                     reset_ok, reset_reason = genuine_trend_reset_confirmed(
-                        proposed_action, cached_15m.get("df"), adx_15m_true, trend_15m
+                        proposed_action, cached_15m.get("df"), adx_15m_true, trend_15m, df_5m
                     )
                     if not reset_ok:
                         log_scan_event(

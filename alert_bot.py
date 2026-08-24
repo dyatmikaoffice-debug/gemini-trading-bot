@@ -95,37 +95,32 @@ RANGE_EDGE_ZONE_PCT = 0.20         # price must be within this fraction of the r
 RANGE_SL_BUFFER_ATR_MULT = 0.3     # stop placed this many ATR beyond the bracket edge being faded
 RANGE_MODE_MAX_15M_ADX = 25.0      # skip the fade if the 15M chart itself shows a real trend (ADX >= this)
 
-# --- V10: TREND-QUALITY / TRANSITION REGIME ---
-# High 5M ADX no longer means "trade trend setups" by itself. ADX is lagging --
-# it can stay elevated for many bars after a trend has already exhausted into
-# consolidation (this is exactly what produced the ID 86-92 loss cluster: 5M
-# ADX 60-83, 15M BULLISH throughout, six straight BUY signals, six straight
-# SL hits). TRANSITION sits between TREND and RANGE: ADX is still >= 20 (so
-# RANGE mode is not appropriate either), but the move itself has stopped
-# producing clean directional follow-through. TRANSITION -> HOLD, no new
-# trend entries, until the market re-qualifies as TREND.
-TRANSITION_SLOPE_LOOKBACK = 6          # 5M candles (~30 min) used for EMA/ADX slope checks
-TRANSITION_MIN_EMA_SEP_ATR = 0.20      # EMA5/EMA9 separation must be at least this many ATR to count as a live trend
-TRANSITION_MIN_EMA_SLOPE_ATR = 0.15    # EMA5 must have moved at least this many ATR over the lookback (flat = chop)
-TRANSITION_MAX_EMA_CROSSES = 2         # 2+ EMA5/EMA9 crosses in the lookback window = whipsaw, not trend
-TRANSITION_ADX_FALLING_DROP = 1.0      # ADX dropping by at least this much over the lookback = weakening, not fresh
+# --- TREND EXHAUSTION / CHOP GUARD v1 ---
+# Purpose: keep the original high-frequency EMA engine intact, but detect when
+# a previously strong trend is losing directional power and turning into chop.
+# Unlike V10, these are NOT hard entry filters. The guard stays dormant during
+# healthy trends and only becomes restrictive when several exhaustion signals
+# agree.
+EXHAUSTION_LOOKBACK = 12                 # 60 minutes of 5M candles
+EXHAUSTION_CROSS_LOOKBACK = 6            # 30 minutes
+EXHAUSTION_MIN_PEAK_ADX = 30.0            # only guard a trend that was meaningful
+EXHAUSTION_ADX_DROP = 5.0                 # peak ADX -> current ADX
+EXHAUSTION_DI_DROP = 8.0                  # peak directional DI gap -> current
+EXHAUSTION_EMA_CONTRACTION = 0.40         # spread contracted >=40% from recent max
+EXHAUSTION_MIN_SLOPE_ATR = 0.10           # weak current directional EMA movement
+EXHAUSTION_SCORE_CAUTION = 2              # monitor, but continue trading
+EXHAUSTION_SCORE_BLOCK_DIRECTION = 3      # block only the weakening direction
+EXHAUSTION_SCORE_CHOP = 5                 # full temporary chop guard
+EXHAUSTION_HARD_LOSS_LOCK = 3             # 3 same-direction SLs = hard directional lock
+EXHAUSTION_RESET_LOOKBACK = 3             # fresh expansion window
+EXHAUSTION_RESET_MIN_DI_GAP = 4.0
+EXHAUSTION_RESET_PRICE_LOOKBACK = 6
 
-# --- V10: SAME-DIRECTION CONSECUTIVE-LOSS CIRCUIT BREAKER ---
-# Distinct from LOSS_COOLDOWN_MINUTES (which pauses ALL new signals briefly
-# after ANY loss) and from the distance cooldown (which only asks "have we
-# moved far enough from the last entry"). Neither asks "am I still exposed to
-# the same failed thesis". This does: after two consecutive SL losses in the
-# SAME direction, that direction is blocked until a genuine new trend forms
-# in that direction -- not just time passing or ADX still being high. The
-# opposite direction is never affected, and TREND-mode same-direction
-# stacking is intentionally left untouched (it's a source of real profit
-# during genuine strong trends -- see the V10 discussion notes).
+# --- SAME-DIRECTION LOSS PROTECTION ---
+# Two losses do NOT immediately shut the strategy down. They make the
+# exhaustion guard more sensitive. Three consecutive SLs in one direction
+# hard-lock that direction until a fresh expansion is confirmed.
 CONSEC_LOSS_BREAKER_THRESHOLD = 2
-BREAKER_RESET_MIN_15M_ADX = 25.0       # 15M ADX must be at least this strong to count as a genuine new trend
-# NOTE: the reset check no longer requires 15M ADX to be RISING (too laggy --
-# see genuine_trend_reset_confirmed's docstring) -- freshness is now judged by
-# the SAME 5M classify_trend_quality() used for normal entries instead.
-BREAKER_RESET_MIN_DI_GAP = 5.0         # +DI/-DI must be separated by at least this many points on the 15M chart
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
@@ -775,71 +770,8 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
     return "HOLD", "No range edge rejection", bracket_high, bracket_low
 
 
-def classify_trend_quality(df_5m: pd.DataFrame, lookback: int = TRANSITION_SLOPE_LOOKBACK):
-    """
-    V10: called ONLY when adx_5m >= RANGE_MODE_ADX_MAX (i.e. inside what used
-    to be the pure TREND branch). Decides whether the market is genuinely
-    TRENDing or has quietly slipped into TRANSITION (high ADX left over from
-    a move that has already stopped producing follow-through -- ADX is a
-    lagging strength measure, not a "is this still happening right now"
-    measure). Returns ("TREND" | "TRANSITION", reason, metrics_dict).
-
-    Checks (any ONE failing is enough to call it TRANSITION):
-      1. EMA5/EMA9 separation, in ATR -- a live trend keeps the fast/slow
-         EMAs meaningfully apart; in chop they collapse toward each other.
-      2. EMA5 slope, in ATR over `lookback` candles -- a live trend keeps
-         pushing the fast EMA in one direction; a flat EMA5 means price is
-         oscillating around it instead of trending through it.
-      3. EMA5/EMA9 cross count over `lookback` candles -- 2+ crosses in a
-         short window is the classic whipsaw signature.
-      4. ADX slope over `lookback` candles -- a meaningfully FALLING ADX
-         (even from a high level) means the move is losing strength right
-         now, regardless of how high the absolute reading still is. This is
-         exactly what ID 86-92 showed: ADX 79->83->83->67->67->61, still
-         "high" throughout, but clearly deteriorating.
-    """
-    metrics = {"ema_sep_atr": None, "ema_slope_atr": None, "cross_count": None, "adx_slope": None}
-
-    if len(df_5m) < lookback + 2:
-        return "TREND", "Insufficient history for quality check -- defaulting to TREND", metrics
-
-    atr_val = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else None
-    if atr_val is None or atr_val <= 0:
-        return "TREND", "ATR unavailable for quality check -- defaulting to TREND", metrics
-
-    ema_fast = df_5m["ema_fast"]
-    ema_slow = df_5m["ema_slow"]
-    adx_series = df_5m["adx"]
-
-    ema_sep_atr = abs(float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])) / atr_val
-    ema_slope_atr = (float(ema_fast.iloc[-1]) - float(ema_fast.iloc[-1 - lookback])) / atr_val
-
-    recent_diff = (ema_fast - ema_slow).iloc[-(lookback + 1):]
-    cross_count = int((np.sign(recent_diff).diff().fillna(0) != 0).sum())
-
-    adx_now = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
-    adx_then = float(adx_series.iloc[-1 - lookback]) if not pd.isna(adx_series.iloc[-1 - lookback]) else adx_now
-    adx_slope = adx_now - adx_then
-
-    metrics.update({
-        "ema_sep_atr": round(ema_sep_atr, 3), "ema_slope_atr": round(ema_slope_atr, 3),
-        "cross_count": cross_count, "adx_slope": round(adx_slope, 2),
-    })
-
-    if ema_sep_atr < TRANSITION_MIN_EMA_SEP_ATR:
-        return "TRANSITION", f"EMA5/9 separation only {ema_sep_atr:.2f} ATR (< {TRANSITION_MIN_EMA_SEP_ATR}) -- lines have converged", metrics
-    if abs(ema_slope_atr) < TRANSITION_MIN_EMA_SLOPE_ATR:
-        return "TRANSITION", f"EMA5 slope only {ema_slope_atr:+.2f} ATR over {lookback} candles -- flattening, not trending", metrics
-    if cross_count >= TRANSITION_MAX_EMA_CROSSES:
-        return "TRANSITION", f"{cross_count} EMA5/9 crosses in last {lookback} candles -- whipsaw pattern", metrics
-    if adx_slope <= -TRANSITION_ADX_FALLING_DROP:
-        return "TRANSITION", f"ADX falling {adx_slope:+.1f} over {lookback} candles despite still-high level -- trend exhausting", metrics
-
-    return "TREND", f"EMA sep {ema_sep_atr:.2f} ATR, slope {ema_slope_atr:+.2f} ATR, {cross_count} crosses, ADX slope {adx_slope:+.1f} -- genuine trend", metrics
-
-
-def get_recent_signals_for_direction(action: str, limit: int = CONSEC_LOSS_BREAKER_THRESHOLD):
-    """V10: last `limit` EXECUTED, closed signals in one direction, newest first."""
+def get_recent_signals_for_direction(action: str, limit: int = 3):
+    """Return recent closed EXECUTED trades in one direction, newest first."""
     if not DATABASE_URL:
         return []
     try:
@@ -854,85 +786,173 @@ def get_recent_signals_for_direction(action: str, limit: int = CONSEC_LOSS_BREAK
         cursor.close(); conn.close()
         return rows or []
     except Exception as e:
-        logging.error(f"[V10 BREAKER ERROR] {e}")
+        logging.error(f"[EXHAUSTION DB ERROR] {e}")
         return []
 
 
-def consecutive_loss_breaker_active(action: str) -> bool:
-    """
-    V10: True if the last CONSEC_LOSS_BREAKER_THRESHOLD closed trades in this
-    SAME direction were all SL losses -- i.e. we're still exposed to a thesis
-    that has now failed twice in a row. Only that direction is blocked; the
-    opposite direction is untouched (a failed BUY thesis says nothing about
-    whether a fresh SELL setup is valid).
-    """
-    recent = get_recent_signals_for_direction(action, CONSEC_LOSS_BREAKER_THRESHOLD)
-    if len(recent) < CONSEC_LOSS_BREAKER_THRESHOLD:
-        return False
-    return all(str(r["outcome"]) == "LOSS (SL HIT)" for r in recent)
+def consecutive_loss_count(action: str, limit: int = 3) -> int:
+    recent = get_recent_signals_for_direction(action, limit)
+    count = 0
+    for row in recent:
+        if str(row.get("outcome")) == "LOSS (SL HIT)":
+            count += 1
+        else:
+            break
+    return count
 
 
-def genuine_trend_reset_confirmed(action: str, df_15m: pd.DataFrame, adx_15m_true: float, trend_15m: str, df_5m: pd.DataFrame = None) -> tuple[bool, str]:
-    """
-    V10.2 (FIXES a real inconsistency, not just a timeframe swap): what it
-    takes to release the breaker for `action`. The ORIGINAL version required
-    15M ADX to be RISING as its freshness check -- but 15M ADX is built from
-    15-minute bars, so it takes multiple 15M candles (30-45+ min) to reflect
-    a fresh 5M impulse. Confirmed live: a genuine new impulsive move started
-    on 5M (ADX5m 21.8->31.7 rising, EMA5/9 separation widening sharply) and
-    the entry-side classifier had ALREADY tagged it Mode: TREND -- yet the
-    breaker blocked it anyway because 15M ADX was still decaying from the
-    PREVIOUS (exhausted) trend (48.4->41.8). Two parts of the same bot
-    disagreeing about the same market, with the laggier one blocking.
+def _directional_di_gap(df_5m: pd.DataFrame, action: str, idx: int) -> float:
+    plus = float(df_5m["plus_di"].iloc[idx]) if not pd.isna(df_5m["plus_di"].iloc[idx]) else 0.0
+    minus = float(df_5m["minus_di"].iloc[idx]) if not pd.isna(df_5m["minus_di"].iloc[idx]) else 0.0
+    return (plus - minus) if action == "BUY" else (minus - plus)
 
-    FIX: reuse classify_trend_quality() -- the SAME 5M check that already
-    gates every normal entry -- as the freshness signal here too, instead of
-    a second, laggier, redundant ADX-slope check invented separately for the
-    breaker. This is deliberately NOT "just check bare 5M ADX rising": a raw
-    ADX-slope blip on 5M is exactly the kind of noise the breaker exists to
-    filter out. classify_trend_quality already combines EMA separation, EMA
-    slope, cross count, AND ADX slope -- so it's both faster than 15M ADX and
-    more robust than a single noisy 5M metric.
 
-    Genuine reset now requires:
-      - 15M trend filter must agree with the direction being released (cheap
-        directional anchor -- a snapshot classification, not slope-dependent,
-        so it isn't laggy the way "15M ADX rising" was)
-      - 15M ADX clears BREAKER_RESET_MIN_15M_ADX (absolute floor only -- the
-        "and rising" requirement is gone, since that was the laggy part)
-      - 15M +DI/-DI shows clear directional dominance (also a snapshot check,
-        not slope-based)
-      - The 5M regime classifier itself says TREND, matching direction via
-        its EMA slope sign (not just "not TRANSITION")
+def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame):
     """
+    Soft trend-health guard for the original EMA engine.
+
+    Score components:
+      +1 ADX dropped materially from a recent strong peak
+      +1 directional DI advantage has deteriorated materially
+      +1 EMA5/EMA9 spread contracted materially from its recent maximum
+      +1 EMA5 directional slope is currently weak
+      +1/+2 repeated EMA crosses indicate developing chop
+      +2 three consecutive same-direction SLs (hard lock)
+
+    The guard does NOT reject a signal for one weak metric. It only blocks a
+    direction when multiple pieces of evidence agree.
+    """
+    metrics = {"score": 0, "peak_adx": None, "adx_drop": 0.0, "peak_di_gap": None,
+               "di_drop": 0.0, "ema_spread_atr": None, "spread_contraction": 0.0,
+               "ema_slope_atr": 0.0, "cross_count": 0, "loss_count": 0,
+               "status": "NORMAL", "reason": ""}
+
+    if action not in ("BUY", "SELL") or len(df_5m) < EXHAUSTION_LOOKBACK + 3:
+        return False, metrics
+
+    atr_now = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 0.0
+    if atr_now <= 0:
+        return False, metrics
+
+    adx = df_5m["adx"].astype(float)
+    ema_fast = df_5m["ema_fast"].astype(float)
+    ema_slow = df_5m["ema_slow"].astype(float)
+
+    window = df_5m.iloc[-EXHAUSTION_LOOKBACK:]
+    peak_adx = float(window["adx"].max())
+    adx_now = float(adx.iloc[-1])
+    adx_drop = max(0.0, peak_adx - adx_now)
+
+    di_gaps = [max(0.0, _directional_di_gap(df_5m, action, i))
+               for i in range(len(df_5m) - EXHAUSTION_LOOKBACK, len(df_5m))]
+    peak_di_gap = max(di_gaps) if di_gaps else 0.0
+    current_di_gap = di_gaps[-1] if di_gaps else 0.0
+    di_drop = max(0.0, peak_di_gap - current_di_gap)
+
+    spreads = [abs(float(ema_fast.iloc[i]) - float(ema_slow.iloc[i])) / atr_now
+               for i in range(len(df_5m) - EXHAUSTION_LOOKBACK, len(df_5m))]
+    peak_spread = max(spreads) if spreads else 0.0
+    current_spread = spreads[-1] if spreads else 0.0
+    contraction = ((peak_spread - current_spread) / peak_spread) if peak_spread > 0 else 0.0
+
+    slope = (float(ema_fast.iloc[-1]) - float(ema_fast.iloc[-1 - EXHAUSTION_RESET_LOOKBACK])) / atr_now
+    directional_slope = slope if action == "BUY" else -slope
+
+    diff = ema_fast - ema_slow
+    recent_diff = diff.iloc[-(EXHAUSTION_CROSS_LOOKBACK + 1):]
+    cross_count = int((np.sign(recent_diff).diff().fillna(0) != 0).sum())
+
+    score = 0
+    reasons = []
+
+    # Only score ADX/DI deterioration if there really was a strong directional move.
+    strong_trend_context = peak_adx >= EXHAUSTION_MIN_PEAK_ADX and peak_di_gap >= EXHAUSTION_RESET_MIN_DI_GAP
+    if strong_trend_context and adx_drop >= EXHAUSTION_ADX_DROP:
+        score += 1
+        reasons.append(f"ADX peak {peak_adx:.1f}->now {adx_now:.1f}")
+    if strong_trend_context and di_drop >= EXHAUSTION_DI_DROP:
+        score += 1
+        reasons.append(f"DI gap contracted {peak_di_gap:.1f}->{current_di_gap:.1f}")
+    if strong_trend_context and contraction >= EXHAUSTION_EMA_CONTRACTION:
+        score += 1
+        reasons.append(f"EMA spread contracted {contraction*100:.0f}%")
+    if strong_trend_context and directional_slope < EXHAUSTION_MIN_SLOPE_ATR:
+        score += 1
+        reasons.append(f"EMA directional slope weak {directional_slope:+.2f} ATR")
+
+    if cross_count >= 3:
+        score += 2
+        reasons.append(f"{cross_count} EMA crosses")
+    elif cross_count >= 2:
+        score += 1
+        reasons.append(f"{cross_count} EMA crosses")
+
+    loss_count = consecutive_loss_count(action, EXHAUSTION_HARD_LOSS_LOCK)
+    if loss_count >= EXHAUSTION_HARD_LOSS_LOCK:
+        reasons.append(f"{loss_count} consecutive {action} SLs")
+
+    # Losses are handled by the explicit directional-lock path below so a
+    # potential fresh expansion can actually release the lock.
+    block_direction = score >= EXHAUSTION_SCORE_BLOCK_DIRECTION
+    full_chop = score >= EXHAUSTION_SCORE_CHOP
+
+    if full_chop:
+        status = "CHOP"
+    elif block_direction:
+        status = "EXHAUSTION"
+    elif score >= EXHAUSTION_SCORE_CAUTION:
+        status = "CAUTION"
+    else:
+        status = "NORMAL"
+
+    metrics.update({
+        "score": score, "peak_adx": round(peak_adx, 1), "adx_drop": round(adx_drop, 1),
+        "peak_di_gap": round(peak_di_gap, 1), "di_gap": round(current_di_gap, 1),
+        "di_drop": round(di_drop, 1), "ema_spread_atr": round(current_spread, 3),
+        "spread_contraction": round(contraction, 3), "ema_slope_atr": round(directional_slope, 3),
+        "cross_count": cross_count, "loss_count": loss_count, "status": status,
+        "reason": "; ".join(reasons) if reasons else "No meaningful exhaustion evidence"
+    })
+
+    return block_direction or full_chop, metrics
+
+
+def fresh_directional_expansion_confirmed(action: str, df_5m: pd.DataFrame, trend_15m: str) -> tuple[bool, str]:
+    """Confirm that a genuinely new directional expansion is underway."""
+    if df_5m is None or len(df_5m) < max(EXHAUSTION_RESET_PRICE_LOOKBACK + 2, 8):
+        return False, "Insufficient 5M history"
+
     wanted_trend = "BULLISH" if action == "BUY" else "BEARISH"
     if trend_15m != wanted_trend:
-        return False, f"15M trend is {trend_15m}, not {wanted_trend}"
-    if adx_15m_true < BREAKER_RESET_MIN_15M_ADX:
-        return False, f"15M ADX {adx_15m_true:.1f} < required {BREAKER_RESET_MIN_15M_ADX:.0f}"
+        return False, f"15M trend {trend_15m}, need {wanted_trend}"
 
-    if df_15m is None or len(df_15m) < 2:
-        return False, "Insufficient 15M history to confirm DI dominance"
+    atr = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 0.0
+    if atr <= 0:
+        return False, "ATR unavailable"
 
-    plus_di = float(df_15m["plus_di"].iloc[-1]) if not pd.isna(df_15m["plus_di"].iloc[-1]) else 0.0
-    minus_di = float(df_15m["minus_di"].iloc[-1]) if not pd.isna(df_15m["minus_di"].iloc[-1]) else 0.0
-    di_gap = (plus_di - minus_di) if action == "BUY" else (minus_di - plus_di)
-    if di_gap < BREAKER_RESET_MIN_DI_GAP:
-        return False, f"15M DI gap only {di_gap:+.1f} (< {BREAKER_RESET_MIN_DI_GAP:.0f}) -- direction not dominant"
+    ef = float(df_5m["ema_fast"].iloc[-1]); es = float(df_5m["ema_slow"].iloc[-1])
+    ef_prev = float(df_5m["ema_fast"].iloc[-1-EXHAUSTION_RESET_LOOKBACK])
+    es_prev = float(df_5m["ema_slow"].iloc[-1-EXHAUSTION_RESET_LOOKBACK])
+    spread_now = abs(ef-es) / atr
+    spread_prev = abs(ef_prev-es_prev) / atr
+    spread_expanding = spread_now > spread_prev
 
-    if df_5m is None or len(df_5m) < TRANSITION_SLOPE_LOOKBACK + 2:
-        return False, "Insufficient 5M history to confirm fresh trend quality"
+    gap_now = _directional_di_gap(df_5m, action, -1)
+    gap_prev = _directional_di_gap(df_5m, action, -1-EXHAUSTION_RESET_LOOKBACK)
+    di_expanding = gap_now > gap_prev and gap_now >= EXHAUSTION_RESET_MIN_DI_GAP
 
-    regime, regime_reason, regime_metrics = classify_trend_quality(df_5m)
-    if regime != "TREND":
-        return False, f"5M regime is {regime}, not TREND yet ({regime_reason})"
+    recent = df_5m.iloc[-EXHAUSTION_RESET_PRICE_LOOKBACK-1:-1]
+    last_close = float(df_5m["close"].iloc[-1])
+    if action == "BUY":
+        price_break = last_close > float(recent["high"].max())
+        ema_aligned = ef > es
+    else:
+        price_break = last_close < float(recent["low"].min())
+        ema_aligned = ef < es
 
-    ema_slope = regime_metrics.get("ema_slope_atr") or 0.0
-    wanted_sign = 1 if action == "BUY" else -1
-    if (ema_slope > 0) != (wanted_sign > 0):
-        return False, f"5M EMA slope {ema_slope:+.2f} ATR doesn't match {action} direction"
-
-    return True, f"15M {trend_15m} (DI gap {di_gap:+.1f}), 5M regime TREND ({regime_reason}) -- genuine reset"
+    if ema_aligned and spread_expanding and di_expanding and price_break:
+        return True, f"Fresh {action} expansion: EMA spread expanding, DI gap expanding, recent price extreme broken"
+    return False, f"Expansion incomplete (EMA {'ok' if ema_aligned else 'bad'}, spread {'up' if spread_expanding else 'flat/down'}, DI {'up' if di_expanding else 'flat/down'}, price {'break' if price_break else 'inside range'})"
 
 
 def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
@@ -1310,54 +1330,61 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                # Mode is selected by 5M ADX, same as V9 -- but ADX >= 20 no
-                # longer means "run trend setups" unconditionally. V10 adds a
-                # trend-QUALITY check on top: high ADX left over from an
-                # already-exhausted move (the ID 86-92 pattern) now classifies
-                # as TRANSITION and holds instead of trading. RANGE mode is
-                # untouched (< RANGE_MODE_ADX_MAX still goes straight to fade).
+                # ORIGINAL HIGH-FREQUENCY MODE SELECTION -- no V10 trend-quality
+                # gate. ADX >= 20 goes directly to the original EMA engine; ADX < 20
+                # uses the existing range engine. The new protection is applied only
+                # AFTER a concrete BUY/SELL setup has appeared.
                 range_high = range_low = None
                 regime_metrics = {}
                 if adx_5m >= RANGE_MODE_ADX_MAX:
-                    strategy_mode, regime_reason, regime_metrics = classify_trend_quality(df_5m)
-                    if strategy_mode == "TREND":
-                        proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
-                    else:
-                        proposed_action, trigger_type = "HOLD", "TRANSITION regime -- trend quality checks failed"
-                        log_scan_event(
-                            "TRANSITION_HOLD", stage="REGIME", action="HOLD", price=curr_price,
-                            adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                            decision="HOLD", reason=regime_reason, details=regime_metrics
-                        )
-                        logging.info(f"[TRANSITION] {regime_reason} | {regime_metrics}")
+                    strategy_mode = "TREND"
+                    proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
                 else:
                     strategy_mode = "RANGE"
                     proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
 
-                # --- VETO CHECKS ---
-                # (check_stat_veto's former ADX<20 rule is now handled by the mode
-                # selection above -- see its docstring. No separate call needed.)
-
-                # V10: same-direction consecutive-loss circuit breaker. Checked
-                # before the loss/distance cooldowns below since it's a
-                # different question ("am I still exposed to a thesis that just
-                # failed twice in this exact direction") -- it does not affect
-                # the opposite direction and does not affect TREND-mode
-                # same-direction stacking while the breaker is inactive.
-                if proposed_action in ("BUY", "SELL") and consecutive_loss_breaker_active(proposed_action):
-                    reset_ok, reset_reason = genuine_trend_reset_confirmed(
-                        proposed_action, cached_15m.get("df"), adx_15m_true, trend_15m, df_5m
-                    )
-                    if not reset_ok:
+                # --- TREND EXHAUSTION / CHOP GUARD ---
+                # This is deliberately AFTER signal generation so the original
+                # EMA frequency is preserved during healthy trends. It only blocks
+                # a direction when multiple signs agree that the old trend is
+                # losing power, or when three same-direction SLs have occurred.
+                if proposed_action in ("BUY", "SELL") and strategy_mode == "TREND":
+                    guard_block, guard_metrics = trend_exhaustion_guard(proposed_action, df_5m)
+                    regime_metrics["exhaustion_guard"] = guard_metrics
+                    if guard_metrics.get("score", 0) >= EXHAUSTION_SCORE_CAUTION:
                         log_scan_event(
-                            "BREAKER_BLOCKED", stage="RISK", action=proposed_action, price=curr_price,
+                            "EXHAUSTION_GUARD", stage="RISK", action=proposed_action, price=curr_price,
                             adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                            decision="HOLD", reason=f"2-loss breaker active, reset not confirmed: {reset_reason}"
+                            decision="HOLD" if guard_block else "WATCH",
+                            reason=guard_metrics.get("reason", ""), details=guard_metrics
                         )
-                        logging.info(f"[BREAKER] Blocking {proposed_action}: 2 consecutive SL losses, reset not confirmed ({reset_reason}).")
+                    if guard_block:
+                        logging.info(
+                            f"[EXHAUSTION GUARD] Blocking {proposed_action}: "
+                            f"status={guard_metrics.get('status')} score={guard_metrics.get('score')} "
+                            f"losses={guard_metrics.get('loss_count')} reason={guard_metrics.get('reason')}"
+                        )
                         proposed_action = "HOLD"
-                    else:
-                        logging.info(f"[BREAKER] {proposed_action} breaker released: {reset_reason}")
+
+                # A hard 3-loss directional lock is only released by a fresh
+                # expansion, not by time passing. The normal 10-minute cooldown
+                # remains unchanged and still applies after any SL.
+                for guarded_direction in ("BUY", "SELL"):
+                    if proposed_action != guarded_direction:
+                        continue
+                    if consecutive_loss_count(guarded_direction, EXHAUSTION_HARD_LOSS_LOCK) >= EXHAUSTION_HARD_LOSS_LOCK:
+                        reset_ok, reset_reason = fresh_directional_expansion_confirmed(
+                            guarded_direction, df_5m, trend_15m
+                        )
+                        if not reset_ok:
+                            log_scan_event(
+                                "DIRECTION_LOCKED", stage="RISK", action=guarded_direction, price=curr_price,
+                                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                                decision="HOLD", reason=f"3-loss directional lock: {reset_reason}"
+                            )
+                            proposed_action = "HOLD"
+                        else:
+                            logging.info(f"[DIRECTION LOCK] {guarded_direction} released: {reset_reason}")
 
                 if proposed_action != "HOLD":
                     try:

@@ -1,4 +1,7 @@
-# V9 AGGRESSIVE EMA 5+9 IMPULSE CATCHER: 24/7 SCANNER, RATE-LIMIT PROTECTED, MT5 HEARTBEAT
+# A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
+# BASE: alert_bot_exhaustion_guard_v1.py
+# Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
+# CONTROL_5_9 remains the only MT5-live strategy; EXPERIMENTAL_5_15 is PAPER only.
 # 
 # CHANGES FROM V8.1:
 # 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
@@ -40,12 +43,22 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 RAW_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+RAW_EXPERIMENTAL_BOT_TOKEN = os.getenv("EXPERIMENTAL_TELEGRAM_BOT_TOKEN", "").strip()
+RAW_EXPERIMENTAL_CHAT_ID = os.getenv("EXPERIMENTAL_TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
+# Experimental Telegram credentials MUST be supplied through environment variables. Do not hardcode bot tokens.
 
 CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
 TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
+EXPERIMENTAL_TELEGRAM_CHAT_ID = "".join(RAW_EXPERIMENTAL_CHAT_ID.split())
+
+CLEAN_EXPERIMENTAL_BOT_TOKEN = "".join(RAW_EXPERIMENTAL_BOT_TOKEN.split())
+if CLEAN_EXPERIMENTAL_BOT_TOKEN.startswith("bot"):
+    EXPERIMENTAL_TELEGRAM_BOT_TOKEN = CLEAN_EXPERIMENTAL_BOT_TOKEN[3:]
+else:
+    EXPERIMENTAL_TELEGRAM_BOT_TOKEN = CLEAN_EXPERIMENTAL_BOT_TOKEN
 
 if CLEAN_BOT_TOKEN.startswith("bot"):
     TELEGRAM_BOT_TOKEN = CLEAN_BOT_TOKEN[3:]
@@ -71,8 +84,15 @@ cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
+CONTROL_STRATEGY = "CONTROL_5_9"
+EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
+CONTROL_EXECUTION_MODE = "LIVE"
+EXPERIMENTAL_EXECUTION_MODE = "PAPER"
+
 EMA_TREND_FAST = 5
 EMA_TREND_SLOW = 9
+EXPERIMENTAL_EMA_FAST = 5
+EXPERIMENTAL_EMA_SLOW = 15
 
 # FIXED: the 15M confluence filter previously reused the same 5/9 EMA as the 5M
 # execution signal, so it reacted almost as fast as the thing it was supposed to
@@ -298,11 +318,16 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_slope_atr_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_slope_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_cross_count_5m INTEGER;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy TEXT;",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_mode TEXT DEFAULT 'LIVE';",
         ]
 
         for query in migrations:
             cursor.execute(query)
 
+        # Historical rows predate A/B tagging; preserve them as the existing 5/9 control.
+        cursor.execute("UPDATE signals SET strategy = %s, execution_mode = %s WHERE strategy IS NULL", (CONTROL_STRATEGY, CONTROL_EXECUTION_MODE))
+        cursor.execute("UPDATE signals SET execution_mode = %s WHERE execution_mode IS NULL", (CONTROL_EXECUTION_MODE,))
         conn.commit()
         cursor.close()
         conn.close()
@@ -427,7 +452,8 @@ def log_trade_signal(
     status: str, action: str, trigger_type: str, price: float, sl: float, tp1: float, tp2: float,
     confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str,
     trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
-    entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None
+    entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None,
+    strategy: str = CONTROL_STRATEGY, execution_mode: str = CONTROL_EXECUTION_MODE
     # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
     # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
     # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
@@ -466,14 +492,13 @@ def log_trade_signal(
                 tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m,
                 divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true,
                 entry_extension_atr, entry_climax_ratio, regime, ema_sep_atr_5m, ema_slope_atr_5m,
-                adx_slope_5m, ema_cross_count_5m, created_at
+                adx_slope_5m, ema_cross_count_5m, strategy, execution_mode, created_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, NOW()
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, NOW()
             )
             RETURNING id;
         """, (
@@ -481,7 +506,7 @@ def log_trade_signal(
             sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val,
             str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val,
             extension_val, climax_val, regime_val, ema_sep_val, ema_slope_val,
-            adx_slope_val, cross_count_val
+            adx_slope_val, cross_count_val, str(strategy), str(execution_mode)
         ))
 
         inserted_row = cursor.fetchone()
@@ -770,7 +795,7 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
     return "HOLD", "No range edge rejection", bracket_high, bracket_low
 
 
-def get_recent_signals_for_direction(action: str, limit: int = 3):
+def get_recent_signals_for_direction(action: str, limit: int = 3, strategy: str = CONTROL_STRATEGY):
     """Return recent closed EXECUTED trades in one direction, newest first."""
     if not DATABASE_URL:
         return []
@@ -778,10 +803,10 @@ def get_recent_signals_for_direction(action: str, limit: int = 3):
         conn = get_db_connection(); cursor = conn.cursor()
         cursor.execute("""
             SELECT id, outcome FROM signals
-            WHERE status = 'EXECUTED' AND action = %s
+            WHERE status = 'EXECUTED' AND action = %s AND strategy = %s
               AND outcome IS NOT NULL AND outcome NOT IN ('PENDING', 'WIN (TP1 HIT)')
             ORDER BY id DESC LIMIT %s
-        """, (str(action), int(limit)))
+        """, (str(action), str(strategy), int(limit)))
         rows = cursor.fetchall()
         cursor.close(); conn.close()
         return rows or []
@@ -790,8 +815,8 @@ def get_recent_signals_for_direction(action: str, limit: int = 3):
         return []
 
 
-def consecutive_loss_count(action: str, limit: int = 3) -> int:
-    recent = get_recent_signals_for_direction(action, limit)
+def consecutive_loss_count(action: str, limit: int = 3, strategy: str = CONTROL_STRATEGY) -> int:
+    recent = get_recent_signals_for_direction(action, limit, strategy)
     count = 0
     for row in recent:
         if str(row.get("outcome")) == "LOSS (SL HIT)":
@@ -807,7 +832,7 @@ def _directional_di_gap(df_5m: pd.DataFrame, action: str, idx: int) -> float:
     return (plus - minus) if action == "BUY" else (minus - plus)
 
 
-def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame):
+def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CONTROL_STRATEGY):
     """
     Soft trend-health guard for the original EMA engine.
 
@@ -887,7 +912,7 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame):
         score += 1
         reasons.append(f"{cross_count} EMA crosses")
 
-    loss_count = consecutive_loss_count(action, EXHAUSTION_HARD_LOSS_LOCK)
+    loss_count = consecutive_loss_count(action, EXHAUSTION_HARD_LOSS_LOCK, strategy)
     if loss_count >= EXHAUSTION_HARD_LOSS_LOCK:
         reasons.append(f"{loss_count} consecutive {action} SLs")
 
@@ -1142,14 +1167,24 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
 
 
 # --- TELEGRAM NOTIFICATIONS ---
-async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None):
-    chat_id = "".join(str(target_chat_id or TELEGRAM_CHAT_ID).split())
-    if not TELEGRAM_BOT_TOKEN or not chat_id: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_id: str = None, target_bot_token: str = None):
+    bot_token = target_bot_token or TELEGRAM_BOT_TOKEN
+    default_chat = EXPERIMENTAL_TELEGRAM_CHAT_ID if target_bot_token == EXPERIMENTAL_TELEGRAM_BOT_TOKEN else TELEGRAM_CHAT_ID
+    chat_id = "".join(str(target_chat_id or default_chat).split())
+    if not bot_token or not chat_id: return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
         res = await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         if res.status_code != 200: await client.post(url, json={"chat_id": chat_id, "text": text})
     except Exception as e: logging.error(f"[TELEGRAM EXCEPTION] {e}")
+
+
+def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.DataFrame:
+    """Apply strategy-specific 5M EMA columns without refetching market data."""
+    df_5m = df_5m.copy()
+    df_5m["ema_fast"] = df_5m["close"].ewm(span=fast, adjust=False).mean()
+    df_5m["ema_slow"] = df_5m["close"].ewm(span=slow, adjust=False).mean()
+    return df_5m
 
 
 # --- AI ANALYST EVALUATION ---
@@ -1234,7 +1269,177 @@ Respond strictly in valid JSON matching schema:
     return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure EMA structural alignment.")
 
 
-# --- BACKGROUND SCANNING LOOP (RATE-LIMIT PROTECTED) ---
+# --- SIDE-BY-SIDE BACKGROUND SCANNING LOOP ---
+async def evaluate_strategy_cycle(
+    client: httpx.AsyncClient,
+    market_df_5m: pd.DataFrame,
+    trend_15m: str,
+    adx_15m_true: float,
+    now_wib: datetime,
+    strategy: str,
+    ema_fast: int,
+    ema_slow: int,
+    execution_mode: str,
+    alert_bot_token: str,
+    alert_chat_id: str,
+):
+    """Evaluate one strategy on the SAME market snapshot used by the other strategy."""
+    global EMA_TREND_FAST, EMA_TREND_SLOW
+
+    # Strategy-specific state is represented by the same helper functions, but
+    # with the execution EMA pair swapped. No market-data/API call happens here.
+    EMA_TREND_FAST = ema_fast
+    EMA_TREND_SLOW = ema_slow
+    df_5m = set_execution_ema_columns(market_df_5m, ema_fast, ema_slow)
+
+    curr_price = float(df_5m["close"].iloc[-1])
+    curr_ema_fast = float(df_5m["ema_fast"].iloc[-1])
+    curr_ema_slow = float(df_5m["ema_slow"].iloc[-1])
+    adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
+
+    range_high = range_low = None
+    regime_metrics = {}
+
+    if adx_5m >= RANGE_MODE_ADX_MAX:
+        strategy_mode = "TREND"
+        proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+    else:
+        strategy_mode = "RANGE"
+        proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
+
+    # Same exhaustion/chop guard for both strategies, isolated by strategy history.
+    if proposed_action in ("BUY", "SELL") and strategy_mode == "TREND":
+        guard_block, guard_metrics = trend_exhaustion_guard(proposed_action, df_5m, strategy)
+        regime_metrics["exhaustion_guard"] = guard_metrics
+        if guard_metrics.get("score", 0) >= EXHAUSTION_SCORE_CAUTION:
+            log_scan_event(
+                "EXHAUSTION_GUARD", stage="RISK", action=proposed_action, price=curr_price,
+                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                decision="HOLD" if guard_block else "WATCH",
+                reason=f"{strategy}: {guard_metrics.get('reason', '')}", details=guard_metrics
+            )
+        if guard_block:
+            logging.info(f"[{strategy}] [EXHAUSTION GUARD] Blocking {proposed_action}: score={guard_metrics.get('score')} reason={guard_metrics.get('reason')}")
+            proposed_action = "HOLD"
+
+    # Isolated three-loss directional lock.
+    for guarded_direction in ("BUY", "SELL"):
+        if proposed_action != guarded_direction:
+            continue
+        if consecutive_loss_count(guarded_direction, EXHAUSTION_HARD_LOSS_LOCK, strategy) >= EXHAUSTION_HARD_LOSS_LOCK:
+            reset_ok, reset_reason = fresh_directional_expansion_confirmed(guarded_direction, df_5m, trend_15m)
+            if not reset_ok:
+                log_scan_event(
+                    "DIRECTION_LOCKED", stage="RISK", action=guarded_direction, price=curr_price,
+                    adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                    decision="HOLD", reason=f"{strategy}: 3-loss directional lock: {reset_reason}"
+                )
+                proposed_action = "HOLD"
+            else:
+                logging.info(f"[{strategy}] [DIRECTION LOCK] {guarded_direction} released: {reset_reason}")
+
+    # Strategy-isolated global loss cooldown.
+    if proposed_action != "HOLD":
+        try:
+            conn = get_db_connection(); cursor = conn.cursor()
+            cursor.execute("""
+                SELECT outcome_timestamp FROM signals
+                WHERE status = 'EXECUTED' AND outcome = 'LOSS (SL HIT)'
+                  AND strategy = %s AND outcome_timestamp IS NOT NULL AND outcome_timestamp != ''
+                ORDER BY id DESC LIMIT 1
+            """, (strategy,))
+            last_loss = cursor.fetchone(); cursor.close(); conn.close()
+            if last_loss and last_loss.get("outcome_timestamp"):
+                last_loss_time = datetime.strptime(str(last_loss["outcome_timestamp"]).replace(" WIB", ""), "%Y-%m-%d %H:%M:%S")
+                if 0 <= (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0 < LOSS_COOLDOWN_MINUTES:
+                    logging.info(f"[{strategy}] [LOSS COOLDOWN] Skipping {proposed_action}.")
+                    proposed_action = "HOLD"
+        except Exception as e:
+            logging.error(f"[{strategy}] loss cooldown check: {e}")
+
+    # Strategy-isolated distance cooldown.
+    if proposed_action != "HOLD":
+        try:
+            conn = get_db_connection(); cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome
+                FROM signals
+                WHERE status = 'EXECUTED' AND action = %s AND strategy = %s
+                ORDER BY id DESC LIMIT 1
+            """, (str(proposed_action), strategy))
+            last_trade = cursor.fetchone(); cursor.close(); conn.close()
+            if last_trade:
+                required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
+                if abs(curr_price - float(last_trade["entry_p"])) < required_distance:
+                    logging.info(f"[{strategy}] [DISTANCE COOLDOWN] Skipping {proposed_action}: Price too close.")
+                    proposed_action = "HOLD"
+        except Exception as e:
+            logging.error(f"[{strategy}] distance cooldown check: {e}")
+
+    if proposed_action == "HOLD":
+        logging.info(
+            f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | EMA{ema_fast}: ${curr_ema_fast:.2f} | "
+            f"EMA{ema_slow}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | "
+            f"15mTrend: {trend_15m} | Status: HOLD"
+        )
+        return
+
+    logging.info(f"[{strategy}] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
+    ai_decision = await analyze_signal_with_ai(
+        proposed_action, trigger_type, curr_price, df_5m, trend_15m,
+        adx_15m_true, strategy_mode, range_high, range_low
+    )
+
+    atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
+    entry_extension_atr, entry_climax_ratio = compute_entry_extension(df_5m, proposed_action)
+
+    if strategy_mode == "RANGE":
+        if proposed_action == "BUY":
+            sl_price = range_low - RANGE_SL_BUFFER_ATR_MULT * atr_5m
+            tp2_price = range_high
+            tp1_price = curr_price + (tp2_price - curr_price) * 0.5
+        else:
+            sl_price = range_high + RANGE_SL_BUFFER_ATR_MULT * atr_5m
+            tp2_price = range_low
+            tp1_price = curr_price - (curr_price - tp2_price) * 0.5
+        tp1_r_mult = abs(tp1_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
+        tp2_r_mult = abs(tp2_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
+    else:
+        risk = max(2.5, atr_5m * 1.0)
+        tp1_r_mult = 1.5
+        tp2_r_mult = 2.5
+        sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
+        tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
+        tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
+
+    if ai_decision.action == proposed_action:
+        new_id = log_trade_signal(
+            "EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
+            float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
+            trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
+            strategy_mode, regime_metrics, strategy, execution_mode
+        )
+        mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else "🚀 TREND"
+        paper_tag = " [PAPER]" if execution_mode == "PAPER" else " [LIVE]"
+        msg = (
+            f"{mode_tag} *{strategy}{paper_tag} SIGNAL #{new_id}*\n\n"
+            f"Asset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\n"
+            f"Entry Price: *${curr_price:.2f}*\n\n"
+            f"Stop Loss: *${sl_price:.2f}*\n"
+            f"TP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\n"
+            f"TP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\n"
+            f"Execution: *{execution_mode}*\nReasoning: {ai_decision.reasoning}"
+        )
+        await send_telegram_alert(client, msg, target_chat_id=alert_chat_id, target_bot_token=alert_bot_token)
+    else:
+        log_trade_signal(
+            "VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
+            float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
+            trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
+            strategy_mode, regime_metrics, strategy, execution_mode
+        )
+
+
 async def background_scanning_loop():
     global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID, cached_15m
 
@@ -1260,14 +1465,9 @@ async def background_scanning_loop():
                     await asyncio.sleep(60)
                     continue
 
-                # V10.1: weekend/market-closed gate. Skips the ENTIRE cycle
-                # (no TwelveData call, no signal evaluation, no AI call) when
-                # the forex/gold market is shut -- this is what should have
-                # stopped the Sat Aug 22 16:45-17:25 "Range Fade" signals from
-                # ever being generated on a dead, frozen weekend feed.
                 if not is_forex_market_open(now_wib):
                     if now_wib.minute % 30 == 0 and now_wib.second < 5:
-                        logging.info(f"[SLEEP STATUS] Market closed (weekend, WIB). Waiting for reopen...")
+                        logging.info("[SLEEP STATUS] Market closed (weekend, WIB). Waiting for reopen...")
                     await asyncio.sleep(120)
                     continue
 
@@ -1279,13 +1479,13 @@ async def background_scanning_loop():
                 if current_bucket == last_claimed_bucket:
                     await asyncio.sleep(20)
                     continue
-
                 last_claimed_bucket = current_bucket
 
                 if not twelve_data_budget_ok(now_wib):
                     await asyncio.sleep(20)
                     continue
 
+                # ONE shared 5M request for both strategies.
                 df_5m = await fetch_timeframe_data(client, "5min", now_wib=now_wib)
                 if df_5m is None or len(df_5m) < 6:
                     logging.warning("[SCAN LOOP] 5M fetch failed or insufficient data this window; will retry next candle.")
@@ -1294,33 +1494,23 @@ async def background_scanning_loop():
 
                 df_5m = calculate_metrics_tf(df_5m)
                 candle_time_5m = df_5m["datetime"].iloc[-1]
-
                 if last_processed_candle_time is not None and candle_time_5m == last_processed_candle_time:
                     await asyncio.sleep(5)
                     continue
-
                 last_processed_candle_time = candle_time_5m
 
                 CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
-                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Scanner cycle started (5M Execution)")
+                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Shared 5M market snapshot for A/B experiment")
 
                 curr_high = float(df_5m["high"].iloc[-1])
                 curr_low = float(df_5m["low"].iloc[-1])
                 update_open_trades(curr_high, curr_low)
 
-                curr_price = float(df_5m["close"].iloc[-1])
-                curr_ema_fast = float(df_5m["ema_fast"].iloc[-1])
-                curr_ema_slow = float(df_5m["ema_slow"].iloc[-1])
-                adx_5m = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
-
-                # REMOVED: this used to skip the 15M refresh entirely during the
-                # mid-session veto window, since trades were blocked there anyway
-                # so refreshing was "wasted." Now that the veto is gone, trades can
-                # execute during those hours too -- skipping the refresh would mean
-                # confluence checks run on stale (potentially hours-old) 15M data
-                # exactly when it matters. Refresh logic is now the same 24/7.
-                need_refresh = (cached_15m["df"] is None or cached_15m["fetched_at"] is None or (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES)))
-
+                # ONE shared 15M refresh/cache for both strategies.
+                need_refresh = (
+                    cached_15m["df"] is None or cached_15m["fetched_at"] is None or
+                    (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES))
+                )
                 if need_refresh and twelve_data_budget_ok(now_wib):
                     df_15m_raw = await fetch_timeframe_data(client, "15min", now_wib=now_wib)
                     if df_15m_raw is not None and len(df_15m_raw) >= 21:
@@ -1330,136 +1520,24 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                # ORIGINAL HIGH-FREQUENCY MODE SELECTION -- no V10 trend-quality
-                # gate. ADX >= 20 goes directly to the original EMA engine; ADX < 20
-                # uses the existing range engine. The new protection is applied only
-                # AFTER a concrete BUY/SELL setup has appeared.
-                range_high = range_low = None
-                regime_metrics = {}
-                if adx_5m >= RANGE_MODE_ADX_MAX:
-                    strategy_mode = "TREND"
-                    proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
-                else:
-                    strategy_mode = "RANGE"
-                    proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
+                # CONTROL A: existing Exhaustion Guard v1, EMA 5/9, LIVE.
+                await evaluate_strategy_cycle(
+                    client, df_5m, trend_15m, adx_15m_true, now_wib,
+                    CONTROL_STRATEGY, 5, 9, CONTROL_EXECUTION_MODE,
+                    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+                )
 
-                # --- TREND EXHAUSTION / CHOP GUARD ---
-                # This is deliberately AFTER signal generation so the original
-                # EMA frequency is preserved during healthy trends. It only blocks
-                # a direction when multiple signs agree that the old trend is
-                # losing power, or when three same-direction SLs have occurred.
-                if proposed_action in ("BUY", "SELL") and strategy_mode == "TREND":
-                    guard_block, guard_metrics = trend_exhaustion_guard(proposed_action, df_5m)
-                    regime_metrics["exhaustion_guard"] = guard_metrics
-                    if guard_metrics.get("score", 0) >= EXHAUSTION_SCORE_CAUTION:
-                        log_scan_event(
-                            "EXHAUSTION_GUARD", stage="RISK", action=proposed_action, price=curr_price,
-                            adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                            decision="HOLD" if guard_block else "WATCH",
-                            reason=guard_metrics.get("reason", ""), details=guard_metrics
-                        )
-                    if guard_block:
-                        logging.info(
-                            f"[EXHAUSTION GUARD] Blocking {proposed_action}: "
-                            f"status={guard_metrics.get('status')} score={guard_metrics.get('score')} "
-                            f"losses={guard_metrics.get('loss_count')} reason={guard_metrics.get('reason')}"
-                        )
-                        proposed_action = "HOLD"
+                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, PAPER.
+                # It receives the exact same candles and 15M confluence snapshot.
+                await evaluate_strategy_cycle(
+                    client, df_5m, trend_15m, adx_15m_true, now_wib,
+                    EXPERIMENTAL_STRATEGY, EXPERIMENTAL_EMA_FAST, EXPERIMENTAL_EMA_SLOW,
+                    EXPERIMENTAL_EXECUTION_MODE, EXPERIMENTAL_TELEGRAM_BOT_TOKEN,
+                    EXPERIMENTAL_TELEGRAM_CHAT_ID
+                )
 
-                # A hard 3-loss directional lock is only released by a fresh
-                # expansion, not by time passing. The normal 10-minute cooldown
-                # remains unchanged and still applies after any SL.
-                for guarded_direction in ("BUY", "SELL"):
-                    if proposed_action != guarded_direction:
-                        continue
-                    if consecutive_loss_count(guarded_direction, EXHAUSTION_HARD_LOSS_LOCK) >= EXHAUSTION_HARD_LOSS_LOCK:
-                        reset_ok, reset_reason = fresh_directional_expansion_confirmed(
-                            guarded_direction, df_5m, trend_15m
-                        )
-                        if not reset_ok:
-                            log_scan_event(
-                                "DIRECTION_LOCKED", stage="RISK", action=guarded_direction, price=curr_price,
-                                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                                decision="HOLD", reason=f"3-loss directional lock: {reset_reason}"
-                            )
-                            proposed_action = "HOLD"
-                        else:
-                            logging.info(f"[DIRECTION LOCK] {guarded_direction} released: {reset_reason}")
-
-                if proposed_action != "HOLD":
-                    try:
-                        conn = get_db_connection(); cursor = conn.cursor()
-                        cursor.execute("SELECT outcome_timestamp FROM signals WHERE status = 'EXECUTED' AND outcome = 'LOSS (SL HIT)' AND outcome_timestamp IS NOT NULL AND outcome_timestamp != '' ORDER BY id DESC LIMIT 1")
-                        last_loss = cursor.fetchone()
-                        cursor.close(); conn.close()
-                        if last_loss and last_loss.get("outcome_timestamp"):
-                            last_loss_time = datetime.strptime(str(last_loss["outcome_timestamp"]).replace(" WIB", ""), "%Y-%m-%d %H:%M:%S")
-                            if 0 <= (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0 < LOSS_COOLDOWN_MINUTES:
-                                logging.info(f"[LOSS COOLDOWN] Skipping {proposed_action}.")
-                                proposed_action = "HOLD"
-                    except Exception as e: logging.error(e)
-
-                if proposed_action != "HOLD":
-                    try:
-                        conn = get_db_connection(); cursor = conn.cursor()
-                        cursor.execute("SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome FROM signals WHERE status = 'EXECUTED' AND action = %s ORDER BY id DESC LIMIT 1", (str(proposed_action),))
-                        last_trade = cursor.fetchone()
-                        cursor.close(); conn.close()
-                        if last_trade:
-                            required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
-                            if abs(curr_price - float(last_trade["entry_p"])) < required_distance:
-                                logging.info(f"[DISTANCE COOLDOWN] Skipping {proposed_action}: Price too close.")
-                                proposed_action = "HOLD"
-                    except Exception as e: logging.error(e)
-
-                # --- AI EVALUATION & FINAL LOGGING ---
-                if proposed_action == "HOLD":
-                    logging.info(f"[MARKET SCAN] Price: ${curr_price:.2f} | EMA{EMA_TREND_FAST}: ${curr_ema_fast:.2f} | EMA{EMA_TREND_SLOW}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | 15mTrend: {trend_15m} | Status: HOLD | Cycle End")
-                else:
-                    logging.info(f"[MARKET SCAN] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
-                    ai_decision = await analyze_signal_with_ai(proposed_action, trigger_type, curr_price, df_5m, trend_15m, adx_15m_true, strategy_mode, range_high, range_low)
-
-                    atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
-
-                    # Instrumentation only (see compute_entry_extension docstring) --
-                    # does not affect sl_price/tp1_price/tp2_price or any veto below.
-                    entry_extension_atr, entry_climax_ratio = compute_entry_extension(df_5m, proposed_action)
-
-                    if strategy_mode == "RANGE":
-                        # Structural risk: stop sits just beyond the bracket edge
-                        # being faded, not an arbitrary ATR multiple of entry --
-                        # if the fade is wrong, the range itself is invalidated.
-                        # TP2 (full target) is the opposite edge of the bracket;
-                        # TP1 (partial) is the midpoint, matching the same
-                        # 50/50 partial-close model your MT5 EA already runs.
-                        if proposed_action == "BUY":
-                            sl_price = range_low - RANGE_SL_BUFFER_ATR_MULT * atr_5m
-                            tp2_price = range_high
-                            tp1_price = curr_price + (tp2_price - curr_price) * 0.5
-                        else:
-                            sl_price = range_high + RANGE_SL_BUFFER_ATR_MULT * atr_5m
-                            tp2_price = range_low
-                            tp1_price = curr_price - (curr_price - tp2_price) * 0.5
-                        tp1_r_mult = abs(tp1_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
-                        tp2_r_mult = abs(tp2_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
-                    else:
-                        risk = max(2.5, atr_5m * 1.0)
-                        tp1_r_mult = 1.5
-                        tp2_r_mult = 2.5 
-
-                        sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
-                        tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
-                        tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
-
-                    if ai_decision.action == proposed_action:
-                        new_id = log_trade_signal("EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio, strategy_mode, regime_metrics)
-                        mode_tag = "\U0001f4ca RANGE FADE" if strategy_mode == "RANGE" else "\U0001f680 TREND"
-                        msg = (f"{mode_tag} *SIGNAL #{new_id}*\n\nAsset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\nEntry Price: *${curr_price:.2f}*\n\nStop Loss: *${sl_price:.2f}*\nTP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\nTP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\nReasoning: {ai_decision.reasoning}")
-                        await send_telegram_alert(client, msg)
-                    else:
-                        log_trade_signal("VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price, float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning, trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio, strategy_mode, regime_metrics)
-
-                del df_5m; gc.collect()
+                del df_5m
+                gc.collect()
                 await asyncio.sleep(5)
 
             except Exception as e:
@@ -1471,6 +1549,8 @@ async def background_scanning_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if not EXPERIMENTAL_TELEGRAM_BOT_TOKEN or not EXPERIMENTAL_TELEGRAM_CHAT_ID:
+        logging.warning("[A/B] Experimental Telegram credentials are not configured; experimental signals will still be logged to DB but Telegram alerts will be skipped.")
     if TELEGRAM_BOT_TOKEN and APP_URL:
         try:
             webhook_endpoint = f"{APP_URL.rstrip('/')}/telegram-webhook"
@@ -1490,7 +1570,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": f"EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trading bot scanner active."}
+    return {"status": "ok", "message": "A/B scanner active: CONTROL EMA 5/9 LIVE + EXPERIMENTAL EMA 5/15 PAPER.", "comparison": "/ab-comparison"}
 
 
 # =====================================================================
@@ -1513,8 +1593,10 @@ async def get_latest_signal():
         cur.execute("""
             SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                    COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
-            FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 1;
-        """)
+            FROM signals
+            WHERE status = 'EXECUTED' AND strategy = %s AND execution_mode = 'LIVE'
+            ORDER BY id DESC LIMIT 1;
+        """, (CONTROL_STRATEGY,))
         row = cur.fetchone()
         cur.close()
         conn.close()
@@ -1525,6 +1607,49 @@ async def get_latest_signal():
     except Exception as e:
         logging.error(f"[MT5 BRIDGE ERROR] {e}")
         return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
+
+
+# =====================================================================
+# A/B COMPARISON ENDPOINT (READ-ONLY)
+# =====================================================================
+@app.get("/ab-comparison")
+async def ab_comparison():
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URL not set"}
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""
+            SELECT strategy, execution_mode,
+                   COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
+                   COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%') AS wins,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%') AS losses,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
+                   COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
+                   COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
+                   COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
+            FROM signals
+            WHERE strategy IN (%s, %s)
+            GROUP BY strategy, execution_mode
+            ORDER BY strategy;
+        """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
+        rows=cur.fetchall(); cur.close(); conn.close()
+        result={}
+        for r in rows:
+            executed=int(r["executed"] or 0); wins=int(r["wins"] or 0)
+            result[str(r["strategy"])] = {
+                "execution_mode": r["execution_mode"], "executed": executed,
+                "vetoed": int(r["vetoed"] or 0), "wins": wins,
+                "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
+                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
+                "net_pips": round(float(r["net_pips"] or 0), 2),
+                "net_usd": round(float(r["net_usd"] or 0), 2),
+                "avg_r": round(float(r["avg_r"] or 0), 3),
+            }
+        return {"control": result.get(CONTROL_STRATEGY, {}), "experimental": result.get(EXPERIMENTAL_STRATEGY, {})}
+    except Exception as e:
+        logging.error(f"[A/B COMPARISON ERROR] {e}")
+        return {"error": str(e)}
 
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
@@ -1542,7 +1667,7 @@ async def telegram_webhook(request: Request):
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             if raw_text in ["/help", "/start"]:
                 reply = (
-                    f"\U0001f916 *EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} BOT COMMANDS:*\n\n"
+                    f"\U0001f916 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
                     "\u2022 `/status` - \U0001f4e1 Real-Time MT5, Server & API Budget Status\n"
                     "\u2022 `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
                     "\u2022 `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"

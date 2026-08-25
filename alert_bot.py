@@ -1778,11 +1778,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     total_vetoes = cur.fetchone()["vetoes"] or 0
                     cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (CONTROL_STRATEGY,))
                     total_pending = cur.fetchone()["pending"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%')", (CONTROL_STRATEGY,))
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%%' OR outcome LIKE 'CLOSED%')", (CONTROL_STRATEGY,))
                     tp1_wins = cur.fetchone()["tp1_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%'", (CONTROL_STRATEGY,))
+                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%%'", (CONTROL_STRATEGY,))
                     tp2_wins = cur.fetchone()["tp2_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%'", (CONTROL_STRATEGY,))
+                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (CONTROL_STRATEGY,))
                     losses = cur.fetchone()["losses"] or 0
 
                     cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))

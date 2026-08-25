@@ -683,7 +683,7 @@ def compute_ema_trend(df: pd.DataFrame):
 
 TOUCH_MIN_BODY_ATR_MULT = 0.15  # FIXED: touch signals previously had zero quality filter
 
-def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
+def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
     
     curr = df_5m.iloc[-1]
@@ -723,14 +723,14 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str):
         return "SELL", "Aggressive Price Impulse (Bearish)"
         
     if bullish_cross and trend_15m == "BULLISH":
-        return "BUY", f"EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} Bullish Cross"
+        return "BUY", f"EMA {ema_fast}/{ema_slow} Bullish Cross"
     if bearish_cross and trend_15m == "BEARISH":
-        return "SELL", f"EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} Bearish Cross"
+        return "SELL", f"EMA {ema_fast}/{ema_slow} Bearish Cross"
         
     if touch_bullish and trend_15m == "BULLISH":
-        return "BUY", f"EMA {EMA_TREND_FAST} Line Touch (Bullish)"
+        return "BUY", f"EMA {ema_fast} Line Touch (Bullish)"
     if touch_bearish and trend_15m == "BEARISH":
-        return "SELL", f"EMA {EMA_TREND_FAST} Line Touch (Bearish)"
+        return "SELL", f"EMA {ema_fast} Line Touch (Bearish)"
         
     return "HOLD", "No EMA Setup"
 
@@ -1191,7 +1191,8 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 async def analyze_signal_with_ai(
     proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, 
     trend_15m: str = "NEUTRAL", adx_15m_true: float = 0.0, strategy_mode: str = "TREND",
-    range_high: float = None, range_low: float = None
+    range_high: float = None, range_low: float = None,
+    ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW
 ):
     adx_5m = float(df_5m['adx'].iloc[-1])
     plus_di_5m = float(df_5m['plus_di'].iloc[-1])
@@ -1214,7 +1215,7 @@ async def analyze_signal_with_ai(
             f"- This is a mean-reversion fade, not a breakout -- do NOT expect trend-style follow-through."
         )
     else:
-        strategy_desc = f"EMA {EMA_TREND_FAST}+{EMA_TREND_SLOW} Trend Follower (5M Execution + 15M Confluence)"
+        strategy_desc = f"EMA {ema_fast}+{ema_slow} Trend Follower (5M Execution + 15M Confluence)"
         range_text = ""
         veto_rules_text = (
             f"- VETO if 5M ADX < {RANGE_MODE_ADX_MAX:.0f} (Choppy/Ranging market, EMA setups will fail).\n"
@@ -1228,7 +1229,7 @@ Trigger ({trigger_type}): {proposed_action} at ${current_price:.2f}.
 
 TECHNICAL CONTEXT:
 1. 5M Close=${float(df_5m['close'].iloc[-1]):.2f}
-2. 5M EMAs: EMA{EMA_TREND_FAST}=${c_ema_fast:.2f}, EMA{EMA_TREND_SLOW}=${c_ema_slow:.2f}.
+2. 5M EMAs: EMA{ema_fast}=${c_ema_fast:.2f}, EMA{ema_slow}=${c_ema_slow:.2f}.
 3. 5M ADX={adx_5m:.1f}; {di_text}.
 4. 15M Trend Filter: {trend_15m}
 {range_text}
@@ -1284,12 +1285,8 @@ async def evaluate_strategy_cycle(
     alert_chat_id: str,
 ):
     """Evaluate one strategy on the SAME market snapshot used by the other strategy."""
-    global EMA_TREND_FAST, EMA_TREND_SLOW
-
-    # Strategy-specific state is represented by the same helper functions, but
-    # with the execution EMA pair swapped. No market-data/API call happens here.
-    EMA_TREND_FAST = ema_fast
-    EMA_TREND_SLOW = ema_slow
+    # Strategy-specific EMA pair is passed explicitly; no global EMA state is mutated.
+    # This keeps Control A and Experimental B fully independent.
     df_5m = set_execution_ema_columns(market_df_5m, ema_fast, ema_slow)
 
     curr_price = float(df_5m["close"].iloc[-1])
@@ -1302,7 +1299,7 @@ async def evaluate_strategy_cycle(
 
     if adx_5m >= RANGE_MODE_ADX_MAX:
         strategy_mode = "TREND"
-        proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m)
+        proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m, ema_fast, ema_slow)
     else:
         strategy_mode = "RANGE"
         proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
@@ -1387,7 +1384,7 @@ async def evaluate_strategy_cycle(
     logging.info(f"[{strategy}] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
     ai_decision = await analyze_signal_with_ai(
         proposed_action, trigger_type, curr_price, df_5m, trend_15m,
-        adx_15m_true, strategy_mode, range_high, range_low
+        adx_15m_true, strategy_mode, range_high, range_low, ema_fast, ema_slow
     )
 
     atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
@@ -1551,13 +1548,38 @@ async def lifespan(app: FastAPI):
     init_db()
     if not EXPERIMENTAL_TELEGRAM_BOT_TOKEN or not EXPERIMENTAL_TELEGRAM_CHAT_ID:
         logging.warning("[A/B] Experimental Telegram credentials are not configured; experimental signals will still be logged to DB but Telegram alerts will be skipped.")
-    if TELEGRAM_BOT_TOKEN and APP_URL:
+    if APP_URL:
         try:
-            webhook_endpoint = f"{APP_URL.rstrip('/')}/telegram-webhook"
-            set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_endpoint}"
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                res = await client.get(set_url)
-                logging.info(f"[AUTO WEBHOOK SETUP] Response: {res.text}")
+                if TELEGRAM_BOT_TOKEN:
+                    webhook_a = f"{APP_URL.rstrip('/')}/telegram-webhook"
+                    set_a = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+                    res_a = await client.post(set_a, data={"url": webhook_a})
+                    logging.info(f"[CONTROL WEBHOOK SETUP] {res_a.text}")
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
+                        {"command":"start","description":"Show Control bot commands"},
+                        {"command":"help","description":"Show Control command menu"},
+                        {"command":"status","description":"MT5/server/API status"},
+                        {"command":"stats","description":"Live EMA 5/9 performance"},
+                        {"command":"pips","description":"Pips and USD breakdown"},
+                        {"command":"logs","description":"Last 10 live trades"},
+                        {"command":"analyze","description":"Forward-test analysis"},
+                        {"command":"pause","description":"Emergency kill switch"},
+                        {"command":"resume","description":"Resume auto-trading"}
+                    ]})
+                if EXPERIMENTAL_TELEGRAM_BOT_TOKEN:
+                    webhook_b = f"{APP_URL.rstrip('/')}/telegram-webhook-b"
+                    set_b = f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setWebhook"
+                    res_b = await client.post(set_b, data={"url": webhook_b})
+                    logging.info(f"[EXPERIMENTAL WEBHOOK SETUP] {res_b.text}")
+                    await client.post(f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
+                        {"command":"start","description":"Show A/B bot commands"},
+                        {"command":"help","description":"Show A/B command menu"},
+                        {"command":"stats","description":"A/B performance dashboard"},
+                        {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
+                        {"command":"status","description":"Read-only system status"},
+                        {"command":"last","description":"Last 10 paper trades"}
+                    ]})
         except Exception as e:
             logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
 
@@ -1653,8 +1675,7 @@ async def ab_comparison():
 
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
+async def _handle_telegram_webhook(request: Request, bot_role: str):
     global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
     try:
         data = await request.json()
@@ -1664,29 +1685,44 @@ async def telegram_webhook(request: Request):
 
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
+        # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last"}
+        allowed = EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS
+        if raw_text not in allowed:
+            return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
+
+        active_token = EXPERIMENTAL_TELEGRAM_BOT_TOKEN if bot_role == "experimental" else TELEGRAM_BOT_TOKEN
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            async def send_reply(text: str):
+                await send_telegram_alert(client, text, target_chat_id=sender_chat_id, target_bot_token=active_token)
+
             if raw_text in ["/help", "/start"]:
-                reply = (
-                    f"\U0001f916 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
-                    "\u2022 `/status` - \U0001f4e1 Real-Time MT5, Server & API Budget Status\n"
-                    "\u2022 `/stats` - Comprehensive Win-Rate & Risk Analytics Dashboard\n"
-                    "\u2022 `/pips` - Detailed Gross/Net Pips & USD Profit Breakdown (0.01 Lot)\n"
-                    "\u2022 `/logs` - Detailed View of Last 10 Trades & Outcomes\n"
-                    "\u2022 `/analyze` - Forward-Test Breakdown by Strategy, ADX Regime & Session\n"
-                    "\u2022 `/pause` - \U0001f6d1 *EMERGENCY KILL SWITCH* (Stop Bot & MT5 auto-trade)\n"
-                    "\u2022 `/resume` - \U0001f7e2 Re-enable Auto-Trading Execution\n"
-                    "\u2022 `/help` - Display Command Menu\n\n"
-                    f"\u2696\ufe0f Strategy mode: 5M ADX \u2265{RANGE_MODE_ADX_MAX:.0f} is TREND-eligible, "
-                    f"<{RANGE_MODE_ADX_MAX:.0f} runs range-fade. TREND-eligible doesn't mean TREND, though -- "
-                    f"a trend-quality check (EMA separation/slope, cross count, ADX slope) can still "
-                    f"reclassify it as TRANSITION and hold, even with high ADX.\n"
-                    f"\U0001f6a7 2-loss breaker: 2 consecutive SL losses in the SAME direction blocks that "
-                    f"direction until a genuine new 15M trend forms (ADX\u2265{BREAKER_RESET_MIN_15M_ADX:.0f} "
-                    f"and rising, DI dominant). Opposite direction unaffected.\n"
-                    f"\u23f1\ufe0f Loss cooldown: {LOSS_COOLDOWN_MINUTES} min after any SL hit "
-                    f"(any direction) before a new signal can execute."
-                )
-                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                if bot_role == "experimental":
+                    reply = (
+                        "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
+                        "• `/stats` - A/B performance dashboard\n"
+                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
+                        "• `/status` - Read-only system status\n"
+                        "• `/last` - Last 10 experimental paper trades\n"
+                        "• `/help` - Display this command menu\n\n"
+                        "🔵 Strategy: *EMA 5/15 — PAPER ONLY*\n"
+                        "🛡️ This bot cannot control MT5 live trading.\n"
+                    )
+                else:
+                    reply = (
+                        f"🤖 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
+                        "• `/status` - Real-time MT5, server & API status\n"
+                        "• `/stats` - Original live/control performance dashboard\n"
+                        "• `/pips` - Gross/net pips & USD breakdown\n"
+                        "• `/logs` - Last 10 executed trades\n"
+                        "• `/analyze` - Forward-test strategy analysis\n"
+                        "• `/pause` - 🚨 Emergency kill switch\n"
+                        "• `/resume` - 🟢 Re-enable auto-trading\n"
+                        "• `/help` - Display this command menu\n\n"
+                        f"⚖️ Execution: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                    )
+                await send_reply(reply)
 
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:
@@ -1716,40 +1752,40 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
                         f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
-                        f"\u2022 Execution (5M): *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
+                        f"\u2022 Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
                         f"\u2022 Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
                     )
                 else:
                     reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
-                await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                await send_reply(reply)
 
-            elif raw_text == "/pause":
+            elif bot_role == "control" and raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
-                await send_telegram_alert(client, "\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.", target_chat_id=sender_chat_id)
+                await send_reply("\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.")
 
-            elif raw_text == "/resume":
+            elif bot_role == "control" and raw_text == "/resume":
                 SYSTEM_TRADING_ENABLED = True
-                await send_telegram_alert(client, "\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.", target_chat_id=sender_chat_id)
+                await send_reply("\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
 
-            elif raw_text == "/stats":
+            elif bot_role == "control" and raw_text == "/stats":
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED'")
+                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED' AND strategy = %s", (CONTROL_STRATEGY,))
                     total_executed = cur.fetchone()["total"] or 0
-                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED'")
+                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED' AND strategy = %s", (CONTROL_STRATEGY,))
                     total_vetoes = cur.fetchone()["vetoes"] or 0
-                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING'")
+                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (CONTROL_STRATEGY,))
                     total_pending = cur.fetchone()["pending"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%'")
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%' OR outcome LIKE 'CLOSED%')", (CONTROL_STRATEGY,))
                     tp1_wins = cur.fetchone()["tp1_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE outcome LIKE 'WIN (TP2%'")
+                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%'", (CONTROL_STRATEGY,))
                     tp2_wins = cur.fetchone()["tp2_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE outcome LIKE 'LOSS%'")
+                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%'", (CONTROL_STRATEGY,))
                     losses = cur.fetchone()["losses"] or 0
 
-                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL")
+                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))
                     closed_trades = cur.fetchall()
                     total_pips = win_pips = loss_pips = 0.0
                     total_wins_count = tp1_wins + tp2_wins
@@ -1788,10 +1824,102 @@ async def telegram_webhook(request: Request):
                         f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
                         f"\u2022 Win Rate: *{win_rate:.1f}%*"
                     )
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
-                except Exception as e: await send_telegram_alert(client, f"\u26a0\ufe0f Error querying stats: {e}", target_chat_id=sender_chat_id)
+                    await send_reply(reply)
+                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
 
-            elif raw_text == "/pips":
+            elif (bot_role == "experimental" and raw_text in ("/stats", "/compare")):
+                try:
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("""
+                        SELECT strategy, execution_mode,
+                               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
+                               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%') AS wins,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%') AS losses,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
+                               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
+                               COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
+                               COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
+                               COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
+                        FROM signals
+                        WHERE strategy IN (%s, %s)
+                        GROUP BY strategy, execution_mode
+                        ORDER BY strategy;
+                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
+                    rows = cur.fetchall()
+                    stats = {}
+                    for r in rows:
+                        executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
+                        net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
+                        total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
+                        # Profit factor from stored result_pips, falling back to R when needed.
+                        cur.execute("""
+                            SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
+                                   COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
+                            FROM signals WHERE status='EXECUTED' AND strategy=%s AND result_pips IS NOT NULL
+                        """, (r["strategy"],))
+                        pfrow = cur.fetchone(); gross_win = float(pfrow["gross_win"] or 0); gross_loss = float(pfrow["gross_loss"] or 0)
+                        pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
+                        stats[str(r["strategy"])] = {
+                            "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
+                            "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
+                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
+                            "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
+                        }
+
+                    # Calculate current maximum consecutive SL streak per strategy.
+                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
+                        cur.execute("""
+                            SELECT outcome FROM signals
+                            WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
+                            ORDER BY id ASC
+                        """, (strategy,))
+                        streak = best = 0
+                        for rr in cur.fetchall():
+                            if str(rr["outcome"]).startswith("LOSS"):
+                                streak += 1; best = max(best, streak)
+                            else:
+                                streak = 0
+                        stats.setdefault(strategy, {})["max_loss_streak"] = best
+
+                    cur.close(); conn.close()
+                    a = stats.get(CONTROL_STRATEGY, {})
+                    b = stats.get(EXPERIMENTAL_STRATEGY, {})
+                    leader = "Not enough data"
+                    if a.get("executed", 0) or b.get("executed", 0):
+                        if a.get("total_r", 0) > b.get("total_r", 0): leader = "🟢 EMA 5/9 (CONTROL)"
+                        elif b.get("total_r", 0) > a.get("total_r", 0): leader = "🔵 EMA 5/15 (EXPERIMENT)"
+                        else: leader = "🤝 Tied"
+
+                    def block(label, d):
+                        if not d:
+                            return f"{label}\nNo data yet."
+                        return (
+                            f"{label} — *{d.get('mode','UNKNOWN')}*\n"
+                            f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
+                            f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
+                            f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
+                            f"• Net Pips: *{d.get('pips',0):+.1f}*\n"
+                            f"• Net USD: *${d.get('usd',0):+.2f}*\n"
+                            f"• Total R: *{d.get('total_r',0):+.2f}R* | Avg R: *{d.get('avg_r',0):+.3f}R*\n"
+                            f"• Profit Factor: *{d.get('pf',0):.2f}*\n"
+                            f"• Max SL Streak: *{d.get('max_loss_streak',0)}*"
+                        )
+
+                    reply = (
+                        "🔬 *A/B STRATEGY DASHBOARD*\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "XAU/USD • Same market snapshot • Same risk framework\n\n"
+                        f"🟢 *CONTROL — EMA 5/9*\n{block('', a)}\n\n"
+                        f"🔵 *EXPERIMENT — EMA 5/15*\n{block('', b)}\n\n"
+                        f"🏆 *CURRENT LEADER:* {leader}\n"
+                        "\n_Compare again after more trades; early samples are not statistically meaningful._"
+                    )
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"⚠️ Error querying A/B dashboard: {e}")
+
+            elif bot_role == "control" and raw_text == "/pips":
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
@@ -1799,8 +1927,8 @@ async def telegram_webhook(request: Request):
                         SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                                COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
                                exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
-                    """)
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (CONTROL_STRATEGY,))
                     trades = cur.fetchall()
                     cur.close(); conn.close()
 
@@ -1842,11 +1970,11 @@ async def telegram_webhook(request: Request):
                         f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
                         f"TP2 = lot1 @ TP1 + lot2 @ TP2."
                     )
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                    await send_reply(reply)
                 except Exception as e:
-                    await send_telegram_alert(client, f"\u26a0\ufe0f Error calculating pips: {e}", target_chat_id=sender_chat_id)
+                    await send_reply(f"\u26a0\ufe0f Error calculating pips: {e}")
 
-            elif raw_text == "/logs":
+            elif ((bot_role == "control" and raw_text == "/logs") or (bot_role == "experimental" and raw_text == "/last")):
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
@@ -1856,8 +1984,9 @@ async def telegram_webhook(request: Request):
                                COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
                                COALESCE(outcome, 'PENDING') AS outcome_val,
                                COALESCE(timestamp, created_at::text, 'N/A') AS log_time
-                        FROM signals WHERE status = 'EXECUTED' ORDER BY id DESC LIMIT 10
-                    """)
+                        FROM signals WHERE status = 'EXECUTED' AND strategy = %s
+                        ORDER BY id DESC LIMIT 10
+                    """, (CONTROL_STRATEGY if bot_role == 'control' else EXPERIMENTAL_STRATEGY,))
                     logs = cur.fetchall()
                     cur.close(); conn.close()
 
@@ -1900,11 +2029,11 @@ async def telegram_webhook(request: Request):
                                 f"\u2022 Result: {pip_str} | Time: {date_str}\n"
                                 f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
                             )
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                    await send_reply(reply)
                 except Exception as e:
-                    await send_telegram_alert(client, f"\u26a0\ufe0f Error querying logs: {e}", target_chat_id=sender_chat_id)
+                    await send_reply(f"\u26a0\ufe0f Error querying logs: {e}")
 
-            elif raw_text == "/analyze":
+            elif bot_role == "control" and raw_text == "/analyze":
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
@@ -1915,8 +2044,8 @@ async def telegram_webhook(request: Request):
                                COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
                                COALESCE(timestamp, created_at::text, '') AS log_time,
                                trend_15m, entry_extension_atr, regime
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL
-                    """)
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (CONTROL_STRATEGY,))
                     rows = cur.fetchall()
                     cur.close(); conn.close()
 
@@ -1967,9 +2096,21 @@ async def telegram_webhook(request: Request):
                             f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
                         )
                         reply = "\n".join(reply_parts)
-                    await send_telegram_alert(client, reply, target_chat_id=sender_chat_id)
+                    await send_reply(reply)
                 except Exception as e:
-                    await send_telegram_alert(client, f"\u26a0\ufe0f Error: {e}", target_chat_id=sender_chat_id)
+                    await send_reply(f"\u26a0\ufe0f Error: {e}")
 
     except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
     return {"status": "ok"}
+
+
+# =====================================================================
+# SEPARATE TELEGRAM WEBHOOKS — CONTROL vs EXPERIMENTAL
+# =====================================================================
+@app.post("/telegram-webhook")
+async def telegram_webhook_control(request: Request):
+    return await _handle_telegram_webhook(request, "control")
+
+@app.post("/telegram-webhook-b")
+async def telegram_webhook_experimental(request: Request):
+    return await _handle_telegram_webhook(request, "experimental")

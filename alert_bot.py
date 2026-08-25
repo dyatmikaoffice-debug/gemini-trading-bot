@@ -1829,81 +1829,128 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
             elif (bot_role == "experimental" and raw_text in ("/stats", "/compare")):
                 try:
-                    conn = get_db_connection(); cur = conn.cursor()
+                    # Use an explicit RealDictCursor here so this dashboard is independent
+                    # of the connection's default cursor configuration. Also keep all
+                    # aggregate queries parameter-safe and handle missing/legacy rows.
+                    conn = get_db_connection()
+                    cur = conn.cursor(cursor_factory=RealDictCursor)
+
                     cur.execute("""
-                        SELECT strategy, execution_mode,
-                               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
-                               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%') AS wins,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%') AS losses,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
-                               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
-                               COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
-                               COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
-                               COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
+                        SELECT strategy,
+                               MAX(execution_mode) AS execution_mode,
+                               COUNT(*) FILTER (WHERE status = 'EXECUTED') AS executed,
+                               COUNT(*) FILTER (WHERE status = 'VETOED') AS vetoed,
+                               COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome LIKE 'WIN%') AS wins,
+                               COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome LIKE 'LOSS%') AS losses,
+                               COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome = 'PENDING') AS pending,
+                               COALESCE(SUM(result_pips) FILTER (WHERE status = 'EXECUTED' AND result_pips IS NOT NULL), 0) AS net_pips,
+                               COALESCE(SUM(result_usd) FILTER (WHERE status = 'EXECUTED' AND result_usd IS NOT NULL), 0) AS net_usd,
+                               COALESCE(SUM(result_r) FILTER (WHERE status = 'EXECUTED' AND result_r IS NOT NULL), 0) AS total_r,
+                               COALESCE(AVG(result_r) FILTER (WHERE status = 'EXECUTED' AND result_r IS NOT NULL), 0) AS avg_r,
+                               COALESCE(SUM(result_pips) FILTER (WHERE status = 'EXECUTED' AND result_pips > 0), 0) AS gross_win_pips,
+                               COALESCE(SUM(ABS(result_pips)) FILTER (WHERE status = 'EXECUTED' AND result_pips < 0), 0) AS gross_loss_pips
                         FROM signals
                         WHERE strategy IN (%s, %s)
-                        GROUP BY strategy, execution_mode
-                        ORDER BY strategy;
+                        GROUP BY strategy
+                        ORDER BY strategy
                     """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
-                    rows = cur.fetchall()
+
+                    rows = cur.fetchall() or []
                     stats = {}
-                    for r in rows:
-                        executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
-                        net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
-                        total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
-                        # Profit factor from stored result_pips, falling back to R when needed.
-                        cur.execute("""
-                            SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
-                                   COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
-                            FROM signals WHERE status='EXECUTED' AND strategy=%s AND result_pips IS NOT NULL
-                        """, (r["strategy"],))
-                        pfrow = cur.fetchone(); gross_win = float(pfrow["gross_win"] or 0); gross_loss = float(pfrow["gross_loss"] or 0)
+                    for raw_row in rows:
+                        # Convert to a normal dict even if a deployment somehow returns
+                        # a tuple-like row; use cursor.description as the fallback mapping.
+                        if isinstance(raw_row, dict):
+                            r = raw_row
+                        else:
+                            columns = [d[0] for d in cur.description]
+                            r = dict(zip(columns, raw_row))
+
+                        strategy = str(r.get("strategy") or "")
+                        if not strategy:
+                            continue
+
+                        executed = int(r.get("executed") or 0)
+                        wins = int(r.get("wins") or 0)
+                        losses = int(r.get("losses") or 0)
+                        net_pips = float(r.get("net_pips") or 0)
+                        net_usd = float(r.get("net_usd") or 0)
+                        total_r = float(r.get("total_r") or 0)
+                        avg_r = float(r.get("avg_r") or 0)
+                        gross_win = float(r.get("gross_win_pips") or 0)
+                        gross_loss = float(r.get("gross_loss_pips") or 0)
                         pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
-                        stats[str(r["strategy"])] = {
-                            "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
-                            "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
-                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
-                            "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
+
+                        stats[strategy] = {
+                            "mode": str(r.get("execution_mode") or ("LIVE" if strategy == CONTROL_STRATEGY else "PAPER")),
+                            "executed": executed,
+                            "vetoed": int(r.get("vetoed") or 0),
+                            "wins": wins,
+                            "losses": losses,
+                            "pending": int(r.get("pending") or 0),
+                            "wr": (wins / executed * 100) if executed else 0.0,
+                            "pips": net_pips,
+                            "usd": net_usd,
+                            "total_r": total_r,
+                            "avg_r": avg_r,
+                            "pf": pf,
+                            "max_loss_streak": 0,
                         }
 
-                    # Calculate current maximum consecutive SL streak per strategy.
+                    # Calculate maximum consecutive LOSS streak for each strategy.
                     for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
                         cur.execute("""
-                            SELECT outcome FROM signals
-                            WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
+                            SELECT outcome
+                            FROM signals
+                            WHERE status = 'EXECUTED' AND strategy = %s AND outcome IS NOT NULL
                             ORDER BY id ASC
                         """, (strategy,))
                         streak = best = 0
-                        for rr in cur.fetchall():
-                            if str(rr["outcome"]).startswith("LOSS"):
-                                streak += 1; best = max(best, streak)
+                        for raw_row in (cur.fetchall() or []):
+                            if isinstance(raw_row, dict):
+                                outcome = raw_row.get("outcome")
+                            else:
+                                columns = [d[0] for d in cur.description]
+                                outcome = dict(zip(columns, raw_row)).get("outcome")
+                            if str(outcome or "").startswith("LOSS"):
+                                streak += 1
+                                best = max(best, streak)
                             else:
                                 streak = 0
-                        stats.setdefault(strategy, {})["max_loss_streak"] = best
+                        stats.setdefault(strategy, {
+                            "mode": "LIVE" if strategy == CONTROL_STRATEGY else "PAPER",
+                            "executed": 0, "vetoed": 0, "wins": 0, "losses": 0,
+                            "pending": 0, "wr": 0.0, "pips": 0.0, "usd": 0.0,
+                            "total_r": 0.0, "avg_r": 0.0, "pf": 0.0
+                        })["max_loss_streak"] = best
 
-                    cur.close(); conn.close()
+                    cur.close()
+                    conn.close()
+
                     a = stats.get(CONTROL_STRATEGY, {})
                     b = stats.get(EXPERIMENTAL_STRATEGY, {})
                     leader = "Not enough data"
                     if a.get("executed", 0) or b.get("executed", 0):
-                        if a.get("total_r", 0) > b.get("total_r", 0): leader = "🟢 EMA 5/9 (CONTROL)"
-                        elif b.get("total_r", 0) > a.get("total_r", 0): leader = "🔵 EMA 5/15 (EXPERIMENT)"
-                        else: leader = "🤝 Tied"
+                        if a.get("total_r", 0) > b.get("total_r", 0):
+                            leader = "🟢 EMA 5/9 (CONTROL)"
+                        elif b.get("total_r", 0) > a.get("total_r", 0):
+                            leader = "🔵 EMA 5/15 (EXPERIMENT)"
+                        else:
+                            leader = "🤝 Tied"
 
                     def block(label, d):
                         if not d:
                             return f"{label}\nNo data yet."
                         return (
-                            f"{label} — *{d.get('mode','UNKNOWN')}*\n"
-                            f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
-                            f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
-                            f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
-                            f"• Net Pips: *{d.get('pips',0):+.1f}*\n"
-                            f"• Net USD: *${d.get('usd',0):+.2f}*\n"
-                            f"• Total R: *{d.get('total_r',0):+.2f}R* | Avg R: *{d.get('avg_r',0):+.3f}R*\n"
-                            f"• Profit Factor: *{d.get('pf',0):.2f}*\n"
-                            f"• Max SL Streak: *{d.get('max_loss_streak',0)}*"
+                            f"{label} — *{d.get('mode', 'UNKNOWN')}*\n"
+                            f"• Executed: *{d.get('executed', 0)}* | Vetoed: *{d.get('vetoed', 0)}*\n"
+                            f"• Wins/Losses: *{d.get('wins', 0)}/{d.get('losses', 0)}* | Pending: *{d.get('pending', 0)}*\n"
+                            f"• Win Rate: *{d.get('wr', 0):.1f}%*\n"
+                            f"• Net Pips: *{d.get('pips', 0):+.1f}*\n"
+                            f"• Net USD: *${d.get('usd', 0):+.2f}*\n"
+                            f"• Total R: *{d.get('total_r', 0):+.2f}R* | Avg R: *{d.get('avg_r', 0):+.3f}R*\n"
+                            f"• Profit Factor: *{d.get('pf', 0):.2f}*\n"
+                            f"• Max SL Streak: *{d.get('max_loss_streak', 0)}*"
                         )
 
                     reply = (
@@ -1917,7 +1964,15 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                     await send_reply(reply)
                 except Exception as e:
-                    await send_reply(f"⚠️ Error querying A/B dashboard: {e}")
+                    logging.exception("[A/B DASHBOARD ERROR]")
+                    try:
+                        if 'cur' in locals() and cur:
+                            cur.close()
+                        if 'conn' in locals() and conn:
+                            conn.close()
+                    except Exception:
+                        pass
+                    await send_reply(f"⚠️ Error querying A/B dashboard: {type(e).__name__}: {e}")
 
             elif bot_role == "control" and raw_text == "/pips":
                 try:

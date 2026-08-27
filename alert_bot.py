@@ -613,7 +613,7 @@ def update_open_trades(current_high: float, current_low: float):
                     new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
-                elif tp1 > 0 and c_high <= tp1:
+                elif tp1 > 0 and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
@@ -1872,7 +1872,7 @@ async def ab_comparison():
             SELECT strategy, execution_mode,
                    COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
                    COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
                    COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
                    COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
                    COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
@@ -1891,7 +1891,7 @@ async def ab_comparison():
                 "execution_mode": r["execution_mode"], "executed": executed,
                 "vetoed": int(r["vetoed"] or 0), "wins": wins,
                 "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
-                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
+                "win_rate_pct": round((wins/(wins+int(r["losses"] or 0))*100) if (wins+int(r["losses"] or 0)) else 0, 2),
                 "net_pips": round(float(r["net_pips"] or 0), 2),
                 "net_usd": round(float(r["net_usd"] or 0), 2),
                 "avg_r": round(float(r["avg_r"] or 0), 3),
@@ -2047,7 +2047,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
             elif bot_role == "breakout" and raw_text == "/stats":
                 try:
                     conn=get_db_connection(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
+                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
                     s=cur.fetchone(); cur.close(); conn.close(); ex=int(s['executed'] or 0); wins=int(s['wins'] or 0); losses=int(s['losses'] or 0)
                     await send_reply(f"📦 *RANGE BREAKOUT PERFORMANCE*\n━━━━━━━━━━━━━━━━━━━━\nExecuted: *{ex}* | Cancelled: *{int(s['cancelled'] or 0)}*\nWins/Losses: *{wins}/{losses}*\nWin Rate: *{(wins/ex*100 if ex else 0):.1f}%*\nTotal R: *{float(s['total_r'] or 0):+.2f}R* | Avg R: *{float(s['avg_r'] or 0):+.3f}R*\nMode: *{BREAKOUT_EXECUTION_MODE}*\nFake-breakout filter: *ACTIVE*")
                 except Exception as e: await send_reply(f"⚠️ Error querying breakout stats: {e}")
@@ -2126,7 +2126,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         SELECT strategy, execution_mode,
                                COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
                                COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
                                COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
                                COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
                                COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
@@ -2155,7 +2155,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         stats[str(r["strategy"])] = {
                             "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
                             "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
-                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
+                            "wr": (wins / (wins + losses) * 100) if (wins + losses) else 0.0, "pips": net_pips,
                             "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
                         }
 

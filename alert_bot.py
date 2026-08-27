@@ -1224,79 +1224,153 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 # =====================================================================
 # STRATEGY C: RANGE BREAKOUT + OCO PENDING ORDERS (PAPER)
 # =====================================================================
-def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
-    """Qualify a compact 5M range and reject obvious fake-breakout candles."""
-    if len(df_5m) < BREAKOUT_RANGE_LOOKBACK_5M + 1:
-        return None
-    bracket = df_5m.iloc[-(BREAKOUT_RANGE_LOOKBACK_5M + 1):-1]
-    curr = df_5m.iloc[-1]
-    atr = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 0.0
-    adx5 = float(df_5m["adx"].iloc[-1]) if not pd.isna(df_5m["adx"].iloc[-1]) else 0.0
-    if atr <= 0:
-        return None
-    high = float(bracket["high"].max()); low = float(bracket["low"].min())
-    width = high - low; width_atr = width / atr
-    base = {"valid": False, "high": high, "low": low, "width": width, "atr": atr, "adx5": adx5, "fake": None}
-    if adx5 >= BREAKOUT_MAX_5M_ADX:
-        base["reason"] = f"5M ADX {adx5:.1f} >= {BREAKOUT_MAX_5M_ADX:.0f}"; return base
-    if adx_15m_true >= BREAKOUT_MAX_15M_ADX:
-        base["reason"] = f"15M ADX {adx_15m_true:.1f} >= {BREAKOUT_MAX_15M_ADX:.0f}"; return base
-    if width_atr < BREAKOUT_MIN_WIDTH_ATR:
-        base["reason"] = f"Range too tight ({width_atr:.2f} ATR)"; return base
-    if width_atr > BREAKOUT_MAX_WIDTH_ATR:
-        base["reason"] = f"Range too wide ({width_atr:.2f} ATR)"; return base
+# =====================================================================
+# STRATEGY C: RANGE BREAKOUT + SUPPORT / RESISTANCE (PAPER)
+# =====================================================================
+# C deliberately does NOT use EMA. The existing 10-candle consolidation
+# breakout remains the foundation; S/R is added as a structural layer for
+# breakout quality, stop placement and targets.
+BREAKOUT_SR_LOOKBACK_5M = 72
+BREAKOUT_SR_PIVOT_LEFT = 2
+BREAKOUT_SR_PIVOT_RIGHT = 2
+BREAKOUT_SR_CLUSTER_ATR = 0.25
+BREAKOUT_SR_MIN_TOUCHES = 2
+BREAKOUT_SR_MIN_STRENGTH = 2.0
+BREAKOUT_SR_MAX_TP_ATR = 8.0
+BREAKOUT_SR_MIN_ROOM_R = 1.10
+BREAKOUT_SR_SL_BUFFER_ATR = 0.20
+BREAKOUT_SR_TP_BUFFER_ATR = 0.10
 
-    c_close = float(curr["close"]); c_high = float(curr["high"]); c_low = float(curr["low"])
-    # If the current candle has already cleared a boundary, there is no point
-    # arming a new stop after the fact. The scanner must have armed the OCO
-    # before the breakout candle; otherwise we wait for the next range.
-    if c_high >= high or c_low <= low:
-        fake_up = c_high > high and c_close <= high and (c_high-high) >= BREAKOUT_FAKE_WICK_ATR*atr
-        fake_down = c_low < low and c_close >= low and (low-c_low) >= BREAKOUT_FAKE_WICK_ATR*atr
-        if fake_up or fake_down:
-            pass
-        else:
-            base["reason"] = "Range boundary already breached on current candle -- no late pending order"
-            return base
-    fake_up = c_high > high and c_close <= high and (c_high-high) >= BREAKOUT_FAKE_WICK_ATR*atr
-    fake_down = c_low < low and c_close >= low and (low-c_low) >= BREAKOUT_FAKE_WICK_ATR*atr
-    if fake_up and fake_down:
-        base["fake"] = "AMBIGUOUS_TWO_SIDED_BREAK"
-    elif fake_up:
-        base["fake"] = "UPSIDE_FAKE_BREAKOUT"
-    elif fake_down:
-        base["fake"] = "DOWNSIDE_FAKE_BREAKOUT"
-    base.update({"valid": True, "reason": "Qualified consolidation range"})
-    return base
+
+def _sr_pivot_levels(df_5m: pd.DataFrame, atr: float):
+    """Find clustered confirmed 5M swing-high resistance and swing-low support."""
+    if atr <= 0 or len(df_5m) < 15:
+        return [], []
+    look = df_5m.iloc[-BREAKOUT_SR_LOOKBACK_5M:].copy()
+    left = BREAKOUT_SR_PIVOT_LEFT; right = BREAKOUT_SR_PIVOT_RIGHT
+    highs, lows = [], []
+    h = look['high'].astype(float).to_numpy(); l = look['low'].astype(float).to_numpy()
+    for i in range(left, len(look) - right):
+        if h[i] >= max(h[i-left:i+right+1]): highs.append((h[i], i))
+        if l[i] <= min(l[i-left:i+right+1]): lows.append((l[i], i))
+    tol = max(0.05, BREAKOUT_SR_CLUSTER_ATR * atr)
+
+    def cluster(points):
+        zones = []
+        for price, idx in sorted(points, key=lambda x: x[0]):
+            hit = next((z for z in zones if abs(price-z['price']) <= tol), None)
+            if hit is None:
+                zones.append({'price': price, 'touches': 1, 'last_idx': idx, 'prices': [price]})
+            else:
+                hit['prices'].append(price); hit['touches'] += 1
+                hit['last_idx'] = max(hit['last_idx'], idx)
+                hit['price'] = sum(hit['prices']) / len(hit['prices'])
+        n=len(look)
+        for z in zones:
+            recency = 1.0 if n-1-z['last_idx'] <= 18 else 0.0
+            z['strength'] = float(z['touches']) + recency
+        return zones
+    return cluster(lows), cluster(highs)
+
+
+def _sr_nearest(levels, price, direction, max_distance):
+    candidates=[]
+    for z in levels:
+        d=z['price']-price if direction=='above' else price-z['price']
+        if d>0 and d<=max_distance and z['strength']>=BREAKOUT_SR_MIN_STRENGTH:
+            candidates.append((d,z))
+    return min(candidates,key=lambda x:x[0])[1] if candidates else None
+
+
+def _sr_best_below(levels, price):
+    c=[z for z in levels if z['price']<price and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    return max(c,key=lambda z:z['price']) if c else None
+
+
+def _sr_best_above(levels, price):
+    c=[z for z in levels if z['price']>price and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    return min(c,key=lambda z:z['price']) if c else None
+
+
+def _breakout_sr_plan(df_5m: pd.DataFrame, range_high: float, range_low: float, atr: float, action: str):
+    """Create structural SL/TP from historical S/R around the breakout range."""
+    supports,resistances=_sr_pivot_levels(df_5m,atr)
+    buffer=max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
+    entry=range_high+buffer if action=='BUY' else range_low-buffer
+    max_dist=BREAKOUT_SR_MAX_TP_ATR*atr
+    if action=='BUY':
+        support=_sr_best_below(supports,entry)
+        stop_anchor=min(range_low,support['price']) if support else range_low
+        sl=stop_anchor-BREAKOUT_SR_SL_BUFFER_ATR*atr
+        risk=max(entry-sl,0.01)
+        target=_sr_nearest(resistances,entry,'above',max_dist)
+        if target is not None and target['price'] <= range_high+0.15*atr: target=None
+        if target is None: return None,{'reason':'NO_USABLE_RESISTANCE_ABOVE_BREAKOUT'}
+        tp1=target['price']-BREAKOUT_SR_TP_BUFFER_ATR*atr
+        room_r=(tp1-entry)/risk
+        if room_r<BREAKOUT_SR_MIN_ROOM_R:
+            return None,{'reason':f'NEXT_RESISTANCE_TOO_CLOSE_{room_r:.2f}R','sr':target['price']}
+        upper=[z for z in resistances if z['price']>target['price'] and z['price']-entry<=max_dist and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+        second=min(upper,key=lambda z:z['price']) if upper else None
+        tp2=second['price']-BREAKOUT_SR_TP_BUFFER_ATR*atr if second else tp1
+        return (sl,tp1,tp2),{'support':stop_anchor,'resistance':target['price'],'resistance_strength':target['strength'],'room_r':room_r}
+    resistance=_sr_best_above(resistances,entry)
+    stop_anchor=max(range_high,resistance['price']) if resistance else range_high
+    sl=stop_anchor+BREAKOUT_SR_SL_BUFFER_ATR*atr
+    risk=max(sl-entry,0.01)
+    target=_sr_nearest(supports,entry,'below',max_dist)
+    if target is not None and target['price'] >= range_low-0.15*atr: target=None
+    if target is None: return None,{'reason':'NO_USABLE_SUPPORT_BELOW_BREAKOUT'}
+    tp1=target['price']+BREAKOUT_SR_TP_BUFFER_ATR*atr
+    room_r=(entry-tp1)/risk
+    if room_r<BREAKOUT_SR_MIN_ROOM_R:
+        return None,{'reason':f'NEXT_SUPPORT_TOO_CLOSE_{room_r:.2f}R','sr':target['price']}
+    lower=[z for z in supports if z['price']<target['price'] and entry-z['price']<=max_dist and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    second=max(lower,key=lambda z:z['price']) if lower else None
+    tp2=second['price']+BREAKOUT_SR_TP_BUFFER_ATR*atr if second else tp1
+    return (sl,tp1,tp2),{'resistance':stop_anchor,'support':target['price'],'support_strength':target['strength'],'room_r':room_r}
+
+
+def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
+    """Existing compact range detector plus the existing fake-break filter."""
+    if len(df_5m)<BREAKOUT_RANGE_LOOKBACK_5M+1: return None
+    bracket=df_5m.iloc[-(BREAKOUT_RANGE_LOOKBACK_5M+1):-1]; curr=df_5m.iloc[-1]
+    atr=float(df_5m['atr'].iloc[-1]) if not pd.isna(df_5m['atr'].iloc[-1]) else 0.0
+    adx5=float(df_5m['adx'].iloc[-1]) if not pd.isna(df_5m['adx'].iloc[-1]) else 0.0
+    if atr<=0: return None
+    high=float(bracket['high'].max()); low=float(bracket['low'].min()); width=high-low; width_atr=width/atr
+    base={'valid':False,'high':high,'low':low,'width':width,'atr':atr,'adx5':adx5,'fake':None}
+    if adx5>=BREAKOUT_MAX_5M_ADX: base['reason']=f'5M ADX {adx5:.1f} >= {BREAKOUT_MAX_5M_ADX:.0f}'; return base
+    if adx_15m_true>=BREAKOUT_MAX_15M_ADX: base['reason']=f'15M ADX {adx_15m_true:.1f} >= {BREAKOUT_MAX_15M_ADX:.0f}'; return base
+    if width_atr<BREAKOUT_MIN_WIDTH_ATR: base['reason']=f'Range too tight ({width_atr:.2f} ATR)'; return base
+    if width_atr>BREAKOUT_MAX_WIDTH_ATR: base['reason']=f'Range too wide ({width_atr:.2f} ATR)'; return base
+    c_close=float(curr['close']); c_high=float(curr['high']); c_low=float(curr['low'])
+    fake_up=c_high>high and c_close<=high and (c_high-high)>=BREAKOUT_FAKE_WICK_ATR*atr
+    fake_down=c_low<low and c_close>=low and (low-c_low)>=BREAKOUT_FAKE_WICK_ATR*atr
+    if c_high>=high or c_low<=low:
+        if not(fake_up or fake_down):
+            base['reason']='Range boundary already breached on current candle -- no late pending order'; return base
+    if fake_up and fake_down: base['fake']='AMBIGUOUS_TWO_SIDED_BREAK'
+    elif fake_up: base['fake']='UPSIDE_FAKE_BREAKOUT'
+    elif fake_down: base['fake']='DOWNSIDE_FAKE_BREAKOUT'
+    base.update({'valid':True,'reason':'Qualified consolidation range'}); return base
 
 
 def _breakout_pending_from_db():
-    if not DATABASE_URL:
-        return None
+    if not DATABASE_URL: return None
     try:
         conn=get_db_connection(); cur=conn.cursor()
-        cur.execute("""
-            SELECT id, action, entry_price, sl_price, tp1_price, tp2_price,
-                   pending_buy_price, pending_sell_price, created_at
-            FROM signals
-            WHERE strategy=%s AND status='PENDING_ORDER' AND order_state='OCO_ACTIVE'
-            ORDER BY id DESC LIMIT 1
-        """, (BREAKOUT_STRATEGY,))
+        cur.execute("""SELECT id, action, entry_price, sl_price, tp1_price, tp2_price, pending_buy_price, pending_sell_price, created_at FROM signals WHERE strategy=%s AND status='PENDING_ORDER' AND order_state='OCO_ACTIVE' ORDER BY id DESC LIMIT 1""",(BREAKOUT_STRATEGY,))
         row=cur.fetchone(); cur.close(); conn.close(); return row
-    except Exception as e:
-        logging.error(f"[BREAKOUT DB ERROR] pending load: {e}"); return None
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] pending load: {e}'); return None
 
 
-def _set_breakout_pending_state(row_id: int, state: str, outcome: str):
+def _set_breakout_pending_state(row_id:int,state:str,outcome:str):
     if not DATABASE_URL: return
     conn=None; cur=None
     try:
-        conn=get_db_connection(); cur=conn.cursor()
-        cur.execute("UPDATE signals SET status='CANCELLED', order_state=%s, outcome=%s, outcome_timestamp=%s WHERE id=%s",
-                    (state, outcome, (datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'), int(row_id)))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"[BREAKOUT DB ERROR] state update: {e}")
+        conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE signals SET status='CANCELLED', order_state=%s, outcome=%s, outcome_timestamp=%s WHERE id=%s",(state,outcome,(datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'),int(row_id))); conn.commit()
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] state update: {e}')
     finally:
         try:
             if cur: cur.close()
@@ -1304,37 +1378,20 @@ def _set_breakout_pending_state(row_id: int, state: str, outcome: str):
         except Exception: pass
 
 
-def create_breakout_pending_signal(range_high: float, range_low: float, atr: float, reasoning: str):
-    buffer=max(BREAKOUT_MIN_BUFFER_PRICE, BREAKOUT_BUFFER_ATR*atr)
-    buy_stop=range_high+buffer; sell_stop=range_low-buffer
-    buy_sl=range_low-BREAKOUT_SL_BUFFER_ATR*atr
-    sell_sl=range_high+BREAKOUT_SL_BUFFER_ATR*atr
-    buy_risk=max(buy_stop-buy_sl,0.01); sell_risk=max(sell_sl-sell_stop,0.01)
-    buy_tp1=buy_stop+buy_risk*BREAKOUT_TP1_R; buy_tp2=buy_stop+buy_risk*BREAKOUT_TP2_R
-    sell_tp1=sell_stop-sell_risk*BREAKOUT_TP1_R; sell_tp2=sell_stop-sell_risk*BREAKOUT_TP2_R
-    if not DATABASE_URL: return None, buy_stop, sell_stop
+def create_breakout_pending_signal(df_5m:pd.DataFrame,range_high:float,range_low:float,atr:float,reasoning:str):
+    buffer=max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr); buy_stop=range_high+buffer; sell_stop=range_low-buffer
+    buy_plan,buy_sr=_breakout_sr_plan(df_5m,range_high,range_low,atr,'BUY'); sell_plan,sell_sr=_breakout_sr_plan(df_5m,range_high,range_low,atr,'SELL')
+    buy_sl=buy_plan[0] if buy_plan else range_low-BREAKOUT_SL_BUFFER_ATR*atr; sell_sl=sell_plan[0] if sell_plan else range_high+BREAKOUT_SL_BUFFER_ATR*atr
+    buy_tp1=buy_plan[1] if buy_plan else buy_stop+max(buy_stop-buy_sl,.01)*BREAKOUT_TP1_R; buy_tp2=buy_plan[2] if buy_plan else buy_tp1
+    sell_tp1=sell_plan[1] if sell_plan else sell_stop-max(sell_sl-sell_stop,.01)*BREAKOUT_TP1_R; sell_tp2=sell_plan[2] if sell_plan else sell_tp1
+    if buy_plan is None: buy_stop=0.0
+    if sell_plan is None: sell_stop=0.0
+    if buy_plan is None and sell_plan is None: return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    if not DATABASE_URL: return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
     conn=None; cur=None
     try:
-        conn=get_db_connection(); cur=conn.cursor()
-        cur.execute("""
-            INSERT INTO signals (
-                timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,tp1,tp1_price,tp2,tp2_price,
-                confidence,adx_15m,stoch_rsi_15m,divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,
-                adx_15m_true,regime,strategy,execution_mode,created_at,pending_buy_price,pending_sell_price,order_state
-            ) VALUES (
-                %s,'PENDING_ORDER','OCO','BUY_STOP/SELL_STOP',%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,0,'None',%s,'PENDING_ORDER','',%s,%s,%s,%s,%s,NOW(),%s,%s,'OCO_ACTIVE'
-            ) RETURNING id
-        """, (
-            (datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'),
-            buy_stop,buy_stop,buy_sl,buy_sl,buy_tp1,buy_tp1,buy_tp2,buy_tp2,
-            0.80,0.0,reasoning,'NEUTRAL',0.0,'RANGE_BREAKOUT',BREAKOUT_STRATEGY,
-            BREAKOUT_EXECUTION_MODE,buy_stop,sell_stop
-        ))
-        row=cur.fetchone(); sid=int(row['id']) if row else None
-        conn.commit(); return sid,buy_stop,sell_stop
-    except Exception as e:
-        logging.error(f"[BREAKOUT DB ERROR] create pending: {e}"); return None,buy_stop,sell_stop
+        conn=get_db_connection(); cur=conn.cursor(); cur.execute("""INSERT INTO signals (timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,tp1,tp1_price,tp2,tp2_price,confidence,adx_15m,stoch_rsi_15m,divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,adx_15m_true,regime,strategy,execution_mode,created_at,pending_buy_price,pending_sell_price,order_state) VALUES (%s,'PENDING_ORDER','OCO','BUY_STOP/SELL_STOP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'None',%s,'PENDING_ORDER','',%s,%s,%s,%s,%s,NOW(),%s,%s,'OCO_ACTIVE') RETURNING id""",((datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'),buy_stop,buy_stop,buy_sl,buy_sl,buy_tp1,buy_tp1,buy_tp2,buy_tp2,.80,0.0,reasoning,'NEUTRAL',0.0,'RANGE_BREAKOUT',BREAKOUT_STRATEGY,BREAKOUT_EXECUTION_MODE,buy_stop,sell_stop)); row=cur.fetchone(); sid=int(row['id']) if row else None; conn.commit(); return sid,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] create pending: {e}'); return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
     finally:
         try:
             if cur: cur.close()
@@ -1342,60 +1399,43 @@ def create_breakout_pending_signal(range_high: float, range_low: float, atr: flo
         except Exception: pass
 
 
-async def evaluate_breakout_strategy(client: httpx.AsyncClient, market_df_5m: pd.DataFrame, adx_15m_true: float, now_wib: datetime):
+async def evaluate_breakout_strategy(client:httpx.AsyncClient,market_df_5m:pd.DataFrame,adx_15m_true:float,now_wib:datetime):
     global BREAKOUT_ACTIVE_PENDING
-    setup=detect_range_breakout_setup(market_df_5m, adx_15m_true)
-    curr=market_df_5m.iloc[-1]; c_high=float(curr['high']); c_low=float(curr['low'])
-
+    setup=detect_range_breakout_setup(market_df_5m,adx_15m_true); curr=market_df_5m.iloc[-1]; c_high=float(curr['high']); c_low=float(curr['low'])
     if BREAKOUT_ACTIVE_PENDING is None:
         dbrow=_breakout_pending_from_db()
         if dbrow: BREAKOUT_ACTIVE_PENDING=dict(dbrow)
-
     if BREAKOUT_ACTIVE_PENDING:
-        p=BREAKOUT_ACTIVE_PENDING
-        buy_stop=float(p.get('pending_buy_price') or 0); sell_stop=float(p.get('pending_sell_price') or 0)
-        created=p.get('created_at'); age_min=0.0
+        p=BREAKOUT_ACTIVE_PENDING; buy_stop=float(p.get('pending_buy_price') or 0); sell_stop=float(p.get('pending_sell_price') or 0); created=p.get('created_at'); age_min=0.0
         if created:
             try: age_min=max(0.0,(datetime.now(timezone.utc).replace(tzinfo=None)-created).total_seconds()/60.0)
             except Exception: pass
         buy_hit=buy_stop>0 and c_high>=buy_stop; sell_hit=sell_stop>0 and c_low<=sell_stop
         if buy_hit and sell_hit:
-            _set_breakout_pending_state(p['id'],'CANCELLED','CANCELLED_TWO_SIDED')
-            await send_telegram_alert(client,f"⚠️ *{BREAKOUT_STRATEGY}* #{p['id']} cancelled — both stops touched in one 5M candle; order sequence is ambiguous.",BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
-            BREAKOUT_ACTIVE_PENDING=None; return
+            _set_breakout_pending_state(p['id'],'CANCELLED','CANCELLED_TWO_SIDED'); await send_telegram_alert(client,f'⚠️ *{BREAKOUT_STRATEGY}* #{p["id"]} cancelled — both stops touched in one 5M candle; order sequence is ambiguous.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
         if buy_hit or sell_hit:
-            action='BUY' if buy_hit else 'SELL'; entry=buy_stop if buy_hit else sell_stop
-            atr=float(market_df_5m['atr'].iloc[-1]) if not pd.isna(market_df_5m['atr'].iloc[-1]) else 3.0
-            # Recover the original bracket from the stored stop levels and current ATR.
-            range_high=buy_stop-max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
-            range_low=sell_stop+max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
-            if action=='BUY':
-                sl=range_low-BREAKOUT_SL_BUFFER_ATR*atr; risk=max(entry-sl,0.01); tp1=entry+risk*BREAKOUT_TP1_R; tp2=entry+risk*BREAKOUT_TP2_R
-            else:
-                sl=range_high+BREAKOUT_SL_BUFFER_ATR*atr; risk=max(sl-entry,0.01); tp1=entry-risk*BREAKOUT_TP1_R; tp2=entry-risk*BREAKOUT_TP2_R
+            action='BUY' if buy_hit else 'SELL'; entry=buy_stop if buy_hit else sell_stop; atr=float(market_df_5m['atr'].iloc[-1]) if not pd.isna(market_df_5m['atr'].iloc[-1]) else 3.0
+            range_high=buy_stop-max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr); range_low=sell_stop+max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
+            plan,sr=_breakout_sr_plan(market_df_5m,range_high,range_low,atr,action)
+            if plan is None:
+                _set_breakout_pending_state(p['id'],'CANCELLED','CANCELLED_SR_GEOMETRY'); await send_telegram_alert(client,f'⚠️ *{BREAKOUT_STRATEGY}* #{p["id"]} cancelled — S/R geometry no longer provides sufficient room.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
+            sl,tp1,tp2=plan
             if DATABASE_URL:
-                conn=get_db_connection(); cur=conn.cursor()
-                cur.execute("""UPDATE signals SET status='EXECUTED',action=%s,price=%s,entry_price=%s,sl=%s,sl_price=%s,tp1=%s,tp1_price=%s,tp2=%s,tp2_price=%s,outcome='PENDING',order_state='TRIGGERED' WHERE id=%s""",(action,entry,entry,sl,sl,tp1,tp1,tp2,tp2,int(p['id'])))
-                conn.commit(); cur.close(); conn.close()
-            await send_telegram_alert(client,f"🚀 *{BREAKOUT_STRATEGY} — {action} TRIGGERED* #{p['id']}\n\nEntry: *${entry:.2f}*\nSL: *${sl:.2f}*\nTP1: *${tp1:.2f}* ({BREAKOUT_TP1_R:.1f}R)\nTP2: *${tp2:.2f}* ({BREAKOUT_TP2_R:.1f}R)\n\nOCO: *{('SELL STOP cancelled' if action=='BUY' else 'BUY STOP cancelled')}*",BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
+                conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE signals SET status='EXECUTED',action=%s,price=%s,entry_price=%s,sl=%s,sl_price=%s,tp1=%s,tp1_price=%s,tp2=%s,tp2_price=%s,outcome='PENDING',order_state='TRIGGERED' WHERE id=%s",(action,entry,entry,sl,sl,tp1,tp1,tp2,tp2,int(p['id']))); conn.commit(); cur.close(); conn.close()
+            sr_label=f'Next R: ${sr.get("resistance",0):.2f}' if action=='BUY' else f'Next S: ${sr.get("support",0):.2f}'
+            await send_telegram_alert(client,f'🚀 *{BREAKOUT_STRATEGY} — {action} TRIGGERED* #{p["id"]}\n\nEntry: *${entry:.2f}*\nSL: *${sl:.2f}*\nTP1: *${tp1:.2f}*\nTP2: *${tp2:.2f}*\n{sr_label}\nS/R room: *{sr.get("room_r",0):.2f}R*\n\nOCO: *{("SELL STOP cancelled" if action=="BUY" else "BUY STOP cancelled")}*',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
             BREAKOUT_ACTIVE_PENDING=None; return
         if age_min>=BREAKOUT_MAX_PENDING_MINUTES:
-            _set_breakout_pending_state(p['id'],'EXPIRED','CANCELLED_EXPIRED')
-            await send_telegram_alert(client,f"⏱️ *{BREAKOUT_STRATEGY}* #{p['id']} expired after {BREAKOUT_MAX_PENDING_MINUTES} minutes — both stops cancelled.",BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
-            BREAKOUT_ACTIVE_PENDING=None; return
+            _set_breakout_pending_state(p['id'],'EXPIRED','CANCELLED_EXPIRED'); await send_telegram_alert(client,f'⏱️ *{BREAKOUT_STRATEGY}* #{p["id"]} expired after {BREAKOUT_MAX_PENDING_MINUTES} minutes — both stops cancelled.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
         return
-
     if not setup or not setup.get('valid'): return
     if setup.get('fake'):
-        log_scan_event('BREAKOUT_FAKE_BREAK',stage='BREAKOUT',decision='REJECT',reason=setup['fake'],details=setup)
-        await send_telegram_alert(client,f"🧨 *FAKE BREAKOUT DETECTED*\n{setup['fake']}\nRange: ${setup['low']:.2f} — ${setup['high']:.2f}\nNo OCO orders armed.",BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
-        return
-    sid,buy_stop,sell_stop=create_breakout_pending_signal(setup['high'],setup['low'],setup['atr'],"Qualified consolidation range; OCO stops armed only after fake-breakout filter passed.")
+        await send_telegram_alert(client,f'🧨 *FAKE BREAKOUT DETECTED*\n{setup["fake"]}\nRange: ${setup["low"]:.2f} — ${setup["high"]:.2f}\nNo OCO orders armed.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); return
+    sid,buy_stop,sell_stop,sr_info=create_breakout_pending_signal(market_df_5m,setup['high'],setup['low'],setup['atr'],'Qualified consolidation range + structural Support/Resistance clearance; OCO stops armed only after S/R geometry passed.')
     if sid is None: return
     BREAKOUT_ACTIVE_PENDING={'id':sid,'pending_buy_price':buy_stop,'pending_sell_price':sell_stop,'created_at':datetime.now(timezone.utc).replace(tzinfo=None)}
-    await send_telegram_alert(client,(f"📦 *{BREAKOUT_STRATEGY} — OCO ARMED #{sid}*\n\nRange: *${setup['low']:.2f} — ${setup['high']:.2f}* ({setup['width']/setup['atr']:.2f} ATR)\n"
-        f"🟢 BUY STOP: *${buy_stop:.2f}*\n🔴 SELL STOP: *${sell_stop:.2f}*\n\n5M ADX: *{setup['adx5']:.1f}* | 15M ADX: *{adx_15m_true:.1f}*\n"
-        f"Fake-breakout filter: *PASSED*\n⏱️ Expiry: *{BREAKOUT_MAX_PENDING_MINUTES} min*\n⚖️ First trigger cancels the opposite side.\n\n⚠️ PAPER ONLY"),BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
+    buy_desc='valid' if sr_info['buy'].get('resistance') else sr_info['buy'].get('reason','blocked'); sell_desc='valid' if sr_info['sell'].get('support') else sr_info['sell'].get('reason','blocked')
+    await send_telegram_alert(client,f'📦 *{BREAKOUT_STRATEGY} — OCO ARMED #{sid}*\n\nRange: *${setup["low"]:.2f} — ${setup["high"]:.2f}* ({setup["width"]/setup["atr"]:.2f} ATR)\n🟢 BUY STOP: *${buy_stop:.2f}* | S/R: *{buy_desc}*\n🔴 SELL STOP: *${sell_stop:.2f}* | S/R: *{sell_desc}*\n\n5M ADX: *{setup["adx5"]:.1f}* | 15M ADX: *{adx_15m_true:.1f}*\nFake-breakout filter: *PASSED*\nS/R structural filter: *ACTIVE*\n⏱️ Expiry: *{BREAKOUT_MAX_PENDING_MINUTES} min*\n⚖️ First trigger cancels the opposite side.\n\n⚠️ PAPER ONLY',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
@@ -1789,8 +1829,8 @@ async def lifespan(app: FastAPI):
                     await client.post(f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
                         {"command":"start","description":"Show A/B bot commands"},
                         {"command":"help","description":"Show A/B command menu"},
-                        {"command":"stats","description":"3-strategy performance dashboard"},
-                        {"command":"compare","description":"Compare all 3 strategies"},
+                        {"command":"stats","description":"A/B performance dashboard"},
+                        {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
                         {"command":"status","description":"Read-only system status"},
                         {"command":"last","description":"Last 10 paper trades"}
                     ]})
@@ -1872,7 +1912,7 @@ async def ab_comparison():
             SELECT strategy, execution_mode,
                    COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
                    COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
                    COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
                    COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
                    COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
@@ -1891,7 +1931,7 @@ async def ab_comparison():
                 "execution_mode": r["execution_mode"], "executed": executed,
                 "vetoed": int(r["vetoed"] or 0), "wins": wins,
                 "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
-                "win_rate_pct": round((wins/(wins+int(r["losses"] or 0))*100) if (wins+int(r["losses"] or 0)) else 0, 2),
+                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
                 "net_pips": round(float(r["net_pips"] or 0), 2),
                 "net_usd": round(float(r["net_usd"] or 0), 2),
                 "avg_r": round(float(r["avg_r"] or 0), 3),
@@ -1942,8 +1982,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 elif bot_role == "experimental":
                     reply = (
                         "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
-                        "• `/stats` - 3-strategy performance dashboard\n"
-                        "• `/compare` - EMA 5/9 vs EMA 5/15 vs Range Breakout\n"
+                        "• `/stats` - A/B performance dashboard\n"
+                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
                         "• `/status` - Read-only system status\n"
                         "• `/last` - Last 10 experimental paper trades\n"
                         "• `/help` - Display this command menu\n\n"
@@ -2047,7 +2087,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
             elif bot_role == "breakout" and raw_text == "/stats":
                 try:
                     conn=get_db_connection(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
+                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
                     s=cur.fetchone(); cur.close(); conn.close(); ex=int(s['executed'] or 0); wins=int(s['wins'] or 0); losses=int(s['losses'] or 0)
                     await send_reply(f"📦 *RANGE BREAKOUT PERFORMANCE*\n━━━━━━━━━━━━━━━━━━━━\nExecuted: *{ex}* | Cancelled: *{int(s['cancelled'] or 0)}*\nWins/Losses: *{wins}/{losses}*\nWin Rate: *{(wins/ex*100 if ex else 0):.1f}%*\nTotal R: *{float(s['total_r'] or 0):+.2f}R* | Avg R: *{float(s['avg_r'] or 0):+.3f}R*\nMode: *{BREAKOUT_EXECUTION_MODE}*\nFake-breakout filter: *ACTIVE*")
                 except Exception as e: await send_reply(f"⚠️ Error querying breakout stats: {e}")
@@ -2126,7 +2166,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         SELECT strategy, execution_mode,
                                COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
                                COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
                                COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
                                COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
                                COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
@@ -2134,10 +2174,10 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
                                COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
                         FROM signals
-                        WHERE strategy IN (%s, %s, %s)
+                        WHERE strategy IN (%s, %s)
                         GROUP BY strategy, execution_mode
                         ORDER BY strategy;
-                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
+                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
                     rows = cur.fetchall()
                     stats = {}
                     for r in rows:
@@ -2155,12 +2195,12 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         stats[str(r["strategy"])] = {
                             "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
                             "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
-                            "wr": (wins / (wins + losses) * 100) if (wins + losses) else 0.0, "pips": net_pips,
+                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
                             "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
                         }
 
                     # Calculate current maximum consecutive SL streak per strategy.
-                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY):
+                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
                         cur.execute("""
                             SELECT outcome FROM signals
                             WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
@@ -2177,16 +2217,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.close(); conn.close()
                     a = stats.get(CONTROL_STRATEGY, {})
                     b = stats.get(EXPERIMENTAL_STRATEGY, {})
-                    c = stats.get(BREAKOUT_STRATEGY, {})
                     leader = "Not enough data"
-                    candidates = [
-                        ("🟢 EMA 5/9 (CONTROL)", a),
-                        ("🔵 EMA 5/15 (EXPERIMENT)", b),
-                        ("🟣 RANGE BREAKOUT (STRATEGY C)", c),
-                    ]
-                    candidates = [(label, d) for label, d in candidates if d.get("executed", 0) > 0]
-                    if candidates:
-                        leader = max(candidates, key=lambda x: x[1].get("total_r", 0))[0]
+                    if a.get("executed", 0) or b.get("executed", 0):
+                        if a.get("total_r", 0) > b.get("total_r", 0): leader = "🟢 EMA 5/9 (CONTROL)"
+                        elif b.get("total_r", 0) > a.get("total_r", 0): leader = "🔵 EMA 5/15 (EXPERIMENT)"
+                        else: leader = "🤝 Tied"
 
                     def block(label, d):
                         if not d:
@@ -2204,12 +2239,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         )
 
                     reply = (
-                        "🔬 *3-WAY STRATEGY DASHBOARD*\n"
+                        "🔬 *A/B STRATEGY DASHBOARD*\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         "XAU/USD • Same market snapshot • Same risk framework\n\n"
                         f"🟢 *CONTROL — EMA 5/9*\n{block('', a)}\n\n"
                         f"🔵 *EXPERIMENT — EMA 5/15*\n{block('', b)}\n\n"
-                        f"🟣 *STRATEGY C — RANGE BREAKOUT OCO*\n{block('', c)}\n\n"
                         f"🏆 *CURRENT LEADER:* {leader}\n"
                         "\n_Compare again after more trades; early samples are not statistically meaningful._"
                     )

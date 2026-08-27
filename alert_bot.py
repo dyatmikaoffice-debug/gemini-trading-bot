@@ -613,7 +613,7 @@ def update_open_trades(current_high: float, current_low: float):
                     new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
-                elif tp1 > 0 and c_low <= tp1:
+                elif tp1 > 0 and c_high >= tp1:
                     new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
@@ -1789,8 +1789,8 @@ async def lifespan(app: FastAPI):
                     await client.post(f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
                         {"command":"start","description":"Show A/B bot commands"},
                         {"command":"help","description":"Show A/B command menu"},
-                        {"command":"stats","description":"A/B performance dashboard"},
-                        {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
+                        {"command":"stats","description":"3-strategy performance dashboard"},
+                        {"command":"compare","description":"Compare all 3 strategies"},
                         {"command":"status","description":"Read-only system status"},
                         {"command":"last","description":"Last 10 paper trades"}
                     ]})
@@ -1942,8 +1942,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 elif bot_role == "experimental":
                     reply = (
                         "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
-                        "• `/stats` - A/B performance dashboard\n"
-                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
+                        "• `/stats` - 3-strategy performance dashboard\n"
+                        "• `/compare` - EMA 5/9 vs EMA 5/15 vs Range Breakout\n"
                         "• `/status` - Read-only system status\n"
                         "• `/last` - Last 10 experimental paper trades\n"
                         "• `/help` - Display this command menu\n\n"
@@ -2134,10 +2134,10 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
                                COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
                         FROM signals
-                        WHERE strategy IN (%s, %s)
+                        WHERE strategy IN (%s, %s, %s)
                         GROUP BY strategy, execution_mode
                         ORDER BY strategy;
-                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
+                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
                     rows = cur.fetchall()
                     stats = {}
                     for r in rows:
@@ -2160,7 +2160,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         }
 
                     # Calculate current maximum consecutive SL streak per strategy.
-                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
+                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY):
                         cur.execute("""
                             SELECT outcome FROM signals
                             WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
@@ -2177,11 +2177,16 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.close(); conn.close()
                     a = stats.get(CONTROL_STRATEGY, {})
                     b = stats.get(EXPERIMENTAL_STRATEGY, {})
+                    c = stats.get(BREAKOUT_STRATEGY, {})
                     leader = "Not enough data"
-                    if a.get("executed", 0) or b.get("executed", 0):
-                        if a.get("total_r", 0) > b.get("total_r", 0): leader = "🟢 EMA 5/9 (CONTROL)"
-                        elif b.get("total_r", 0) > a.get("total_r", 0): leader = "🔵 EMA 5/15 (EXPERIMENT)"
-                        else: leader = "🤝 Tied"
+                    candidates = [
+                        ("🟢 EMA 5/9 (CONTROL)", a),
+                        ("🔵 EMA 5/15 (EXPERIMENT)", b),
+                        ("🟣 RANGE BREAKOUT (STRATEGY C)", c),
+                    ]
+                    candidates = [(label, d) for label, d in candidates if d.get("executed", 0) > 0]
+                    if candidates:
+                        leader = max(candidates, key=lambda x: x[1].get("total_r", 0))[0]
 
                     def block(label, d):
                         if not d:
@@ -2199,11 +2204,12 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         )
 
                     reply = (
-                        "🔬 *A/B STRATEGY DASHBOARD*\n"
+                        "🔬 *3-WAY STRATEGY DASHBOARD*\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         "XAU/USD • Same market snapshot • Same risk framework\n\n"
                         f"🟢 *CONTROL — EMA 5/9*\n{block('', a)}\n\n"
                         f"🔵 *EXPERIMENT — EMA 5/15*\n{block('', b)}\n\n"
+                        f"🟣 *STRATEGY C — RANGE BREAKOUT OCO*\n{block('', c)}\n\n"
                         f"🏆 *CURRENT LEADER:* {leader}\n"
                         "\n_Compare again after more trades; early samples are not statistically meaningful._"
                     )

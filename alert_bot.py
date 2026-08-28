@@ -625,7 +625,7 @@ def update_open_trades(current_high: float, current_low: float):
                     new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
-                elif tp1 > 0 and c_low <= tp1:
+                elif tp1 > 0 and c_high <= tp1:
                     new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
@@ -1923,4 +1923,603 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get(
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "A/B/C scanner active: EMA 5/9 LIVE + EMA 5/15 PAPER + RANGE BREAKOUT OCO PAPER.", "comparison": "/ab-comparison"}
+
+
+# =====================================================================
+# MT5 COPIER BRIDGE API ENDPOINT
+# =====================================================================
+@app.get("/get-latest-signal")
+async def get_latest_signal():
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
+
+    LAST_MT5_PING_TIME = datetime.now(timezone.utc) + timedelta(hours=7)
+
+    if not SYSTEM_TRADING_ENABLED:
+        return {"signal": None, "trading_enabled": False, "status": "PAUSED"}
+    if not DATABASE_URL:
+        return {"signal": None, "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
+            FROM signals
+            WHERE status = 'EXECUTED' AND strategy = %s AND execution_mode = 'LIVE'
+            ORDER BY id DESC LIMIT 1;
+        """, (CONTROL_STRATEGY,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            return {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "trading_enabled": True}
+        return {"signal": None, "trading_enabled": True}
+    except Exception as e:
+        logging.error(f"[MT5 BRIDGE ERROR] {e}")
+        return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
+
+
+# =====================================================================
+# A/B COMPARISON ENDPOINT (READ-ONLY)
+# =====================================================================
+@app.get("/ab-comparison")
+async def ab_comparison():
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URL not set"}
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""
+            SELECT strategy, execution_mode,
+                   COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
+                   COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
+                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
+                   COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
+                   COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
+                   COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
+            FROM signals
+            WHERE strategy IN (%s, %s, %s)
+            GROUP BY strategy, execution_mode
+            ORDER BY strategy;
+        """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
+        rows=cur.fetchall(); cur.close(); conn.close()
+        result={}
+        for r in rows:
+            executed=int(r["executed"] or 0); wins=int(r["wins"] or 0)
+            result[str(r["strategy"])] = {
+                "execution_mode": r["execution_mode"], "executed": executed,
+                "vetoed": int(r["vetoed"] or 0), "wins": wins,
+                "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
+                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
+                "net_pips": round(float(r["net_pips"] or 0), 2),
+                "net_usd": round(float(r["net_usd"] or 0), 2),
+                "avg_r": round(float(r["avg_r"] or 0), 3),
+            }
+        return {"control": result.get(CONTROL_STRATEGY, {}), "experimental": result.get(EXPERIMENTAL_STRATEGY, {}), "breakout": result.get(BREAKOUT_STRATEGY, {})}
+    except Exception as e:
+        logging.error(f"[A/B COMPARISON ERROR] {e}")
+        return {"error": str(e)}
+
+
+# --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
+async def _handle_telegram_webhook(request: Request, bot_role: str):
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, BREAKOUT_ACTIVE_PENDING
+    try:
+        data = await request.json()
+        message = data.get("message", {})
+        raw_text = message.get("text", "").strip().lower()
+        sender_chat_id = str(message.get("chat", {}).get("id", ""))
+
+        if not sender_chat_id or not raw_text: return {"status": "ignored"}
+
+        # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/range", "/last", "/cancel"}
+        allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
+        if raw_text not in allowed:
+            return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
+
+        active_token = BREAKOUT_TELEGRAM_BOT_TOKEN if bot_role == "breakout" else (EXPERIMENTAL_TELEGRAM_BOT_TOKEN if bot_role == "experimental" else TELEGRAM_BOT_TOKEN)
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            async def send_reply(text: str):
+                await send_telegram_alert(client, text, target_chat_id=sender_chat_id, target_bot_token=active_token)
+
+            if raw_text in ["/help", "/start"]:
+                if bot_role == "breakout":
+                    reply = (
+                        "📦 *RANGE BREAKOUT OCO BOT COMMANDS:*\n\n"
+                        "• `/status` - Current OCO/range status\n"
+                        "• `/stats` - Breakout performance\n"
+                        "• `/range` - Current range analysis\n"
+                        "• `/last` - Last breakout events\n"
+                        "• `/cancel` - Cancel active paper OCO\n"
+                        "• `/help` - Display this menu\n\n"
+                        "🟣 Strategy: *Range Breakout + Fake-Breakout Filter*\n"
+                        "⚠️ PAPER ONLY — no live MT5 pending order is placed by Strategy C yet."
+                    )
+                elif bot_role == "experimental":
+                    reply = (
+                        "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
+                        "• `/stats` - A/B performance dashboard\n"
+                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
+                        "• `/status` - Read-only system status\n"
+                        "• `/last` - Last 10 experimental paper trades\n"
+                        "• `/help` - Display this command menu\n\n"
+                        "🔵 Strategy: *EMA 5/15 — PAPER ONLY*\n"
+                        "🛡️ This bot cannot control MT5 live trading.\n"
+                    )
+                else:
+                    reply = (
+                        f"🤖 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
+                        "• `/status` - Real-time MT5, server & API status\n"
+                        "• `/stats` - Original live/control performance dashboard\n"
+                        "• `/pips` - Gross/net pips & USD breakdown\n"
+                        "• `/logs` - Last 10 executed trades\n"
+                        "• `/analyze` - Forward-test strategy analysis\n"
+                        "• `/pause` - 🚨 Emergency kill switch\n"
+                        "• `/resume` - 🟢 Re-enable auto-trading\n"
+                        "• `/help` - Display this command menu\n\n"
+                        f"⚖️ Execution: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                    )
+                await send_reply(reply)
+
+            elif raw_text == "/status":
+                if LAST_MT5_PING_TIME:
+                    now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
+                    seconds_ago = (now_wib.replace(tzinfo=None) - LAST_MT5_PING_TIME.replace(tzinfo=None)).total_seconds()
+
+                    if seconds_ago < 60:
+                        status_icon = "\U0001f7e2"
+                        conn_msg = f"Connected and Active\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
+                    elif seconds_ago < 180:
+                        status_icon = "\U0001f7e1"
+                        conn_msg = f"Slight Lag\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
+                    else:
+                        status_icon = "\U0001f534"
+                        conn_msg = f"DISCONNECTED\n\u2022 Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
+
+                    remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
+                    budget_pct = (_twelve_data_call_count / TWELVE_DATA_DAILY_LIMIT * 100) if TWELVE_DATA_DAILY_LIMIT else 0.0
+                    budget_icon = "\U0001f7e2" if budget_pct < 70 else ("\U0001f7e1" if budget_pct < 90 else "\U0001f534")
+                    reply = (
+                        f"{status_icon} *SYSTEM & BRIDGE STATUS*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\u2022 Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
+                        f"\u2022 MT5 Bridge: *{conn_msg}*\n"
+                        f"\u2022 Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`\n\n"
+                        f"{budget_icon} *TWELVEDATA API BUDGET:*\n"
+                        f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
+                        f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
+                        f"\U0001f4c8 *STRATEGY:*\n"
+                        f"\u2022 Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
+                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"\u2022 Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
+                    )
+                else:
+                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
+                await send_reply(reply)
+
+            elif bot_role == "control" and raw_text == "/pause":
+                SYSTEM_TRADING_ENABLED = False
+                await send_reply("\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.")
+
+            elif bot_role == "control" and raw_text == "/resume":
+                SYSTEM_TRADING_ENABLED = True
+                await send_reply("\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
+
+            elif bot_role == "breakout" and raw_text == "/status":
+                p = BREAKOUT_ACTIVE_PENDING or _breakout_pending_from_db()
+                if p:
+                    reply=(f"📦 *RANGE BREAKOUT OCO STATUS*\n\nPending ID: *#{p['id']}*\n"
+                           f"🟢 BUY STOP: *${float(p.get('pending_buy_price') or 0):.2f}*\n"
+                           f"🔴 SELL STOP: *${float(p.get('pending_sell_price') or 0):.2f}*\n"
+                           f"State: *OCO ACTIVE / PAPER*\nExpiry: *{BREAKOUT_MAX_PENDING_MINUTES} min*")
+                else:
+                    reply="📦 *RANGE BREAKOUT OCO STATUS*\n\n_No active paper OCO. Scanner is monitoring for a qualified range._"
+                await send_reply(reply)
+
+            elif bot_role == "breakout" and raw_text == "/range":
+                try:
+                    df_cmd=await fetch_timeframe_data(client,"5min")
+                    if df_cmd is None or len(df_cmd)<max(BREAKOUT_RANGE_LOOKBACKS)+1:
+                        await send_reply("⚠️ Not enough 5M data to analyze the range.")
+                    else:
+                        df_cmd=calculate_metrics_tf(df_cmd); setup=detect_range_breakout_setup(df_cmd,0.0)
+                        if setup:
+                            reply=(f"📐 *CURRENT RANGE ANALYSIS*\n\nRange: *${setup['low']:.2f} — ${setup['high']:.2f}*\n"
+                                   f"Width: *${setup['width']:.2f}* ({setup['width']/setup['atr']:.2f} ATR)\n"
+                                   f"Window: *{setup.get('lookback','N/A')} candles* | Type: *{setup.get('range_type','N/A')}*\n"
+                                   f"5M ADX: *{setup['adx5']:.1f}*\nQualification: *{'YES' if setup.get('valid') else 'NO'}*\n"
+                                   f"Fake breakout: *{setup.get('fake') or 'NONE'}*\nReason: {setup.get('reason','N/A')}")
+                        else: reply="📐 *CURRENT RANGE ANALYSIS*\n\n_No range available._"
+                        await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"⚠️ Range analysis error: {e}")
+
+            elif bot_role == "breakout" and raw_text == "/cancel":
+                p=BREAKOUT_ACTIVE_PENDING or _breakout_pending_from_db()
+                if p:
+                    _set_breakout_pending_state(int(p['id']),'CANCELLED','CANCELLED_MANUAL'); BREAKOUT_ACTIVE_PENDING=None
+                    await send_reply(f"🛑 *OCO #{p['id']} CANCELLED*\nBoth paper pending orders are cancelled.")
+                else: await send_reply("ℹ️ No active paper OCO order.")
+
+            elif bot_role == "breakout" and raw_text == "/stats":
+                try:
+                    conn=get_db_connection(); cur=conn.cursor()
+                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
+                    s=cur.fetchone(); cur.close(); conn.close(); ex=int(s['executed'] or 0); wins=int(s['wins'] or 0); losses=int(s['losses'] or 0)
+                    await send_reply(f"📦 *RANGE BREAKOUT PERFORMANCE*\n━━━━━━━━━━━━━━━━━━━━\nExecuted: *{ex}* | Cancelled: *{int(s['cancelled'] or 0)}*\nWins/Losses: *{wins}/{losses}*\nWin Rate: *{(wins/ex*100 if ex else 0):.1f}%*\nTotal R: *{float(s['total_r'] or 0):+.2f}R* | Avg R: *{float(s['avg_r'] or 0):+.3f}R*\nMode: *{BREAKOUT_EXECUTION_MODE}*\nFake-breakout filter: *ACTIVE*")
+                except Exception as e: await send_reply(f"⚠️ Error querying breakout stats: {e}")
+
+            elif bot_role == "breakout" and raw_text == "/last":
+                try:
+                    conn=get_db_connection(); cur=conn.cursor(); cur.execute("SELECT id,action,trigger_type,entry_price,outcome,created_at FROM signals WHERE strategy=%s ORDER BY id DESC LIMIT 10",(BREAKOUT_STRATEGY,)); rows=cur.fetchall(); cur.close(); conn.close()
+                    if not rows: reply="📋 *LAST BREAKOUT EVENTS*\n\n_No breakout events yet._"
+                    else: reply="📋 *LAST BREAKOUT EVENTS*\n\n"+"\n".join(f"#{r['id']} | {r['action']} | {r['trigger_type']} | ${float(r['entry_price'] or 0):.2f} | {r['outcome'] or 'N/A'}" for r in rows)
+                    await send_reply(reply)
+                except Exception as e: await send_reply(f"⚠️ Error querying breakout logs: {e}")
+
+            elif bot_role == "control" and raw_text == "/stats":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED' AND strategy = %s", (CONTROL_STRATEGY,))
+                    total_executed = cur.fetchone()["total"] or 0
+                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED' AND strategy = %s", (CONTROL_STRATEGY,))
+                    total_vetoes = cur.fetchone()["vetoes"] or 0
+                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (CONTROL_STRATEGY,))
+                    total_pending = cur.fetchone()["pending"] or 0
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%%' OR outcome LIKE 'CLOSED%%')", (CONTROL_STRATEGY,))
+                    tp1_wins = cur.fetchone()["tp1_wins"] or 0
+                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%%'", (CONTROL_STRATEGY,))
+                    tp2_wins = cur.fetchone()["tp2_wins"] or 0
+                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (CONTROL_STRATEGY,))
+                    losses = cur.fetchone()["losses"] or 0
+
+                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))
+                    closed_trades = cur.fetchall()
+                    total_pips = win_pips = loss_pips = 0.0
+                    total_wins_count = tp1_wins + tp2_wins
+
+                    for t in closed_trades:
+                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
+                        total_pips += trade_pips
+                        if trade_pips > 0: win_pips += trade_pips
+                        elif trade_pips < 0: loss_pips += abs(trade_pips)
+
+                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                    est_dollar = total_pips * 0.10
+                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
+                    cur.close(); conn.close()
+
+                    reply = (
+                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
+                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
+                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
+                        f"\u2022 Total Executed: *{total_executed}*\n"
+                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
+                        f"\u2022 Active Pending: *{total_pending}*\n\n"
+                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
+                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
+                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
+                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
+                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
+                    )
+                    await send_reply(reply)
+                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
+
+            elif (bot_role == "experimental" and raw_text in ("/stats", "/compare")):
+                try:
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("""
+                        SELECT strategy, execution_mode,
+                               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
+                               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
+                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
+                               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
+                               COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
+                               COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
+                               COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
+                        FROM signals
+                        WHERE strategy IN (%s, %s, %s)
+                        GROUP BY strategy, execution_mode
+                        ORDER BY strategy;
+                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
+                    rows = cur.fetchall()
+                    stats = {}
+                    for r in rows:
+                        executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
+                        net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
+                        total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
+                        # Profit factor from stored result_pips, falling back to R when needed.
+                        cur.execute("""
+                            SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
+                                   COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
+                            FROM signals WHERE status='EXECUTED' AND strategy=%s AND result_pips IS NOT NULL
+                        """, (r["strategy"],))
+                        pfrow = cur.fetchone(); gross_win = float(pfrow["gross_win"] or 0); gross_loss = float(pfrow["gross_loss"] or 0)
+                        pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
+                        stats[str(r["strategy"])] = {
+                            "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
+                            "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
+                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
+                            "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
+                        }
+
+                    # Calculate current maximum consecutive SL streak per strategy.
+                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY):
+                        cur.execute("""
+                            SELECT outcome FROM signals
+                            WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
+                            ORDER BY id ASC
+                        """, (strategy,))
+                        streak = best = 0
+                        for rr in cur.fetchall():
+                            if str(rr["outcome"]).startswith("LOSS"):
+                                streak += 1; best = max(best, streak)
+                            else:
+                                streak = 0
+                        stats.setdefault(strategy, {})["max_loss_streak"] = best
+
+                    cur.close(); conn.close()
+                    a = stats.get(CONTROL_STRATEGY, {})
+                    b = stats.get(EXPERIMENTAL_STRATEGY, {})
+                    c = stats.get(BREAKOUT_STRATEGY, {})
+                    leader = "Not enough data"
+                    if a.get("executed", 0) or b.get("executed", 0) or c.get("executed", 0):
+                        candidates = [
+                            ("🟢 CONTROL — EMA 5/9", a.get("total_r", 0)),
+                            ("🔵 EXPERIMENT — EMA 5/15", b.get("total_r", 0)),
+                            ("🟣 STRATEGY C — RANGE BREAKOUT OCO", c.get("total_r", 0)),
+                        ]
+                        best_label, best_r = max(candidates, key=lambda x: x[1])
+                        tied = [lbl for lbl, val in candidates if val == best_r]
+                        leader = best_label if len(tied) == 1 else "🤝 Tied"
+
+                    def block(label, d):
+                        if not d:
+                            return f"{label}\n — *UNKNOWN*\n• Executed: 0 | Vetoed: 0\n• Wins/Losses: 0/0 | Pending: 0\n• Win Rate: 0.0%\n• Net Pips: +0.0\n• Net USD: $+0.00\n• Total R: +0.00R | Avg R: +0.000R\n• Profit Factor: 0.00\n• Max SL Streak: 0"
+                        return (
+                            f"{label}\n — *{d.get('mode','UNKNOWN')}*\n"
+                            f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
+                            f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
+                            f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
+                            f"• Net Pips: *{d.get('pips',0):+.1f}*\n"
+                            f"• Net USD: *${d.get('usd',0):+.2f}*\n"
+                            f"• Total R: *{d.get('total_r',0):+.2f}R* | Avg R: *{d.get('avg_r',0):+.3f}R*\n"
+                            f"• Profit Factor: *{d.get('pf',0):.2f}*\n"
+                            f"• Max SL Streak: *{d.get('max_loss_streak',0)}*"
+                        )
+
+                    reply = (
+                        "🔬 *3-WAY STRATEGY DASHBOARD*\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "XAU/USD • Same market snapshot • Same risk framework\n\n"
+                        f"{block('🟢 CONTROL — EMA 5/9', a)}\n\n"
+                        f"{block('🔵 EXPERIMENT — EMA 5/15', b)}\n\n"
+                        f"{block('🟣 STRATEGY C — RANGE BREAKOUT OCO', c)}\n\n"
+                        f"🏆 *CURRENT LEADER:* {leader}\n"
+                        "\n_Compare again after more trades; early samples are not statistically meaningful._"
+                    )
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"⚠️ Error querying 3-way dashboard: {e}")
+
+            elif bot_role == "control" and raw_text == "/pips":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
+                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (CONTROL_STRATEGY,))
+                    trades = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    total_pips = gross_win_pips = gross_loss_pips = 0.0
+                    winning_trades_count = losing_trades_count = 0
+
+                    for t in trades:
+                        pips, _usd = compute_trade_pips({
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"]
+                        })
+                        total_pips += pips
+                        if pips > 0:
+                            gross_win_pips += pips; winning_trades_count += 1
+                        elif pips < 0:
+                            gross_loss_pips += abs(pips); losing_trades_count += 1
+
+                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                    est_profit_usd = total_pips * 0.10
+                    pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
+
+                    reply = (
+                        f"\U0001f4b5 *DETAILED PIPS & EARNINGS REPORT*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4ca *SUMMARY:*\n"
+                        f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
+                        f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                        f"\U0001f3af *AVERAGE METRICS:*\n"
+                        f"\u2022 Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4a1 *Note:* Reflects your actual 2x0.01 lot execution -- "
+                        f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
+                        f"TP2 = lot1 @ TP1 + lot2 @ TP2."
+                    )
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"\u26a0\ufe0f Error calculating pips: {e}")
+
+            elif ((bot_role == "control" and raw_text == "/logs") or (bot_role == "experimental" and raw_text == "/last")):
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT id, action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
+                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val,
+                               COALESCE(timestamp, created_at::text, 'N/A') AS log_time
+                        FROM signals WHERE status = 'EXECUTED' AND strategy = %s
+                        ORDER BY id DESC LIMIT 10
+                    """, (CONTROL_STRATEGY if bot_role == 'control' else EXPERIMENTAL_STRATEGY,))
+                    logs = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    if not logs:
+                        reply = "\U0001f4dc *LAST 10 TRADE LOGS:*\n\n_No executed trades in the database yet._"
+                    else:
+                        reply = "\U0001f4dc *LAST 10 DETAILED TRADE LOGS:*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\n"
+                        for l in logs:
+                            trade_id = l["id"]; action = l["action"]
+                            entry = float(l["entry_p"])
+                            exit_p = float(l["exit_price"]) if l.get("exit_price") is not None else None
+                            outcome = l["outcome_val"]
+                            date_str = str(l["log_time"])
+
+                            if exit_p is not None:
+                                pips, profit_usd = compute_trade_pips({
+                                    "action": action, "entry_price": entry, "sl_price": l["sl_p"],
+                                    "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p,
+                                    "outcome": outcome
+                                })
+                                r_multiple = compute_r_multiple(
+                                    action, entry, exit_p, float(l["sl_p"] or 0.0),
+                                    float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
+                                )
+                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
+                            else:
+                                pip_str = "*ACTIVE / IN PROGRESS*"
+
+                            if "WIN" in outcome or "CLOSED" in outcome:
+                                icon = "\U0001f7e2"
+                            elif "LOSS" in outcome:
+                                icon = "\U0001f534"
+                            else:
+                                icon = "\U0001f7e1"
+
+                            reply += (
+                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                                f"\u2022 Entry: ${entry:.2f} \u2192 Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                                f"\u2022 Outcome: *{outcome}*\n"
+                                f"\u2022 Result: {pip_str} | Time: {date_str}\n"
+                                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                            )
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"\u26a0\ufe0f Error querying logs: {e}")
+
+            elif bot_role == "control" and raw_text == "/analyze":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
+                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
+                               COALESCE(timestamp, created_at::text, '') AS log_time,
+                               trend_15m, entry_extension_atr, regime
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (CONTROL_STRATEGY,))
+                    rows = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    if not rows:
+                        reply = (
+                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
+                            "_Not enough closed trades yet to analyze. Check back after more signals complete._"
+                        )
+                    else:
+                        segments = {"Strategy": {}, "5M ADX Regime": {}, "V10 Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
+                        overall_r = []
+                        for r in rows:
+                            r_mult = compute_r_multiple(
+                                r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
+                                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
+                            )
+                            overall_r.append(r_mult)
+                            adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
+                            segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
+                            segments["5M ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
+                            segments["V10 Regime"].setdefault(r["regime"] or "Pre-V10 (unlabeled)", []).append(r_mult)
+                            segments["Entry Extension"].setdefault(bucket_extension(r["entry_extension_atr"]), []).append(r_mult)
+                            segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
+                            segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
+
+                        n_total = len(overall_r)
+                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
+                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
+
+                        reply_parts = [
+                            "\U0001f4d0 *EMA STRATEGY FORWARD-TEST ANALYSIS*",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+                            f"Sample: *{n_total} closed trades*",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
+                            "",
+                        ]
+                        for dim in ["Strategy", "5M ADX Regime", "V10 Regime", "Entry Extension", "Session", "15m Confluence"]:
+                            reply_parts.append(format_performance_segment(dim, segments[dim]))
+                            reply_parts.append("")
+
+                        reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
+                        reply_parts.append(
+                            "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
+                            "but noisy). Check the Strategy breakdown for \"Range Fade (Consolidation)\" vs the "
+                            "EMA buckets to see which regime is actually working.\n\n"
+                            f"\u2696\ufe0f Mode is auto-selected by 5M ADX (\u2265{RANGE_MODE_ADX_MAX:.0f} trend, "
+                            f"<{RANGE_MODE_ADX_MAX:.0f} range) -- not a veto, both regimes are live.\n"
+                            f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
+                        )
+                        reply = "\n".join(reply_parts)
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"\u26a0\ufe0f Error: {e}")
+
+    except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
+    return {"status": "ok"}
+
+
+# =====================================================================
+# SEPARATE TELEGRAM WEBHOOKS — CONTROL vs EXPERIMENTAL
+# =====================================================================
+@app.post("/telegram-webhook")
+async def telegram_webhook_control(request: Request):
+    return await _handle_telegram_webhook(request, "control")
+
+@app.post("/telegram-webhook-b")
+async def telegram_webhook_experimental(request: Request):
+    return await _handle_telegram_webhook(request, "experimental")
+
+@app.post("/telegram-webhook-c")
+async def telegram_webhook_breakout(request: Request):
+    return await _handle_telegram_webhook(request, "breakout")

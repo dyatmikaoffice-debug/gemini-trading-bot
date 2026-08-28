@@ -12,6 +12,7 @@
 
 import os
 import json
+import math
 import asyncio
 import psycopg2
 import gc
@@ -131,6 +132,35 @@ BREAKOUT_TP2_R = 2.50
 BREAKOUT_MAX_PENDING_MINUTES = 20
 BREAKOUT_FAKE_WICK_ATR = 0.10
 BREAKOUT_ACTIVE_PENDING = None
+
+# --- Dynamic position sizing (Strategy A / B only) ---
+# Strategy A/B set SL distance off ATR (risk = max(2.5, atr_5m)), so on
+# volatile days the stop is wider -- correct, keeps the stop outside normal
+# noise. But lot size used to be fixed at 0.01 regardless, so the *dollar*
+# loss on a wide-ATR SL hit could run 3x+ the dollar loss on a calm-ATR one,
+# even though both were labeled the same "-2R". This makes lot size scale
+# inversely with SL distance instead, so every trade risks roughly the same
+# dollar amount no matter how volatile the market was when it fired.
+# Strategy C is untouched -- it keeps its existing fixed-lot rule.
+TARGET_RISK_PER_TRADE_USD = 6.00   # combined risk across both legs if SL is hit
+LOT_STEP = 0.01                    # broker's minimum lot increment
+MIN_LOT_SIZE = 0.01
+DOLLAR_PER_POINT_PER_LOT = 100.0   # 1.00 standard lot XAUUSD = 100oz; $1 move x 100oz = $100
+
+def calculate_dynamic_lot_size(risk_price_distance: float) -> float | None:
+    """Per-leg lot size so that BOTH legs hitting SL together costs about
+    TARGET_RISK_PER_TRADE_USD, regardless of how wide ATR made the stop.
+    Rounds DOWN to the broker's lot step (never rounds up past target risk).
+    Returns None if even the minimum lot size would exceed target risk --
+    caller should skip the trade rather than take on outsized risk.
+    """
+    if risk_price_distance <= 0:
+        return None
+    raw_lot = TARGET_RISK_PER_TRADE_USD / (risk_price_distance * DOLLAR_PER_POINT_PER_LOT * 2.0)
+    stepped = math.floor(raw_lot / LOT_STEP) * LOT_STEP
+    if stepped < MIN_LOT_SIZE:
+        return None
+    return round(stepped, 2)
 
 EMA_TREND_FAST = 5
 EMA_TREND_SLOW = 9
@@ -366,6 +396,11 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS pending_buy_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS pending_sell_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_state TEXT;",
+            # Dynamic position sizing (Strategy A/B only -- see
+            # calculate_dynamic_lot_size). Strategy C keeps its existing
+            # fixed sizing untouched. Defaults to 0.01 so pre-existing rows
+            # read exactly as they always have.
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS lot_size REAL DEFAULT 0.01;",
         ]
 
         for query in migrations:
@@ -499,7 +534,8 @@ def log_trade_signal(
     confidence: float, adx_15m: float, stoch_rsi_15m: float, divergence_type: str, reasoning: str,
     trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
     entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None,
-    strategy: str = CONTROL_STRATEGY, execution_mode: str = CONTROL_EXECUTION_MODE
+    strategy: str = CONTROL_STRATEGY, execution_mode: str = CONTROL_EXECUTION_MODE,
+    lot_size: float = 0.01
     # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
     # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
     # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
@@ -538,13 +574,13 @@ def log_trade_signal(
                 tp1, tp1_price, tp2, tp2_price, confidence, adx_15m, stoch_rsi_15m,
                 divergence_type, reasoning, outcome, outcome_timestamp, trend_15m, adx_15m_true,
                 entry_extension_atr, entry_climax_ratio, regime, ema_sep_atr_5m, ema_slope_atr_5m,
-                adx_slope_5m, ema_cross_count_5m, strategy, execution_mode, created_at
+                adx_slope_5m, ema_cross_count_5m, strategy, execution_mode, lot_size, created_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, NOW()
+                %s, %s, %s, %s, %s, %s, %s, NOW()
             )
             RETURNING id;
         """, (
@@ -552,7 +588,7 @@ def log_trade_signal(
             sl_val, sl_val, tp1_val, tp1_val, tp2_val, tp2_val, conf_val, adx_val, stoch_val,
             str(divergence_type), str(reasoning), "PENDING", "", trend_15m_val, adx_15m_true_val,
             extension_val, climax_val, regime_val, ema_sep_val, ema_slope_val,
-            adx_slope_val, cross_count_val, str(strategy), str(execution_mode)
+            adx_slope_val, cross_count_val, str(strategy), str(execution_mode), float(lot_size or 0.01)
         ))
 
         inserted_row = cursor.fetchone()
@@ -631,7 +667,8 @@ def update_open_trades(current_high: float, current_low: float):
             if new_outcome and new_outcome != current_outcome:
                 trade_for_calc = {
                     "action": action, "entry_price": entry_price, "sl_price": sl,
-                    "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome
+                    "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome,
+                    "lot_size": trade.get("lot_size", 0.01)
                 }
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
                 result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
@@ -1107,6 +1144,10 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     tp2 = float(trade.get("tp2_price") or trade.get("tp2") or 0.0)
     exit_p = float(trade.get("exit_price") or entry)
     outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
+    # Defaults to 0.01 for pre-dynamic-sizing rows and Strategy C (which
+    # keeps its own fixed-lot rule) -- both reproduce the original math
+    # exactly, byte for byte.
+    lot_size = float(trade.get("lot_size") or 0.01)
 
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
     if sl_dist == 0: sl_dist = 2.5
@@ -1114,25 +1155,27 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
 
     if "LOSS" in outcome:
-        # Neither lot ever reached TP1 -- both close at SL. Two 0.01 lots,
-        # each risking sl_dist, so the combined loss is 2x a single-lot SL.
-        total_pips = -(sl_dist * 10.0) * 2.0
+        # Neither lot ever reached TP1 -- both legs close at SL, each
+        # risking sl_dist, so the combined price-equivalent is 2x sl_dist.
+        total_price_equiv = -(sl_dist * 2.0)
     elif outcome == "CLOSED (TP1 HIT / SL BE)":
         # Lot 1 banked tp1_dist in full. Lot 2 (the runner) was stopped at
         # breakeven -- zero pips, not a loss and not additional profit.
-        total_pips = tp1_dist * 10.0
+        total_price_equiv = tp1_dist
     elif outcome == "WIN (TP1 HIT)":
         # Interim state: lot 1 has closed at TP1; lot 2 is still open and
-        # not yet resolved, so only lot 1's pips are realized so far.
-        total_pips = tp1_dist * 10.0
+        # not yet resolved, so only lot 1's move is realized so far.
+        total_price_equiv = tp1_dist
     elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
         # Lot 1 closed at TP1, lot 2 (the runner) continued on to TP2 --
         # both legs are realized profit, so both are counted in full.
-        total_pips = (tp1_dist + tp2_dist) * 10.0
+        total_price_equiv = tp1_dist + tp2_dist
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
-    profit_usd = total_pips * 0.10
+        total_price_equiv = diff * 2.0  # PENDING/unclassified fallback: 2-lot mark-to-market
+
+    total_pips = total_price_equiv * 10.0  # display metric -- price distance, independent of lot size
+    profit_usd = total_price_equiv * lot_size * DOLLAR_PER_POINT_PER_LOT
     return total_pips, profit_usd
 
 def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
@@ -1724,12 +1767,29 @@ async def evaluate_strategy_cycle(
         tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
         tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
 
+    # Dynamic lot sizing (A/B only): keep dollar risk roughly constant
+    # instead of dollar risk ballooning whenever ATR widens the stop.
+    risk_price_distance = abs(curr_price - sl_price)
+    dynamic_lot = calculate_dynamic_lot_size(risk_price_distance)
+    if dynamic_lot is None:
+        logging.info(
+            f"[{strategy}] [RISK SKIP] {proposed_action} at ${curr_price:.2f}: SL distance ${risk_price_distance:.2f} "
+            f"means even the {MIN_LOT_SIZE} min lot would exceed the ${TARGET_RISK_PER_TRADE_USD:.2f} target risk. Skipping."
+        )
+        log_trade_signal(
+            "VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
+            0.0, adx_5m, 0.0, "None", f"Risk-sized skip: SL distance ${risk_price_distance:.2f} exceeds target risk even at minimum lot size.",
+            trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
+            strategy_mode, regime_metrics, strategy, execution_mode, MIN_LOT_SIZE
+        )
+        return
+
     if ai_decision.action == proposed_action:
         new_id = log_trade_signal(
             "EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
             float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
             trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
-            strategy_mode, regime_metrics, strategy, execution_mode
+            strategy_mode, regime_metrics, strategy, execution_mode, dynamic_lot
         )
         mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else "🚀 TREND"
         paper_tag = " [PAPER]" if execution_mode == "PAPER" else " [LIVE]"
@@ -1740,6 +1800,7 @@ async def evaluate_strategy_cycle(
             f"Stop Loss: *${sl_price:.2f}*\n"
             f"TP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\n"
             f"TP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\n"
+            f"Lot Size (per leg): *{dynamic_lot:.2f}* _(risk-sized, target ${TARGET_RISK_PER_TRADE_USD:.2f})_\n"
             f"Execution: *{execution_mode}*\nReasoning: {ai_decision.reasoning}"
         )
         await send_telegram_alert(client, msg, target_chat_id=alert_chat_id, target_bot_token=alert_bot_token)
@@ -1748,7 +1809,7 @@ async def evaluate_strategy_cycle(
             "VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
             float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
             trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
-            strategy_mode, regime_metrics, strategy, execution_mode
+            strategy_mode, regime_metrics, strategy, execution_mode, dynamic_lot
         )
 
 
@@ -1947,7 +2008,8 @@ async def get_latest_signal():
         cur = conn.cursor()
         cur.execute("""
             SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
+                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time,
+                   COALESCE(lot_size, 0.01) AS lot_sz
             FROM signals
             WHERE status = 'EXECUTED' AND strategy = %s AND execution_mode = 'LIVE'
             ORDER BY id DESC LIMIT 1;
@@ -1957,7 +2019,7 @@ async def get_latest_signal():
         conn.close()
 
         if row:
-            return {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "trading_enabled": True}
+            return {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "lot_size": float(row["lot_sz"]), "trading_enabled": True}
         return {"signal": None, "trading_enabled": True}
     except Exception as e:
         logging.error(f"[MT5 BRIDGE ERROR] {e}")
@@ -2183,19 +2245,23 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (CONTROL_STRATEGY,))
                     losses = cur.fetchone()["losses"] or 0
 
-                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))
+                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(lot_size, 0.01) AS lot_sz FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))
                     closed_trades = cur.fetchall()
-                    total_pips = win_pips = loss_pips = 0.0
+                    total_pips = win_pips = loss_pips = total_net_usd = 0.0
                     total_wins_count = tp1_wins + tp2_wins
 
                     for t in closed_trades:
-                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
+                        trade_pips, trade_usd = compute_trade_pips({
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"], "lot_size": t["lot_sz"]
+                        })
                         total_pips += trade_pips
+                        total_net_usd += trade_usd
                         if trade_pips > 0: win_pips += trade_pips
                         elif trade_pips < 0: loss_pips += abs(trade_pips)
 
                     win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                    est_dollar = total_pips * 0.10
                     avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
                     avg_loss = (loss_pips / losses) if losses > 0 else 0.0
                     profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
@@ -2205,8 +2271,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
                         f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
-                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
+                        f"\u2022 Net Pips (Price Distance): *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (Dynamic Lot Sizing): *${total_net_usd:+.2f}*\n\n"
                         f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
                         f"\u2022 Total Executed: *{total_executed}*\n"
                         f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
@@ -2287,9 +2353,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     leader = "Not enough data"
                     if a.get("executed", 0) or b.get("executed", 0) or c.get("executed", 0):
                         candidates = [
-                            ("🟢 CONTROL — EMA 5/9", a.get("total_r", 0)),
-                            ("🔵 EXPERIMENT — EMA 5/15", b.get("total_r", 0)),
-                            ("🟣 STRATEGY C — RANGE BREAKOUT OCO", c.get("total_r", 0)),
+                            ("🟢 EMA 5/9 (CONTROL)", a.get("total_r", 0)),
+                            ("🔵 EMA 5/15 (EXPERIMENT)", b.get("total_r", 0)),
+                            ("🟠 Range Breakout (C)", c.get("total_r", 0)),
                         ]
                         best_label, best_r = max(candidates, key=lambda x: x[1])
                         tied = [lbl for lbl, val in candidates if val == best_r]
@@ -2297,9 +2363,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
                     def block(label, d):
                         if not d:
-                            return f"{label}\n — *UNKNOWN*\n• Executed: 0 | Vetoed: 0\n• Wins/Losses: 0/0 | Pending: 0\n• Win Rate: 0.0%\n• Net Pips: +0.0\n• Net USD: $+0.00\n• Total R: +0.00R | Avg R: +0.000R\n• Profit Factor: 0.00\n• Max SL Streak: 0"
+                            return f"{label}\nNo data yet."
                         return (
-                            f"{label}\n — *{d.get('mode','UNKNOWN')}*\n"
+                            f"{label} — *{d.get('mode','UNKNOWN')}*\n"
                             f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
                             f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
                             f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
@@ -2311,18 +2377,18 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         )
 
                     reply = (
-                        "🔬 *3-WAY STRATEGY DASHBOARD*\n"
+                        "🔬 *A/B/C STRATEGY DASHBOARD*\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         "XAU/USD • Same market snapshot • Same risk framework\n\n"
-                        f"{block('🟢 CONTROL — EMA 5/9', a)}\n\n"
-                        f"{block('🔵 EXPERIMENT — EMA 5/15', b)}\n\n"
-                        f"{block('🟣 STRATEGY C — RANGE BREAKOUT OCO', c)}\n\n"
+                        f"🟢 *A — CONTROL (EMA 5/9)*\n{block('', a)}\n\n"
+                        f"🔵 *B — EXPERIMENT (EMA 5/15)*\n{block('', b)}\n\n"
+                        f"🟠 *C — RANGE BREAKOUT (OCO)*\n{block('', c)}\n\n"
                         f"🏆 *CURRENT LEADER:* {leader}\n"
                         "\n_Compare again after more trades; early samples are not statistically meaningful._"
                     )
                     await send_reply(reply)
                 except Exception as e:
-                    await send_reply(f"⚠️ Error querying 3-way dashboard: {e}")
+                    await send_reply(f"⚠️ Error querying A/B/C dashboard: {e}")
 
             elif bot_role == "control" and raw_text == "/pips":
                 try:
@@ -2331,22 +2397,23 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.execute("""
                         SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                                COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
+                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(lot_size, 0.01) AS lot_sz
                         FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
                     """, (CONTROL_STRATEGY,))
                     trades = cur.fetchall()
                     cur.close(); conn.close()
 
-                    total_pips = gross_win_pips = gross_loss_pips = 0.0
+                    total_pips = gross_win_pips = gross_loss_pips = total_net_usd = 0.0
                     winning_trades_count = losing_trades_count = 0
 
                     for t in trades:
-                        pips, _usd = compute_trade_pips({
+                        pips, usd = compute_trade_pips({
                             "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
                             "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
-                            "outcome": t["outcome_val"]
+                            "outcome": t["outcome_val"], "lot_size": t["lot_sz"]
                         })
                         total_pips += pips
+                        total_net_usd += usd
                         if pips > 0:
                             gross_win_pips += pips; winning_trades_count += 1
                         elif pips < 0:
@@ -2354,7 +2421,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
                     avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
                     avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
-                    est_profit_usd = total_pips * 0.10
                     pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
 
                     reply = (
@@ -2362,7 +2428,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
                         f"\U0001f4ca *SUMMARY:*\n"
                         f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"\u2022 Net Profit (Dynamic Lots): *${total_net_usd:+.2f}*\n\n"
                         f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
                         f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
                         f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
@@ -2371,9 +2437,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
                         f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
                         f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4a1 *Note:* Reflects your actual 2x0.01 lot execution -- "
-                        f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
-                        f"TP2 = lot1 @ TP1 + lot2 @ TP2."
+                        f"\U0001f4a1 *Note:* Reflects dynamic position sizing targeting ~${TARGET_RISK_PER_TRADE_USD:.2f} risk per trade."
                     )
                     await send_reply(reply)
                 except Exception as e:
@@ -2388,7 +2452,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
                                COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
                                COALESCE(outcome, 'PENDING') AS outcome_val,
-                               COALESCE(timestamp, created_at::text, 'N/A') AS log_time
+                               COALESCE(timestamp, created_at::text, 'N/A') AS log_time,
+                               COALESCE(lot_size, 0.01) AS lot_sz
                         FROM signals WHERE status = 'EXECUTED' AND strategy = %s
                         ORDER BY id DESC LIMIT 10
                     """, (CONTROL_STRATEGY if bot_role == 'control' else EXPERIMENTAL_STRATEGY,))
@@ -2410,15 +2475,15 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                 pips, profit_usd = compute_trade_pips({
                                     "action": action, "entry_price": entry, "sl_price": l["sl_p"],
                                     "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p,
-                                    "outcome": outcome
+                                    "outcome": outcome, "lot_size": l["lot_sz"]
                                 })
                                 r_multiple = compute_r_multiple(
                                     action, entry, exit_p, float(l["sl_p"] or 0.0),
                                     float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
                                 )
-                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
+                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f} ({l['lot_sz']} lot)"
                             else:
-                                pip_str = "*ACTIVE / IN PROGRESS*"
+                                pip_str = f"*ACTIVE / IN PROGRESS* ({l['lot_sz']} lot)"
 
                             if "WIN" in outcome or "CLOSED" in outcome:
                                 icon = "\U0001f7e2"

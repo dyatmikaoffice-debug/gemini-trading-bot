@@ -1,7 +1,7 @@
-# A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
-# BASE: alert_bot_exhaustion_guard_v1.py
+# FINAL MAIN TRADING BOT: EMA 5/9 CONTROL vs EMA 5/15 LIVE EXPERIMENT
 # Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
-# CONTROL_5_9 remains the only MT5-live strategy; EXPERIMENTAL_5_15 is PAPER only.
+# A = EMA 5/9 PAPER control | B = EMA 5/15 LIVE | C = Range Breakout OCO PAPER.
+# IMPORTANT: Only Strategy B is eligible for the MT5 live-signal bridge.
 # 
 # CHANGES FROM V8.1:
 # 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
@@ -92,18 +92,83 @@ LAST_MT5_PING_TIME = None
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
+# --- 4H directional bias (seasonality-style regime filter) ---
+# Backtest on real trade data found SELL signals losing broadly on both
+# strategies while gold's higher-timeframe trend ran up -- BUY kept working,
+# SELL didn't, across nearly every trigger type. Rather than hard-block one
+# direction permanently, this reads the 4H EMA50 (same method requested) so
+# the block flips automatically if/when the broader trend reverses. A 60-min
+# refresh is once every 4H candle's worth of movement at most -- cheap
+# relative to the 800/day TwelveData budget (5M costs ~288/day, 15M ~96/day
+# on their own; this adds at most 24/day more).
+cached_1h = {"df": None, "fetched_at": None}
+ONE_H_REFRESH_MINUTES = 15   # 1H candles close 4x more often than 4H did -- refresh more often to catch it
+ONE_H_EMA_PERIOD = 200
+ONE_H_OUTPUTSIZE = 250       # need 200+ candles for the EMA itself, so pull well past the default 100
+# Buffer before the BULLISH/BEARISH label is allowed to flip at all -- stops
+# a bare EMA touch (pure noise) from flip-flopping the bias label back and
+# forth. Separate from the ranging-regime threshold below.
+ONE_H_BIAS_FLIP_BUFFER_PCT = 0.18
+# Separate, wider band: how close price sits to the 1H EMA200 before we
+# treat the market as "ranging near the trendline" -- shown in /status as
+# informational context only. SL sizing is NOT adjusted by this (plain
+# ATR-based risk applies to every trade, same as before the $6 cap ever
+# existed) -- the 1H bias filter above is what actually guards against a
+# losing streak on a sudden trend reversal, by blocking entries against the
+# new direction rather than resizing the stop.
+RANGING_REGIME_PCT_THRESHOLD = 0.30
+
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
 CONTROL_STRATEGY = "CONTROL_5_9"
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
-CONTROL_EXECUTION_MODE = "LIVE"
-EXPERIMENTAL_EXECUTION_MODE = "PAPER"
+CONTROL_EXECUTION_MODE = "PAPER"
+EXPERIMENTAL_EXECUTION_MODE = "LIVE"
 
-BREAKOUT_STRATEGY = "ONE_WAY_SR_PULLBACK"
+BREAKOUT_STRATEGY = "RANGE_BREAKOUT_OCO"
 BREAKOUT_EXECUTION_MODE = "PAPER"
 
-# --- STRATEGY C: ONE-WAY MARKET STRUCTURE + SUPPORT/RESISTANCE PULLBACK ---
-# PAPER ONLY. Uses the existing third Telegram bot; no new bot/environment
-# variables are required. Strategy C deliberately does not use EMA.
+# Safety: the MT5 bridge serves ONLY the designated live strategy.
+LIVE_BRIDGE_STRATEGY = EXPERIMENTAL_STRATEGY
+# A live signal must be recent enough to be actionable. This prevents an old
+# signal from being executed after a server/EA outage or after pause/resume.
+LIVE_SIGNAL_MAX_AGE_MINUTES = 7
+
+# --- STRATEGY C: RANGE BREAKOUT + OCO PENDING ORDERS ---
+# This strategy is intentionally PAPER ONLY in this build. It models two
+# pending stop orders (BUY STOP above range / SELL STOP below range) and applies
+# one-cancels-other behavior in the Python scanner. No live MT5 pending order is
+# placed by Strategy C yet.
+BREAKOUT_RANGE_LOOKBACK_5M = 10
+# Multiple window sizes to scan, shortest first. A single fixed 10-candle
+# window misses both shorter, sharper pauses and longer, slower ones -- price
+# doesn't consolidate for the same duration every time. We now test each
+# length and use the tightest/most recent one that qualifies, instead of
+# only ever looking at one fixed-size box.
+BREAKOUT_RANGE_LOOKBACKS = (6, 8, 10, 14, 20)
+# Loosened from 0.80-2.00 ATR / ADX 20/25 -- those thresholds produced ZERO
+# triggered signals across multiple days of live scanning. This strategy is
+# PAPER-only, so the priority is volume for data-gathering (target: 10+
+# triggered signals/day) over the tightest possible setup quality -- more
+# signals means the /compare stats become trustworthy sooner rather than
+# staying stuck at n=0 indefinitely.
+BREAKOUT_MIN_WIDTH_ATR = 0.50
+BREAKOUT_MAX_WIDTH_ATR = 3.00
+BREAKOUT_MAX_5M_ADX = 28.0
+BREAKOUT_MAX_15M_ADX = 32.0
+# "Flag" consolidations (a brief pause mid-trend, right after an impulsive
+# move, before continuation) form precisely while ADX is still elevated from
+# that prior leg -- the quiet-market ADX gate above was rejecting exactly
+# this pattern. If the range itself is unusually tight, allow it through as
+# a distinct flag-type setup even when ADX doesn't clear the quiet-market gate.
+BREAKOUT_FLAG_MAX_WIDTH_ATR = 0.75
+BREAKOUT_BUFFER_ATR = 0.15
+BREAKOUT_MIN_BUFFER_PRICE = 0.15
+BREAKOUT_SL_BUFFER_ATR = 0.30
+BREAKOUT_TP1_R = 1.50
+BREAKOUT_TP2_R = 2.50
+BREAKOUT_MAX_PENDING_MINUTES = 45  # was 20 -- more time for either stop to trigger before the setup expires unfired
+BREAKOUT_FAKE_WICK_ATR = 0.10
+BREAKOUT_ACTIVE_PENDING = None
 
 EMA_TREND_FAST = 5
 EMA_TREND_SLOW = 9
@@ -189,7 +254,7 @@ TWELVE_DATA_SAFETY_MARGIN = 40
 
 _twelve_data_call_count = 0
 _twelve_data_budget_date = None  
-_twelve_data_calls_by_tf = {"5min": 0, "15min": 0}
+_twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0}
 
 
 def _reset_budget_if_new_day(now_wib: datetime):
@@ -200,7 +265,7 @@ def _reset_budget_if_new_day(now_wib: datetime):
             logging.info(f"[TWELVE DATA BUDGET] New WIB day. Resetting counter.")
         _twelve_data_budget_date = today
         _twelve_data_call_count = 0
-        _twelve_data_calls_by_tf = {"5min": 0, "15min": 0}
+        _twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0}
 
 
 def twelve_data_budget_ok(now_wib: datetime) -> bool:
@@ -227,16 +292,6 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    # REMOVED (mid-session): was carried over from the old liquidity-sweep
-    # strategy's forward-test and never validated for this EMA system.
-    #
-    # REMOVED (ADX < 20 chop veto): this veto is now structurally impossible to
-    # trigger and would be dead code if left in. Trend mode and range mode are
-    # selected by ADX BEFORE either detector even runs (see
-    # background_scanning_loop) -- trend mode only ever calls this with
-    # adx_5m >= RANGE_MODE_ADX_MAX, and range mode (which specifically WANTS
-    # low ADX) never calls this at all. Kept as a shell for any future
-    # stat-based veto that isn't already handled by mode selection.
     return False, ""
 
 
@@ -322,20 +377,17 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_extension_atr REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_climax_ratio REAL;",
-            # V10: real dual-0.01-lot accounting, stored per-row (not just
-            # computed on the fly in /stats etc). See compute_trade_pips().
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_pips REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_usd REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_r REAL;",
-            # V10: regime/quality instrumentation at signal time, for the
-            # TRANSITION classifier and future analysis.
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_sep_atr_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_slope_atr_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_slope_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_cross_count_5m INTEGER;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy TEXT;",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_mode TEXT DEFAULT 'LIVE';",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_mode TEXT DEFAULT 'PAPER';",
+            "ALTER TABLE signals ALTER COLUMN execution_mode SET DEFAULT 'PAPER';",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS pending_buy_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS pending_sell_price REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_state TEXT;",
@@ -344,7 +396,6 @@ def init_db():
         for query in migrations:
             cursor.execute(query)
 
-        # Historical rows predate A/B tagging; preserve them as the existing 5/9 control.
         cursor.execute("UPDATE signals SET strategy = %s, execution_mode = %s WHERE strategy IS NULL", (CONTROL_STRATEGY, CONTROL_EXECUTION_MODE))
         cursor.execute("UPDATE signals SET execution_mode = %s WHERE execution_mode IS NULL", (CONTROL_EXECUTION_MODE,))
         conn.commit()
@@ -352,25 +403,12 @@ def init_db():
         conn.close()
         logging.info("[NEON DATABASE] Full schema verified and auto-migrated.")
 
-        # V10: one-time (idempotent) backfill of result_pips/result_usd/result_r
-        # for every historical closed trade that predates these columns. Safe
-        # to run on every boot -- it only ever touches rows where result_pips
-        # IS NULL, so already-backfilled rows are skipped and this stays cheap.
         backfill_dual_lot_accounting()
     except Exception as e:
         logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
 
 
 def backfill_dual_lot_accounting():
-    """
-    V10: fills result_pips / result_usd / result_r for any EXECUTED, closed
-    (exit_price IS NOT NULL) signal that doesn't have them yet -- covers every
-    trade logged before this migration, using the SAME compute_trade_pips /
-    compute_r_multiple functions the live bot now uses, so historical and
-    future numbers are computed identically. Idempotent: only ever updates
-    rows where result_pips IS NULL, so re-running on every boot is cheap and
-    harmless once the backfill has completed.
-    """
     if not DATABASE_URL:
         return
     try:
@@ -473,11 +511,6 @@ def log_trade_signal(
     trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
     entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None,
     strategy: str = CONTROL_STRATEGY, execution_mode: str = CONTROL_EXECUTION_MODE
-    # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
-    # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
-    # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
-    # this column and is labeled accordingly; don't rename the DB column without
-    # a migration, but don't assume it holds a real 15M value either.
 ):
     if not DATABASE_URL:
         return None
@@ -598,7 +631,7 @@ def update_open_trades(current_high: float, current_low: float):
                     new_outcome = "LOSS (SL HIT)"; exit_price = sl
                 elif tp2 > 0 and c_low <= tp2:
                     new_outcome = "WIN (TP2 HIT)"; exit_price = tp2
-                elif tp1 > 0 and c_high >= tp1:
+                elif tp1 > 0 and c_low <= tp1:
                     new_outcome = "WIN (TP1 HIT)"; exit_price = tp1
 
             if new_outcome and new_outcome != current_outcome:
@@ -609,12 +642,6 @@ def update_open_trades(current_high: float, current_low: float):
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
                 result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
 
-                # V10: result_pips/result_usd/result_r are only "final" once the
-                # trade is fully closed (LOSS, CLOSED (TP1 HIT / SL BE), or WIN
-                # (TP2 HIT)) -- the interim "WIN (TP1 HIT)" state still has an
-                # open runner leg, so its stored numbers are a running mark, not
-                # yet a settled result. They get overwritten again once the
-                # runner actually closes.
                 cursor.execute("""
                     UPDATE signals
                     SET outcome = %s, exit_price = %s, outcome_timestamp = %s,
@@ -673,13 +700,9 @@ def calculate_metrics_tf(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     df["atr"] = df["tr"].rolling(window=14).mean()
     
-    # 5M execution EMAs (fast -- used for entry signals on df_5m)
     df["ema_fast"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
 
-    # FIXED: separate, slower EMAs for the 15M confluence read. These are computed
-    # on every call (cheap) so the same helper works for both the 5M and 15M frames,
-    # but compute_ema_trend() below now reads THESE columns, not the fast ones.
     df["trend_ema_fast"] = df["close"].ewm(span=TREND_15M_EMA_FAST, adjust=False).mean()
     df["trend_ema_slow"] = df["close"].ewm(span=TREND_15M_EMA_SLOW, adjust=False).mean()
 
@@ -687,10 +710,6 @@ def calculate_metrics_tf(df: pd.DataFrame):
 
 
 def compute_ema_trend(df: pd.DataFrame):
-    # FIXED: was reading df["ema_fast"]/df["ema_slow"] -- the same 5/9 pair used
-    # for 5M execution -- which made the "15M confluence filter" flip almost as
-    # fast as the signal it was supposed to be filtering. Now reads the dedicated,
-    # slower trend_ema_fast/trend_ema_slow (9/20) columns instead.
     if df is None or len(df) < TREND_15M_EMA_SLOW + 1: return "NEUTRAL", 0.0
     last_fast = float(df["trend_ema_fast"].iloc[-1])
     last_slow = float(df["trend_ema_slow"].iloc[-1])
@@ -700,7 +719,33 @@ def compute_ema_trend(df: pd.DataFrame):
     return "BULLISH" if last_fast > last_slow else "BEARISH", separation_pct
 
 
-TOUCH_MIN_BODY_ATR_MULT = 0.15  # FIXED: touch signals previously had zero quality filter
+def compute_1h_directional_bias(df_1h: pd.DataFrame):
+    if df_1h is None or len(df_1h) < ONE_H_EMA_PERIOD + 1:
+        return "NEUTRAL", 0.0
+    ema200 = df_1h["close"].ewm(span=ONE_H_EMA_PERIOD, adjust=False).mean()
+    last_close = float(df_1h["close"].iloc[-1])
+    last_ema = float(ema200.iloc[-1])
+    if last_ema == 0:
+        return "NEUTRAL", 0.0
+    separation_pct = (last_close - last_ema) / last_ema * 100
+    if abs(separation_pct) < ONE_H_BIAS_FLIP_BUFFER_PCT:
+        return "NEUTRAL", separation_pct
+    return ("BULLISH" if separation_pct > 0 else "BEARISH"), separation_pct
+
+
+def compute_ranging_regime(df_1h: pd.DataFrame):
+    if df_1h is None or len(df_1h) < ONE_H_EMA_PERIOD + 1:
+        return False, 0.0
+    ema200 = df_1h["close"].ewm(span=ONE_H_EMA_PERIOD, adjust=False).mean()
+    last_close = float(df_1h["close"].iloc[-1])
+    last_ema = float(ema200.iloc[-1])
+    if last_ema == 0:
+        return False, 0.0
+    abs_sep_pct = abs(last_close - last_ema) / last_ema * 100
+    return (abs_sep_pct <= RANGING_REGIME_PCT_THRESHOLD), abs_sep_pct
+
+
+TOUCH_MIN_BODY_ATR_MULT = 0.15
 
 def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
@@ -713,20 +758,12 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
     p_ema_fast = prev["ema_fast"]
     p_ema_slow = prev["ema_slow"]
     
-    # 1. PRICE IMPULSE CROSS (Aggressive Early Entry)
-    # Catches massive candles that explode through both EMAs instantly
     bullish_impulse = prev["close"] <= p_ema_slow and curr["close"] > c_ema_fast and curr["close"] > c_ema_slow and curr["close"] > curr["open"]
     bearish_impulse = prev["close"] >= p_ema_slow and curr["close"] < c_ema_fast and curr["close"] < c_ema_slow and curr["close"] < curr["open"]
     
-    # 2. EMA CROSSOVER (The Standard Cross)
     bullish_cross = p_ema_fast <= p_ema_slow and c_ema_fast > c_ema_slow
     bearish_cross = p_ema_fast >= p_ema_slow and c_ema_fast < c_ema_slow
 
-    # 3. EMA TOUCH (Trend Continuation)
-    # FIXED: this trigger had no candle-quality check at all -- a tiny indecisive
-    # doji sitting on the EMA line qualified exactly the same as a strong reclaim
-    # candle, unlike every other trigger in this file which normalizes body size
-    # against ATR. Require the bounce candle to show at least modest conviction.
     raw_atr = curr["atr"] if "atr" in curr and not pd.isna(curr["atr"]) else None
     atr_val = float(raw_atr) if raw_atr is not None and raw_atr > 0 else None
     candle_body = abs(float(curr["close"]) - float(curr["open"]))
@@ -735,7 +772,6 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
     touch_bullish = c_ema_fast > c_ema_slow and curr["low"] <= c_ema_fast and curr["close"] > c_ema_fast and touch_body_ok
     touch_bearish = c_ema_fast < c_ema_slow and curr["high"] >= c_ema_fast and curr["close"] < c_ema_fast and touch_body_ok
     
-    # Evaluate Hierarchy: Impulse > Crossover > Touch
     if bullish_impulse and trend_15m == "BULLISH":
         return "BUY", "Aggressive Price Impulse (Bullish)"
     if bearish_impulse and trend_15m == "BEARISH":
@@ -755,18 +791,9 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
 
 
 def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
-    """
-    Fade-the-edges consolidation strategy. Only ever called when 5M ADX is
-    below RANGE_MODE_ADX_MAX (see background_scanning_loop) -- this is the
-    counterpart to detect_ema_signal(), not a supplement to it. The two never
-    run in the same cycle.
-    """
     if len(df_5m) < RANGE_LOOKBACK_5M + 1:
         return "HOLD", "Insufficient data for range detection", None, None
 
-    # Bracket is defined by the N candles BEFORE the current one, same pattern
-    # as the old V7 consolidation-breakout detector -- but here we fade INSIDE
-    # the bracket instead of trading a breakout beyond it.
     bracket = df_5m.iloc[-(RANGE_LOOKBACK_5M + 1):-1]
     bracket_high = float(bracket["high"].max())
     bracket_low = float(bracket["low"].min())
@@ -777,22 +804,11 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
         return "HOLD", "ATR unavailable", bracket_high, bracket_low
     atr_5m = float(raw_atr)
 
-    # Reject anything that isn't a genuine tight range: too wide means this is
-    # actually a slow drift/pullback, not consolidation; too tight means the
-    # edges are inside normal noise/spread and not worth trading.
     if width > RANGE_MAX_WIDTH_ATR_MULT * atr_5m:
         return "HOLD", "Range too wide -- likely a drift, not consolidation", bracket_high, bracket_low
     if width < RANGE_MIN_WIDTH_ATR_MULT * atr_5m:
         return "HOLD", "Range too tight -- inside normal noise/spread", bracket_high, bracket_low
 
-    # FIXED: this used to require compute_ema_trend() to read exactly NEUTRAL,
-    # which needs the 15M 9/20 EMA pair within TREND_15M_MIN_SEPARATION_PCT
-    # (0.02%, roughly $0.90 at $4490 gold) of each other -- a bar so tight it
-    # was almost never met, silently blocking range mode nearly 100% of the
-    # time (confirmed: 0 of 63 closed trades were Range Fade). Gated on 15M ADX
-    # instead -- a properly calibrated "is there a real higher-timeframe trend"
-    # check, using the same ADX language as the 5M gate rather than a brittle
-    # EMA-separation threshold.
     if adx_15m_true >= RANGE_MODE_MAX_15M_ADX:
         return "HOLD", f"15M ADX {adx_15m_true:.1f} still shows a real trend -- skipping fade to avoid trading against it", bracket_high, bracket_low
 
@@ -815,7 +831,6 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
 
 
 def get_recent_signals_for_direction(action: str, limit: int = 3, strategy: str = CONTROL_STRATEGY):
-    """Return recent closed EXECUTED trades in one direction, newest first."""
     if not DATABASE_URL:
         return []
     try:
@@ -852,20 +867,6 @@ def _directional_di_gap(df_5m: pd.DataFrame, action: str, idx: int) -> float:
 
 
 def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CONTROL_STRATEGY):
-    """
-    Soft trend-health guard for the original EMA engine.
-
-    Score components:
-      +1 ADX dropped materially from a recent strong peak
-      +1 directional DI advantage has deteriorated materially
-      +1 EMA5/EMA9 spread contracted materially from its recent maximum
-      +1 EMA5 directional slope is currently weak
-      +1/+2 repeated EMA crosses indicate developing chop
-      +2 three consecutive same-direction SLs (hard lock)
-
-    The guard does NOT reject a signal for one weak metric. It only blocks a
-    direction when multiple pieces of evidence agree.
-    """
     metrics = {"score": 0, "peak_adx": None, "adx_drop": 0.0, "peak_di_gap": None,
                "di_drop": 0.0, "ema_spread_atr": None, "spread_contraction": 0.0,
                "ema_slope_atr": 0.0, "cross_count": 0, "loss_count": 0,
@@ -909,7 +910,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
     score = 0
     reasons = []
 
-    # Only score ADX/DI deterioration if there really was a strong directional move.
     strong_trend_context = peak_adx >= EXHAUSTION_MIN_PEAK_ADX and peak_di_gap >= EXHAUSTION_RESET_MIN_DI_GAP
     if strong_trend_context and adx_drop >= EXHAUSTION_ADX_DROP:
         score += 1
@@ -935,8 +935,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
     if loss_count >= EXHAUSTION_HARD_LOSS_LOCK:
         reasons.append(f"{loss_count} consecutive {action} SLs")
 
-    # Losses are handled by the explicit directional-lock path below so a
-    # potential fresh expansion can actually release the lock.
     block_direction = score >= EXHAUSTION_SCORE_BLOCK_DIRECTION
     full_chop = score >= EXHAUSTION_SCORE_CHOP
 
@@ -962,7 +960,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
 
 
 def fresh_directional_expansion_confirmed(action: str, df_5m: pd.DataFrame, trend_15m: str) -> tuple[bool, str]:
-    """Confirm that a genuinely new directional expansion is underway."""
     if df_5m is None or len(df_5m) < max(EXHAUSTION_RESET_PRICE_LOOKBACK + 2, 8):
         return False, "Insufficient 5M history"
 
@@ -1000,27 +997,6 @@ def fresh_directional_expansion_confirmed(action: str, df_5m: pd.DataFrame, tren
 
 
 def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
-    """
-    Instrumentation only -- does NOT affect entry/veto decisions. Measures two
-    things at the moment a signal fires, for both TREND and RANGE signals:
-
-    1. extension_atr: how far price has already traveled beyond the edge of
-       its own recent N-candle bracket (the same bracket concept range mode
-       uses), in ATR units. A large value means the move is already well away
-       from its last consolidation zone -- a proxy for "chasing a move that's
-       already run" rather than catching it at the start.
-
-    2. climax_ratio: the current candle's own range (high-low) relative to
-       ATR. A candle several times the normal ATR is a classic "climax" shape
-       often followed by a shakeout/retracement even when the larger move is
-       intact -- this is the pattern behind stops getting tagged mid-impulse
-       before the move continues.
-
-    Logged to signals.entry_extension_atr / entry_climax_ratio so /analyze can
-    bucket outcomes by these values once enough trades accumulate. Nothing
-    here changes what fires or when -- purely for building the evidence base
-    before any logic changes, per the "track first" approach.
-    """
     if len(df_5m) < lookback + 1:
         return None, None
 
@@ -1051,27 +1027,6 @@ def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RA
     return extension_atr, climax_ratio
 
 
-# --- FORWARD-TEST ANALYTICS HELPERS ---
-# V10 (REPLACES partial-close model): your MT5 EA does not run a single
-# 0.01 lot with a 50/50 partial close. It opens TWO separate 0.01-lot
-# positions per signal -- lot 1 targets TP1 and closes there in full, lot 2
-# ("the runner") either rides to TP2 or has its SL moved to breakeven once
-# lot 1 hits TP1. If price never reaches TP1 at all, BOTH lots are still
-# live and BOTH get stopped out at the original SL. Every dollar figure
-# below now reflects that two-position reality:
-#
-#   Outcome                        | pips (2x0.01 lot)          | R
-#   --------------------------------------------------------------------
-#   LOSS (SL HIT, before TP1)      | -2 x sl_dist                | -2.0
-#   CLOSED (TP1 HIT / SL BE)       | +tp1_dist (lot2 nets 0 @BE) | +tp1_r_mult
-#   WIN (TP1 HIT) [interim/open]   | +tp1_dist (lot2 still open) | +tp1_r_mult
-#   WIN (TP2 HIT)                  | +tp1_dist +tp2_dist         | +tp1_r_mult+tp2_r_mult
-#
-# 1 pip = $0.10 on a single 0.01 lot (confirmed against your own bot's SL
-# alert messages, e.g. ID#79: 43.5 pips SL = $4.35 on one 0.01 lot). Two
-# lots at $0.10/pip each is $0.20/pip combined -- captured below by simply
-# not halving the distances the way the old TP1_PARTIAL_CLOSE_RATIO did.
-
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
     entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
@@ -1087,24 +1042,16 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
 
     if "LOSS" in outcome:
-        # Neither lot ever reached TP1 -- both close at SL. Two 0.01 lots,
-        # each risking sl_dist, so the combined loss is 2x a single-lot SL.
         total_pips = -(sl_dist * 10.0) * 2.0
     elif outcome == "CLOSED (TP1 HIT / SL BE)":
-        # Lot 1 banked tp1_dist in full. Lot 2 (the runner) was stopped at
-        # breakeven -- zero pips, not a loss and not additional profit.
         total_pips = tp1_dist * 10.0
     elif outcome == "WIN (TP1 HIT)":
-        # Interim state: lot 1 has closed at TP1; lot 2 is still open and
-        # not yet resolved, so only lot 1's pips are realized so far.
         total_pips = tp1_dist * 10.0
     elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        # Lot 1 closed at TP1, lot 2 (the runner) continued on to TP2 --
-        # both legs are realized profit, so both are counted in full.
         total_pips = (tp1_dist + tp2_dist) * 10.0
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
+        total_pips = diff * 10.0 * 2.0
     profit_usd = total_pips * 0.10
     return total_pips, profit_usd
 
@@ -1114,10 +1061,6 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0: risk_dist = 2.5
 
-    # V10: same dual-0.01-lot model as compute_trade_pips. R is expressed
-    # per unit of SINGLE-LOT risk (risk_dist), so a full loss on both lots
-    # is exactly -2.0R, matching "every signal risks 1R per lot, two lots
-    # per signal" rather than the old hardcoded -1.0.
     if "LOSS" in outcome:
         return -2.0
     if outcome == "CLOSED (TP1 HIT / SL BE)":
@@ -1138,8 +1081,6 @@ def bucket_adx(adx: float) -> str:
     return "ADX 45+ (Overextended)"
 
 def bucket_extension(extension_atr) -> str:
-    # Instrumentation bucket -- how far price had already moved beyond its
-    # recent consolidation bracket (in ATR) at the moment a signal fired.
     if extension_atr is None: return "Extension N/A"
     e = float(extension_atr)
     if e < 0.5: return "Extension <0.5 ATR (Early)"
@@ -1179,9 +1120,9 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
         avg_r = (sum(r_values) / n) if n else 0.0
         flag = ""
         if n >= min_sample_to_flag:
-            if win_rate < 35: flag = " \u26a0\ufe0f underperforming"
-            elif win_rate > 65: flag = " \u2705 strong"
-        lines.append(f"\u2022 {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
+            if win_rate < 35: flag = " ⚠️ underperforming"
+            elif win_rate > 65: flag = " ✅ strong"
+        lines.append(f"• {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
     return "\n".join(lines)
 
 
@@ -1199,7 +1140,6 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 
 
 def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.DataFrame:
-    """Apply strategy-specific 5M EMA columns without refetching market data."""
     df_5m = df_5m.copy()
     df_5m["ema_fast"] = df_5m["close"].ewm(span=fast, adjust=False).mean()
     df_5m["ema_slow"] = df_5m["close"].ewm(span=slow, adjust=False).mean()
@@ -1207,365 +1147,246 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 
 
 # =====================================================================
-# STRATEGY C: ONE-WAY MARKET-STRUCTURE + SUPPORT/RESISTANCE PULLBACK (PAPER)
+# STRATEGY C: RANGE BREAKOUT + SUPPORT / RESISTANCE (PAPER)
 # =====================================================================
-# Strategy C deliberately uses NO EMA.  It is a one-direction strategy:
-# determine the dominant direction from market structure, then wait for a
-# pullback/rejection at a meaningful S/R zone before taking a paper trade.
-# The existing C bot/Telegram credentials are retained; no fourth bot is needed.
-BREAKOUT_STRATEGY = "ONE_WAY_SR_PULLBACK"
-BREAKOUT_EXECUTION_MODE = "PAPER"
-
-ONEWAY_SR_LOOKBACK_5M = 72
-ONEWAY_SR_LOOKBACK_15M = 48
-ONEWAY_PIVOT_LEFT = 2
-ONEWAY_PIVOT_RIGHT = 2
-ONEWAY_SR_CLUSTER_ATR = 0.25
-ONEWAY_SR_MIN_STRENGTH = 2.0
-ONEWAY_MIN_ADX_5M = 12.0
-ONEWAY_MAX_ADX_5M = 45.0
-ONEWAY_MIN_ADX_15M = 12.0
-ONEWAY_MAX_ADX_15M = 45.0
-ONEWAY_DIRECTION_LOOKBACK_5M = 18
-ONEWAY_DIRECTION_LOOKBACK_15M = 12
-ONEWAY_MIN_STRUCTURE_ATR = 0.20
-ONEWAY_PULLBACK_TOL_ATR = 0.30
-ONEWAY_REJECTION_WICK_ATR = 0.10
-ONEWAY_MIN_BODY_ATR = 0.15
-ONEWAY_SL_BUFFER_ATR = 0.20
-ONEWAY_TP_BUFFER_ATR = 0.10
-ONEWAY_MIN_ROOM_R = 1.20
-ONEWAY_MAX_TARGET_ATR = 8.0
-ONEWAY_COOLDOWN_MINUTES = 15
-ONEWAY_LAST_SIGNAL_TIME = None
-
-# Keep the old variable name so the rest of the C webhook/state code can use
-# the same third Telegram bot without requiring a new environment variable.
-BREAKOUT_ACTIVE_PENDING = None
-BREAKOUT_MAX_PENDING_MINUTES = 20
+BREAKOUT_SR_LOOKBACK_5M = 72
+BREAKOUT_SR_PIVOT_LEFT = 2
+BREAKOUT_SR_PIVOT_RIGHT = 2
+BREAKOUT_SR_CLUSTER_ATR = 0.25
+BREAKOUT_SR_MIN_TOUCHES = 2
+BREAKOUT_SR_MIN_STRENGTH = 1.0
+BREAKOUT_SR_MAX_TP_ATR = 14.0
+BREAKOUT_SR_MIN_ROOM_R = 0.75
+BREAKOUT_SR_SL_BUFFER_ATR = 0.20
+BREAKOUT_SR_TP_BUFFER_ATR = 0.10
 
 
-def _oneway_sr_pivot_levels(df_5m: pd.DataFrame, atr: float):
-    """Build clustered S/R zones from confirmed 5M swing highs/lows."""
+def _sr_pivot_levels(df_5m: pd.DataFrame, atr: float):
     if atr <= 0 or len(df_5m) < 15:
         return [], []
-    look = df_5m.iloc[-ONEWAY_SR_LOOKBACK_5M:].copy()
-    h = look["high"].astype(float).to_numpy()
-    l = look["low"].astype(float).to_numpy()
-    left, right = ONEWAY_PIVOT_LEFT, ONEWAY_PIVOT_RIGHT
+    look = df_5m.iloc[-BREAKOUT_SR_LOOKBACK_5M:].copy()
+    left = BREAKOUT_SR_PIVOT_LEFT; right = BREAKOUT_SR_PIVOT_RIGHT
     highs, lows = [], []
+    h = look['high'].astype(float).to_numpy(); l = look['low'].astype(float).to_numpy()
     for i in range(left, len(look) - right):
-        window_h = h[i-left:i+right+1]
-        window_l = l[i-left:i+right+1]
-        if h[i] >= np.max(window_h): highs.append((h[i], i))
-        if l[i] <= np.min(window_l): lows.append((l[i], i))
-
-    tol = max(0.05, ONEWAY_SR_CLUSTER_ATR * atr)
+        if h[i] >= max(h[i-left:i+right+1]): highs.append((h[i], i))
+        if l[i] <= min(l[i-left:i+right+1]): lows.append((l[i], i))
+    tol = max(0.05, BREAKOUT_SR_CLUSTER_ATR * atr)
 
     def cluster(points):
         zones = []
         for price, idx in sorted(points, key=lambda x: x[0]):
-            zone = next((z for z in zones if abs(price - z["price"]) <= tol), None)
-            if zone is None:
-                zones.append({"price": float(price), "touches": 1, "last_idx": idx,
-                              "prices": [float(price)]})
+            hit = next((z for z in zones if abs(price-z['price']) <= tol), None)
+            if hit is None:
+                zones.append({'price': price, 'touches': 1, 'last_idx': idx, 'prices': [price]})
             else:
-                zone["prices"].append(float(price))
-                zone["touches"] += 1
-                zone["last_idx"] = max(zone["last_idx"], idx)
-                zone["price"] = float(np.mean(zone["prices"]))
-        n = len(look)
+                hit['prices'].append(price); hit['touches'] += 1
+                hit['last_idx'] = max(hit['last_idx'], idx)
+                hit['price'] = sum(hit['prices']) / len(hit['prices'])
+        n=len(look)
         for z in zones:
-            recent = 1.0 if n - 1 - z["last_idx"] <= 18 else 0.0
-            z["strength"] = float(z["touches"]) + recent
+            recency = 1.0 if n-1-z['last_idx'] <= 18 else 0.0
+            z['strength'] = float(z['touches']) + recency
         return zones
-
     return cluster(lows), cluster(highs)
 
 
-def _oneway_best_below(levels, price):
-    c = [z for z in levels if z["price"] < price and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-    return max(c, key=lambda z: z["price"]) if c else None
+def _sr_nearest(levels, price, direction, max_distance):
+    candidates=[]
+    for z in levels:
+        d=z['price']-price if direction=='above' else price-z['price']
+        if d>0 and d<=max_distance and z['strength']>=BREAKOUT_SR_MIN_STRENGTH:
+            candidates.append((d,z))
+    return min(candidates,key=lambda x:x[0])[1] if candidates else None
 
 
-def _oneway_best_above(levels, price):
-    c = [z for z in levels if z["price"] > price and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-    return min(c, key=lambda z: z["price"]) if c else None
+def _sr_best_below(levels, price):
+    c=[z for z in levels if z['price']<price and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    return max(c,key=lambda z:z['price']) if c else None
 
 
-def _oneway_next_level(levels, price, direction, max_distance):
-    if direction == "above":
-        c = [z for z in levels if 0 < z["price"] - price <= max_distance
-             and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-        return min(c, key=lambda z: z["price"]) if c else None
-    c = [z for z in levels if 0 < price - z["price"] <= max_distance
-         and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-    return max(c, key=lambda z: z["price"]) if c else None
+def _sr_best_above(levels, price):
+    c=[z for z in levels if z['price']>price and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    return min(c,key=lambda z:z['price']) if c else None
 
 
-def _oneway_structure_direction(df: pd.DataFrame, lookback: int):
-    """Return BULLISH/BEARISH/NEUTRAL from swing structure, never EMA."""
-    if df is None or len(df) < max(lookback, 8):
-        return "NEUTRAL", 0.0, "Insufficient structure"
-    d = df.iloc[-lookback:].copy()
-    h = d["high"].astype(float).to_numpy()
-    l = d["low"].astype(float).to_numpy()
-    c = float(d["close"].iloc[-1])
-    left, right = 2, 2
-    swing_highs, swing_lows = [], []
-    for i in range(left, len(d) - right):
-        if h[i] >= np.max(h[i-left:i+right+1]): swing_highs.append(h[i])
-        if l[i] <= np.min(l[i-left:i+right+1]): swing_lows.append(l[i])
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        hh = swing_highs[-1] > swing_highs[-2]
-        hl = swing_lows[-1] > swing_lows[-2]
-        lh = swing_highs[-1] < swing_highs[-2]
-        ll = swing_lows[-1] < swing_lows[-2]
-        span = max(float(np.max(h) - np.min(l)), 1e-9)
-        if hh and hl and c >= swing_lows[-1]:
-            score = ((swing_highs[-1] - swing_highs[-2]) + (swing_lows[-1] - swing_lows[-2])) / span
-            return "BULLISH", abs(score), "Higher-high + higher-low structure"
-        if lh and ll and c <= swing_highs[-1]:
-            score = ((swing_highs[-2] - swing_highs[-1]) + (swing_lows[-2] - swing_lows[-1])) / span
-            return "BEARISH", abs(score), "Lower-high + lower-low structure"
-    # Fallback only when pivots are sparse: directional displacement over the lookback.
-    span = max(float(np.max(h) - np.min(l)), 1e-9)
-    displacement = (c - float(d["close"].iloc[0])) / span
-    if displacement >= 0.30:
-        return "BULLISH", displacement, "Bullish structural displacement"
-    if displacement <= -0.30:
-        return "BEARISH", abs(displacement), "Bearish structural displacement"
-    return "NEUTRAL", abs(displacement), "Mixed/choppy structure"
-
-def _oneway_direction(df_5m: pd.DataFrame, df_15m: pd.DataFrame, adx5: float, adx15: float):
-    """Require aligned 5M/15M market structure; no EMA is involved."""
-    d5, s5, r5 = _oneway_structure_direction(df_5m, ONEWAY_DIRECTION_LOOKBACK_5M)
-    d15, s15, r15 = _oneway_structure_direction(df_15m, ONEWAY_DIRECTION_LOOKBACK_15M)
-    if not (ONEWAY_MIN_ADX_5M <= adx5 < ONEWAY_MAX_ADX_5M):
-        return "NEUTRAL", 0.0, f"5M ADX {adx5:.1f} outside one-way band", d5, d15
-    if not (ONEWAY_MIN_ADX_15M <= adx15 < ONEWAY_MAX_ADX_15M):
-        return "NEUTRAL", 0.0, f"15M ADX {adx15:.1f} outside one-way band", d5, d15
-    if d5 == d15 and d5 in ("BULLISH", "BEARISH"):
-        return d5, (s5 + s15) / 2.0, f"5M {r5}; 15M {r15}", d5, d15
-    return "NEUTRAL", 0.0, f"Structure disagreement: 5M={d5}, 15M={d15}", d5, d15
+def _breakout_sr_plan(df_5m: pd.DataFrame, range_high: float, range_low: float, atr: float, action: str):
+    supports,resistances=_sr_pivot_levels(df_5m,atr)
+    buffer=max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
+    entry=range_high+buffer if action=='BUY' else range_low-buffer
+    max_dist=BREAKOUT_SR_MAX_TP_ATR*atr
+    if action=='BUY':
+        support=_sr_best_below(supports,entry)
+        stop_anchor=min(range_low,support['price']) if support else range_low
+        sl=stop_anchor-BREAKOUT_SR_SL_BUFFER_ATR*atr
+        risk=max(entry-sl,0.01)
+        target=_sr_nearest(resistances,entry,'above',max_dist)
+        if target is not None and target['price'] <= range_high+0.15*atr: target=None
+        if target is None: return None,{'reason':'NO_USABLE_RESISTANCE_ABOVE_BREAKOUT'}
+        tp1=target['price']-BREAKOUT_SR_TP_BUFFER_ATR*atr
+        room_r=(tp1-entry)/risk
+        if room_r<BREAKOUT_SR_MIN_ROOM_R:
+            return None,{'reason':f'NEXT_RESISTANCE_TOO_CLOSE_{room_r:.2f}R','sr':target['price']}
+        upper=[z for z in resistances if z['price']>target['price'] and z['price']-entry<=max_dist and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+        second=min(upper,key=lambda z:z['price']) if upper else None
+        tp2=second['price']-BREAKOUT_SR_TP_BUFFER_ATR*atr if second else tp1
+        return (sl,tp1,tp2),{'support':stop_anchor,'resistance':target['price'],'resistance_strength':target['strength'],'room_r':room_r}
+    resistance=_sr_best_above(resistances,entry)
+    stop_anchor=max(range_high,resistance['price']) if resistance else range_high
+    sl=stop_anchor+BREAKOUT_SR_SL_BUFFER_ATR*atr
+    risk=max(sl-entry,0.01)
+    target=_sr_nearest(supports,entry,'below',max_dist)
+    if target is not None and target['price'] >= range_low-0.15*atr: target=None
+    if target is None: return None,{'reason':'NO_USABLE_SUPPORT_BELOW_BREAKOUT'}
+    tp1=target['price']+BREAKOUT_SR_TP_BUFFER_ATR*atr
+    room_r=(entry-tp1)/risk
+    if room_r<BREAKOUT_SR_MIN_ROOM_R:
+        return None,{'reason':f'NEXT_SUPPORT_TOO_CLOSE_{room_r:.2f}R','sr':target['price']}
+    lower=[z for z in supports if z['price']<target['price'] and entry-z['price']<=max_dist and z['strength']>=BREAKOUT_SR_MIN_STRENGTH]
+    second=max(lower,key=lambda z:z['price']) if lower else None
+    tp2=second['price']+BREAKOUT_SR_TP_BUFFER_ATR*atr if second else tp1
+    return (sl,tp1,tp2),{'resistance':stop_anchor,'support':target['price'],'support_strength':target['strength'],'room_r':room_r}
 
 
-def _oneway_pullback_signal(df_5m: pd.DataFrame, direction: str, supports, resistances, atr: float):
-    """Detect a current-candle pullback/rejection at S/R in the one-way direction."""
+def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
+    atr = float(df_5m['atr'].iloc[-1]) if not pd.isna(df_5m['atr'].iloc[-1]) else 0.0
+    adx5 = float(df_5m['adx'].iloc[-1]) if not pd.isna(df_5m['adx'].iloc[-1]) else 0.0
+    if atr <= 0 or len(df_5m) < max(BREAKOUT_RANGE_LOOKBACKS) + 1:
+        return None
+
+    quiet_market = adx5 < BREAKOUT_MAX_5M_ADX and adx_15m_true < BREAKOUT_MAX_15M_ADX
     curr = df_5m.iloc[-1]
-    o, h, l, c = map(float, (curr["open"], curr["high"], curr["low"], curr["close"]))
-    body = abs(c - o)
-    if atr <= 0:
-        return None
-    body_ok = body / atr >= ONEWAY_MIN_BODY_ATR
-    if direction == "BULLISH":
-        # Prefer support below/around price. The candle must probe the zone and close back above it.
-        candidates = [z for z in supports if z["strength"] >= ONEWAY_SR_MIN_STRENGTH
-                      and abs(l - z["price"]) <= ONEWAY_PULLBACK_TOL_ATR * atr]
-        if not candidates:
-            return None
-        z = min(candidates, key=lambda x: abs(l - x["price"]))
-        rejection = c > z["price"] and c > o and (min(o, c) - l) >= ONEWAY_REJECTION_WICK_ATR * atr
-        if rejection and body_ok:
-            return {"action": "BUY", "level": z, "reason": "Bullish rejection from support"}
-    else:
-        candidates = [z for z in resistances if z["strength"] >= ONEWAY_SR_MIN_STRENGTH
-                      and abs(h - z["price"]) <= ONEWAY_PULLBACK_TOL_ATR * atr]
-        if not candidates:
-            return None
-        z = min(candidates, key=lambda x: abs(h - x["price"]))
-        rejection = c < z["price"] and c < o and (h - max(o, c)) >= ONEWAY_REJECTION_WICK_ATR * atr
-        if rejection and body_ok:
-            return {"action": "SELL", "level": z, "reason": "Bearish rejection from resistance"}
-    return None
+    c_close = float(curr['close']); c_high = float(curr['high']); c_low = float(curr['low'])
+
+    best = None
+    rejections = []
+    fallback_bracket = df_5m.iloc[-(BREAKOUT_RANGE_LOOKBACKS[0] + 1):-1]
+    fallback_high = float(fallback_bracket['high'].max()); fallback_low = float(fallback_bracket['low'].min())
+
+    for lookback in BREAKOUT_RANGE_LOOKBACKS:
+        bracket = df_5m.iloc[-(lookback + 1):-1]
+        high = float(bracket['high'].max()); low = float(bracket['low'].min())
+        width = high - low; width_atr = width / atr
+
+        if width_atr < BREAKOUT_MIN_WIDTH_ATR:
+            rejections.append(f'{lookback}c too tight ({width_atr:.2f} ATR)'); continue
+        if width_atr > BREAKOUT_MAX_WIDTH_ATR:
+            rejections.append(f'{lookback}c too wide ({width_atr:.2f} ATR)'); continue
+
+        if quiet_market:
+            range_type = 'QUIET_CONSOLIDATION'
+        elif width_atr <= BREAKOUT_FLAG_MAX_WIDTH_ATR:
+            range_type = 'FLAG_CONTINUATION'
+        else:
+            rejections.append(f'{lookback}c ADX still elevated (5m {adx5:.1f}, 15m {adx_15m_true:.1f}) and range not tight enough for a flag ({width_atr:.2f} ATR > {BREAKOUT_FLAG_MAX_WIDTH_ATR:.2f})')
+            continue
+
+        if best is None or width_atr < best['width_atr']:
+            best = {'lookback': lookback, 'high': high, 'low': low, 'width': width,
+                    'width_atr': width_atr, 'range_type': range_type}
+
+    base = {'valid': False, 'atr': atr, 'adx5': adx5, 'fake': None}
+    if best is None:
+        base['reason'] = '; '.join(rejections[-3:]) if rejections else 'No qualifying range in any scanned window'
+        base.update({'high': fallback_high, 'low': fallback_low, 'width': fallback_high - fallback_low, 'lookback': BREAKOUT_RANGE_LOOKBACKS[0], 'range_type': 'NONE'})
+        return base
+
+    high, low = best['high'], best['low']
+    base.update({'high': high, 'low': low, 'width': best['width'], 'lookback': best['lookback'], 'range_type': best['range_type']})
+
+    fake_up = c_high > high and c_close <= high and (c_high - high) >= BREAKOUT_FAKE_WICK_ATR * atr
+    fake_down = c_low < low and c_close >= low and (low - c_low) >= BREAKOUT_FAKE_WICK_ATR * atr
+    if c_high >= high or c_low <= low:
+        if not (fake_up or fake_down):
+            base['reason'] = 'Range boundary already breached on current candle -- no late pending order'
+            return base
+    if fake_up and fake_down: base['fake'] = 'AMBIGUOUS_TWO_SIDED_BREAK'
+    elif fake_up: base['fake'] = 'UPSIDE_FAKE_BREAKOUT'
+    elif fake_down: base['fake'] = 'DOWNSIDE_FAKE_BREAKOUT'
+    base.update({'valid': True, 'reason': f"Qualified {best['range_type'].lower().replace('_',' ')} ({best['lookback']}c, {best['width_atr']:.2f} ATR)"})
+    return base
 
 
-def _oneway_trade_plan(df_5m: pd.DataFrame, direction: str, atr: float, entry: float):
-    supports, resistances = _oneway_sr_pivot_levels(df_5m, atr)
-    max_dist = ONEWAY_MAX_TARGET_ATR * atr
-    if direction == "BUY":
-        support = _oneway_best_below(supports, entry)
-        if support is None:
-            return None, {"reason": "NO_STRUCTURAL_SUPPORT_FOR_SL"}
-        sl = support["price"] - ONEWAY_SL_BUFFER_ATR * atr
-        risk = entry - sl
-        if risk <= 0:
-            return None, {"reason": "INVALID_BUY_RISK"}
-        target = _oneway_next_level(resistances, entry, "above", max_dist)
-        if target is None:
-            return None, {"reason": "NO_NEXT_RESISTANCE"}
-        tp1 = target["price"] - ONEWAY_TP_BUFFER_ATR * atr
-        room_r = (tp1 - entry) / risk
-        if room_r < ONEWAY_MIN_ROOM_R:
-            return None, {"reason": f"RESISTANCE_TOO_CLOSE_{room_r:.2f}R", "target": target["price"]}
-        upper = [z for z in resistances if z["price"] > target["price"]
-                 and z["price"] - entry <= max_dist
-                 and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-        second = min(upper, key=lambda z: z["price"]) if upper else None
-        tp2 = second["price"] - ONEWAY_TP_BUFFER_ATR * atr if second else tp1
-        return (sl, tp1, tp2), {"support": support, "resistance": target,
-                                "second_resistance": second, "room_r": room_r}
-    resistance = _oneway_best_above(resistances, entry)
-    if resistance is None:
-        return None, {"reason": "NO_STRUCTURAL_RESISTANCE_FOR_SL"}
-    sl = resistance["price"] + ONEWAY_SL_BUFFER_ATR * atr
-    risk = sl - entry
-    if risk <= 0:
-        return None, {"reason": "INVALID_SELL_RISK"}
-    target = _oneway_next_level(supports, entry, "below", max_dist)
-    if target is None:
-        return None, {"reason": "NO_NEXT_SUPPORT"}
-    tp1 = target["price"] + ONEWAY_TP_BUFFER_ATR * atr
-    room_r = (entry - tp1) / risk
-    if room_r < ONEWAY_MIN_ROOM_R:
-        return None, {"reason": f"SUPPORT_TOO_CLOSE_{room_r:.2f}R", "target": target["price"]}
-    lower = [z for z in supports if z["price"] < target["price"]
-             and entry - z["price"] <= max_dist
-             and z["strength"] >= ONEWAY_SR_MIN_STRENGTH]
-    second = max(lower, key=lambda z: z["price"]) if lower else None
-    tp2 = second["price"] + ONEWAY_TP_BUFFER_ATR * atr if second else tp1
-    return (sl, tp1, tp2), {"resistance": resistance, "support": target,
-                            "second_support": second, "room_r": room_r}
-
-
-def _oneway_pending_from_db():
-    if not DATABASE_URL:
-        return None
+def _breakout_pending_from_db():
+    if not DATABASE_URL: return None
     try:
-        conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("""SELECT id, action, entry_price, sl_price, tp1_price, tp2_price,
-                              created_at, reasoning
-                       FROM signals WHERE strategy=%s AND status='PENDING'
-                       ORDER BY id DESC LIMIT 1""", (BREAKOUT_STRATEGY,))
-        row = cur.fetchone(); cur.close(); conn.close(); return row
-    except Exception as e:
-        logging.error(f"[ONE-WAY DB ERROR] pending load: {e}")
-        return None
+        conn=get_db_connection(); cur=conn.cursor()
+        cur.execute("""SELECT id, action, entry_price, sl_price, tp1_price, tp2_price, pending_buy_price, pending_sell_price, created_at FROM signals WHERE strategy=%s AND status='PENDING_ORDER' AND order_state='OCO_ACTIVE' ORDER BY id DESC LIMIT 1""",(BREAKOUT_STRATEGY,))
+        row=cur.fetchone(); cur.close(); conn.close(); return row
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] pending load: {e}'); return None
 
 
-def _oneway_cooldown_ok(now_wib):
-    global ONEWAY_LAST_SIGNAL_TIME
-    if ONEWAY_LAST_SIGNAL_TIME is None:
-        return True
-    return (now_wib - ONEWAY_LAST_SIGNAL_TIME).total_seconds() >= ONEWAY_COOLDOWN_MINUTES * 60
-
-
-def _oneway_log_scan(decision, reason, direction="NEUTRAL", d5="NEUTRAL", d15="NEUTRAL",
-                     support=None, resistance=None, target=None, room_r=None, adx5=0.0, adx15=0.0):
-    log_scan_event(
-        "STRATEGY_C_SCAN", stage="STRATEGY_C", strategy=BREAKOUT_STRATEGY,
-        execution_mode=BREAKOUT_EXECUTION_MODE, decision=decision, reason=reason,
-        direction=direction, structure_5m=d5, structure_15m=d15,
-        support=float(support) if support is not None else None,
-        resistance=float(resistance) if resistance is not None else None,
-        next_target=float(target) if target is not None else None,
-        room_r=float(room_r) if room_r is not None else None,
-        adx5=float(adx5), adx15=float(adx15)
-    )
-    logging.info(
-        f"[STRATEGY C] {decision} | dir={direction} | 5M={d5} | 15M={d15} | "
-        f"S={support if support is not None else '-'} | R={resistance if resistance is not None else '-'} | "
-        f"target={target if target is not None else '-'} | room={room_r if room_r is not None else '-'}R | {reason}"
-    )
-
-
-def _create_oneway_signal(action, entry, sl, tp1, tp2, reasoning, adx5, adx15, direction):
-    if not DATABASE_URL:
-        return None
+def _set_breakout_pending_state(row_id:int,state:str,outcome:str):
+    if not DATABASE_URL: return
+    conn=None; cur=None
     try:
-        conn = get_db_connection(); cur = conn.cursor()
-        wib = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB')
-        cur.execute("""INSERT INTO signals
-            (timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,tp1,tp1_price,tp2,tp2_price,
-             confidence,adx_15m,stoch_rsi_15m,divergence_type,reasoning,outcome,outcome_timestamp,
-             trend_15m,adx_15m_true,regime,strategy,execution_mode,created_at,order_state)
-            VALUES (%s,'EXECUTED',%s,'ONE_WAY_SR_PULLBACK',%s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,0,'None',%s,'PENDING','',%s,%s,%s,%s,%s,NOW(),'TRIGGERED')
-            RETURNING id""",
-            (wib, action, entry, entry, sl, sl, tp1, tp1, tp2, tp2,
-             .80, adx5, reasoning, direction, adx15, 'ONE_WAY_SR', BREAKOUT_STRATEGY,
-             BREAKOUT_EXECUTION_MODE))
-        row = cur.fetchone(); sid = int(row["id"]) if row else None
-        conn.commit(); cur.close(); conn.close(); return sid
-    except Exception as e:
-        logging.error(f"[ONE-WAY DB ERROR] create signal: {e}")
+        conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE signals SET status='CANCELLED', order_state=%s, outcome=%s, outcome_timestamp=%s WHERE id=%s",(state,outcome,(datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'),int(row_id))); conn.commit()
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] state update: {e}')
+    finally:
         try:
-            cur.close(); conn.close()
+            if cur: cur.close()
+            if conn: conn.close()
         except Exception: pass
-        return None
 
 
-async def evaluate_breakout_strategy(client: httpx.AsyncClient, market_df_5m: pd.DataFrame,
-                                     df_15m: pd.DataFrame, adx_15m_true: float, now_wib: datetime):
-    """Strategy C replacement: one-way structure + S/R pullback, paper only."""
-    global ONEWAY_LAST_SIGNAL_TIME
-    curr = market_df_5m.iloc[-1]
-    atr = float(curr["atr"]) if not pd.isna(curr["atr"]) else 0.0
-    adx5 = float(curr["adx"]) if not pd.isna(curr["adx"]) else 0.0
-    if atr <= 0 or df_15m is None or len(df_15m) < 6:
-        _oneway_log_scan("NO_DATA", "Insufficient 5M/15M data", adx5=adx5, adx15=adx_15m_true)
+def create_breakout_pending_signal(df_5m:pd.DataFrame,range_high:float,range_low:float,atr:float,reasoning:str):
+    buffer=max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr); buy_stop=range_high+buffer; sell_stop=range_low-buffer
+    buy_plan,buy_sr=_breakout_sr_plan(df_5m,range_high,range_low,atr,'BUY'); sell_plan,sell_sr=_breakout_sr_plan(df_5m,range_high,range_low,atr,'SELL')
+    buy_sl=buy_plan[0] if buy_plan else range_low-BREAKOUT_SL_BUFFER_ATR*atr; sell_sl=sell_plan[0] if sell_plan else range_high+BREAKOUT_SL_BUFFER_ATR*atr
+    buy_tp1=buy_plan[1] if buy_plan else buy_stop+max(buy_stop-buy_sl,.01)*BREAKOUT_TP1_R; buy_tp2=buy_plan[2] if buy_plan else buy_tp1
+    sell_tp1=sell_plan[1] if sell_plan else sell_stop-max(sell_sl-sell_stop,.01)*BREAKOUT_TP1_R; sell_tp2=sell_plan[2] if sell_plan else sell_tp1
+    if buy_plan is None: buy_stop=0.0
+    if sell_plan is None: sell_stop=0.0
+    if buy_plan is None and sell_plan is None: return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    if not DATABASE_URL: return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    conn=None; cur=None
+    try:
+        conn=get_db_connection(); cur=conn.cursor(); cur.execute("""INSERT INTO signals (timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,tp1,tp1_price,tp2,tp2_price,confidence,adx_15m,stoch_rsi_15m,divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,adx_15m_true,regime,strategy,execution_mode,created_at,pending_buy_price,pending_sell_price,order_state) VALUES (%s,'PENDING_ORDER','OCO','BUY_STOP/SELL_STOP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'None',%s,'PENDING_ORDER','',%s,%s,%s,%s,%s,NOW(),%s,%s,'OCO_ACTIVE') RETURNING id""",((datetime.now(timezone.utc)+timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S WIB'),buy_stop,buy_stop,buy_sl,buy_sl,buy_tp1,buy_tp1,buy_tp2,buy_tp2,.80,0.0,reasoning,'NEUTRAL',0.0,'RANGE_BREAKOUT',BREAKOUT_STRATEGY,BREAKOUT_EXECUTION_MODE,buy_stop,sell_stop)); row=cur.fetchone(); sid=int(row['id']) if row else None; conn.commit(); return sid,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    except Exception as e: logging.error(f'[BREAKOUT DB ERROR] create pending: {e}'); return None,buy_stop,sell_stop,{'buy':buy_sr,'sell':sell_sr}
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception: pass
+
+
+async def evaluate_breakout_strategy(client:httpx.AsyncClient,market_df_5m:pd.DataFrame,adx_15m_true:float,now_wib:datetime):
+    global BREAKOUT_ACTIVE_PENDING
+    setup=detect_range_breakout_setup(market_df_5m,adx_15m_true); curr=market_df_5m.iloc[-1]; c_high=float(curr['high']); c_low=float(curr['low'])
+    if BREAKOUT_ACTIVE_PENDING is None:
+        dbrow=_breakout_pending_from_db()
+        if dbrow: BREAKOUT_ACTIVE_PENDING=dict(dbrow)
+    if BREAKOUT_ACTIVE_PENDING:
+        p=BREAKOUT_ACTIVE_PENDING; buy_stop=float(p.get('pending_buy_price') or 0); sell_stop=float(p.get('pending_sell_price') or 0); created=p.get('created_at'); age_min=0.0
+        if created:
+            try: age_min=max(0.0,(datetime.now(timezone.utc).replace(tzinfo=None)-created).total_seconds()/60.0)
+            except Exception: pass
+        buy_hit=buy_stop>0 and c_high>=buy_stop; sell_hit=sell_stop>0 and c_low<=sell_stop
+        if buy_hit and sell_hit:
+            _set_breakout_pending_state(p['id'],'CANCELLED','CANCELLED_TWO_SIDED'); await send_telegram_alert(client,f'⚠️ *{BREAKOUT_STRATEGY}* #{p["id"]} cancelled — both stops touched in one 5M candle; order sequence is ambiguous.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
+        if buy_hit or sell_hit:
+            action='BUY' if buy_hit else 'SELL'; entry=buy_stop if buy_hit else sell_stop; atr=float(market_df_5m['atr'].iloc[-1]) if not pd.isna(market_df_5m['atr'].iloc[-1]) else 3.0
+            range_high=buy_stop-max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr); range_low=sell_stop+max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
+            plan,sr=_breakout_sr_plan(market_df_5m,range_high,range_low,atr,action)
+            if plan is None:
+                _set_breakout_pending_state(p['id'],'CANCELLED','CANCELLED_SR_GEOMETRY'); await send_telegram_alert(client,f'⚠️ *{BREAKOUT_STRATEGY}* #{p["id"]} cancelled — S/R geometry no longer provides sufficient room.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
+            sl,tp1,tp2=plan
+            if DATABASE_URL:
+                conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE signals SET status='EXECUTED',action=%s,price=%s,entry_price=%s,sl=%s,sl_price=%s,tp1=%s,tp1_price=%s,tp2=%s,tp2_price=%s,outcome='PENDING',order_state='TRIGGERED' WHERE id=%s",(action,entry,entry,sl,sl,tp1,tp1,tp2,tp2,int(p['id']))); conn.commit(); cur.close(); conn.close()
+            sr_label=f'Next R: ${sr.get("resistance",0):.2f}' if action=='BUY' else f'Next S: ${sr.get("support",0):.2f}'
+            await send_telegram_alert(client,f'🚀 *{BREAKOUT_STRATEGY} — {action} TRIGGERED* #{p["id"]}\n\nEntry: *${entry:.2f}*\nSL: *${sl:.2f}*\nTP1: *${tp1:.2f}*\nTP2: *${tp2:.2f}*\n{sr_label}\nS/R room: *{sr.get("room_r",0):.2f}R*\n\nOCO: *{("SELL STOP cancelled" if action=="BUY" else "BUY STOP cancelled")}*',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
+            BREAKOUT_ACTIVE_PENDING=None; return
+        if age_min>=BREAKOUT_MAX_PENDING_MINUTES:
+            _set_breakout_pending_state(p['id'],'EXPIRED','CANCELLED_EXPIRED'); await send_telegram_alert(client,f'⏱️ *{BREAKOUT_STRATEGY}* #{p["id"]} expired after {BREAKOUT_MAX_PENDING_MINUTES} minutes — both stops cancelled.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); BREAKOUT_ACTIVE_PENDING=None; return
         return
-
-    supports, resistances = _oneway_sr_pivot_levels(market_df_5m, atr)
-    direction, score, direction_reason, d5, d15 = _oneway_direction(
-        market_df_5m, df_15m, adx5, adx_15m_true
-    )
-    nearest_s = _oneway_best_below(supports, float(curr["close"]))
-    nearest_r = _oneway_best_above(resistances, float(curr["close"]))
-    s_price = nearest_s["price"] if nearest_s else None
-    r_price = nearest_r["price"] if nearest_r else None
-
-    if direction == "NEUTRAL":
-        _oneway_log_scan("WAIT", direction_reason, direction, d5, d15, s_price, r_price,
-                          adx5=adx5, adx15=adx_15m_true)
-        return
-
-    signal = _oneway_pullback_signal(market_df_5m, direction, supports, resistances, atr)
-    if signal is None:
-        _oneway_log_scan("WAIT", "No S/R pullback + rejection on current candle", direction,
-                          d5, d15, s_price, r_price, adx5=adx5, adx15=adx_15m_true)
-        return
-
-    if not _oneway_cooldown_ok(now_wib):
-        _oneway_log_scan("COOLDOWN", f"{ONEWAY_COOLDOWN_MINUTES}-minute post-signal cooldown",
-                          direction, d5, d15, s_price, r_price, adx5=adx5, adx15=adx_15m_true)
-        return
-
-    action = signal["action"]
-    entry = float(curr["close"])
-    plan, sr = _oneway_trade_plan(market_df_5m, action, atr, entry)
-    if plan is None:
-        target = sr.get("target")
-        _oneway_log_scan("SR_VETO", sr.get("reason", "Invalid S/R geometry"), direction,
-                          d5, d15, s_price, r_price, target, adx5=adx5, adx15=adx_15m_true)
-        return
-
-    sl, tp1, tp2 = plan
-    sid = _create_oneway_signal(
-        action, entry, sl, tp1, tp2,
-        f"{signal['reason']}; aligned 5M/15M structure; structural S/R SL/TP; no EMA",
-        adx5, adx_15m_true, direction
-    )
-    if sid is None:
-        _oneway_log_scan("DB_ERROR", "Could not persist Strategy C signal", direction,
-                          d5, d15, s_price, r_price, sr["resistance"]["price"] if action == "BUY" else sr["support"]["price"],
-                          sr.get("room_r"), adx5, adx_15m_true)
-        return
-
-    ONEWAY_LAST_SIGNAL_TIME = now_wib
-    target_zone = sr["resistance"] if action == "BUY" else sr["support"]
-    _oneway_log_scan("TRIGGERED", signal["reason"], direction, d5, d15,
-                      s_price, r_price, target_zone["price"], sr["room_r"], adx5, adx_15m_true)
-    await send_telegram_alert(
-        client,
-        f"🟣 *{BREAKOUT_STRATEGY} — {action}* #{sid}\n\n"
-        f"Entry: *${entry:.2f}*\nSL: *${sl:.2f}*\nTP1: *${tp1:.2f}*\nTP2: *${tp2:.2f}*\n\n"
-        f"Direction: *{direction}*\n5M structure: *{d5}* | 15M structure: *{d15}*\n"
-        f"Support: *${s_price:.2f}*\nResistance: *${r_price:.2f}*\n"
-        f"Target S/R: *${target_zone['price']:.2f}*\nRoom: *{sr['room_r']:.2f}R*\n\n"
-        f"🧭 One-way structure + S/R pullback\n⚠️ PAPER ONLY — no EMA used",
-        BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN
-    )
+    if not setup or not setup.get('valid'): return
+    if setup.get('fake'):
+        await send_telegram_alert(client,f'🧨 *FAKE BREAKOUT DETECTED*\n{setup["fake"]}\nRange: ${setup["low"]:.2f} — ${setup["high"]:.2f}\nNo OCO orders armed.',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN); return
+    sid,buy_stop,sell_stop,sr_info=create_breakout_pending_signal(market_df_5m,setup['high'],setup['low'],setup['atr'],f"Qualified {setup['range_type'].lower().replace('_',' ')} ({setup['lookback']}c) + structural Support/Resistance clearance; OCO stops armed only after S/R geometry passed.")
+    if sid is None: return
+    BREAKOUT_ACTIVE_PENDING={'id':sid,'pending_buy_price':buy_stop,'pending_sell_price':sell_stop,'created_at':datetime.now(timezone.utc).replace(tzinfo=None)}
+    buy_desc='valid' if sr_info['buy'].get('resistance') else sr_info['buy'].get('reason','blocked'); sell_desc='valid' if sr_info['sell'].get('support') else sr_info['sell'].get('reason','blocked')
+    await send_telegram_alert(client,f'📦 *{BREAKOUT_STRATEGY} — OCO ARMED #{sid}*\n\nRange: *${setup["low"]:.2f} — ${setup["high"]:.2f}* ({setup["width"]/setup["atr"]:.2f} ATR)\n🟢 BUY STOP: *${buy_stop:.2f}* | S/R: *{buy_desc}*\n🔴 SELL STOP: *${sell_stop:.2f}* | S/R: *{sell_desc}*\n\n5M ADX: *{setup["adx5"]:.1f}* | 15M ADX: *{adx_15m_true:.1f}*\nFake-breakout filter: *PASSED*\nS/R structural filter: *ACTIVE*\n⏱️ Expiry: *{BREAKOUT_MAX_PENDING_MINUTES} min*\n⚖️ First trigger cancels the opposite side.\n\n⚠️ PAPER ONLY',BREAKOUT_TELEGRAM_CHAT_ID,BREAKOUT_TELEGRAM_BOT_TOKEN)
 
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
@@ -1582,10 +1403,6 @@ async def analyze_signal_with_ai(
     c_ema_fast = float(df_5m["ema_fast"].iloc[-1])
     c_ema_slow = float(df_5m["ema_slow"].iloc[-1])
 
-    # FIXED: the veto-rule text is now mode-aware. Range mode ONLY ever fires
-    # when 5M ADX < RANGE_MODE_ADX_MAX by design -- if this prompt still told
-    # the AI reviewer "VETO if ADX < 20", every single range signal would get
-    # auto-vetoed regardless of quality, silently defeating the whole feature.
     if strategy_mode == "RANGE":
         strategy_desc = f"Range Fade / Consolidation (5M Execution, active only when ADX < {RANGE_MODE_ADX_MAX:.0f})"
         range_text = f"5. Range Bracket: High=${range_high:.2f}, Low=${range_low:.2f}" if range_high else ""
@@ -1647,7 +1464,7 @@ Respond strictly in valid JSON matching schema:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure EMA structural alignment.")
+    return SignalOutput(action="HOLD", confidence=0.0, reasoning="AI unavailable: fail-safe HOLD. No trade is authorized without AI review.")
 
 
 # --- SIDE-BY-SIDE BACKGROUND SCANNING LOOP ---
@@ -1663,10 +1480,8 @@ async def evaluate_strategy_cycle(
     execution_mode: str,
     alert_bot_token: str,
     alert_chat_id: str,
+    directional_bias: str = "NEUTRAL",
 ):
-    """Evaluate one strategy on the SAME market snapshot used by the other strategy."""
-    # Strategy-specific EMA pair is passed explicitly; no global EMA state is mutated.
-    # This keeps Control A and Experimental B fully independent.
     df_5m = set_execution_ema_columns(market_df_5m, ema_fast, ema_slow)
 
     curr_price = float(df_5m["close"].iloc[-1])
@@ -1684,928 +1499,122 @@ async def evaluate_strategy_cycle(
         strategy_mode = "RANGE"
         proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
 
-    # Same exhaustion/chop guard for both strategies, isolated by strategy history.
-    if proposed_action in ("BUY", "SELL") and strategy_mode == "TREND":
-        guard_block, guard_metrics = trend_exhaustion_guard(proposed_action, df_5m, strategy)
-        regime_metrics["exhaustion_guard"] = guard_metrics
-        if guard_metrics.get("score", 0) >= EXHAUSTION_SCORE_CAUTION:
-            log_scan_event(
-                "EXHAUSTION_GUARD", stage="RISK", action=proposed_action, price=curr_price,
-                adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                decision="HOLD" if guard_block else "WATCH",
-                reason=f"{strategy}: {guard_metrics.get('reason', '')}", details=guard_metrics
-            )
-        if guard_block:
-            logging.info(f"[{strategy}] [EXHAUSTION GUARD] Blocking {proposed_action}: score={guard_metrics.get('score')} reason={guard_metrics.get('reason')}")
-            proposed_action = "HOLD"
-
-    # Isolated three-loss directional lock.
-    for guarded_direction in ("BUY", "SELL"):
-        if proposed_action != guarded_direction:
-            continue
-        if consecutive_loss_count(guarded_direction, EXHAUSTION_HARD_LOSS_LOCK, strategy) >= EXHAUSTION_HARD_LOSS_LOCK:
-            reset_ok, reset_reason = fresh_directional_expansion_confirmed(guarded_direction, df_5m, trend_15m)
-            if not reset_ok:
-                log_scan_event(
-                    "DIRECTION_LOCKED", stage="RISK", action=guarded_direction, price=curr_price,
-                    adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
-                    decision="HOLD", reason=f"{strategy}: 3-loss directional lock: {reset_reason}"
-                )
-                proposed_action = "HOLD"
-            else:
-                logging.info(f"[{strategy}] [DIRECTION LOCK] {guarded_direction} released: {reset_reason}")
-
-    # Strategy-isolated global loss cooldown.
-    if proposed_action != "HOLD":
-        try:
-            conn = get_db_connection(); cursor = conn.cursor()
-            cursor.execute("""
-                SELECT outcome_timestamp FROM signals
-                WHERE status = 'EXECUTED' AND outcome = 'LOSS (SL HIT)'
-                  AND strategy = %s AND outcome_timestamp IS NOT NULL AND outcome_timestamp != ''
-                ORDER BY id DESC LIMIT 1
-            """, (strategy,))
-            last_loss = cursor.fetchone(); cursor.close(); conn.close()
-            if last_loss and last_loss.get("outcome_timestamp"):
-                last_loss_time = datetime.strptime(str(last_loss["outcome_timestamp"]).replace(" WIB", ""), "%Y-%m-%d %H:%M:%S")
-                if 0 <= (now_wib.replace(tzinfo=None) - last_loss_time).total_seconds() / 60.0 < LOSS_COOLDOWN_MINUTES:
-                    logging.info(f"[{strategy}] [LOSS COOLDOWN] Skipping {proposed_action}.")
-                    proposed_action = "HOLD"
-        except Exception as e:
-            logging.error(f"[{strategy}] loss cooldown check: {e}")
-
-    # Strategy-isolated distance cooldown.
-    if proposed_action != "HOLD":
-        try:
-            conn = get_db_connection(); cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COALESCE(entry_price, price, 0) AS entry_p, outcome
-                FROM signals
-                WHERE status = 'EXECUTED' AND action = %s AND strategy = %s
-                ORDER BY id DESC LIMIT 1
-            """, (str(proposed_action), strategy))
-            last_trade = cursor.fetchone(); cursor.close(); conn.close()
-            if last_trade:
-                required_distance = 2.00 if str(last_trade.get("outcome") or "PENDING") == "PENDING" else 1.50
-                if abs(curr_price - float(last_trade["entry_p"])) < required_distance:
-                    logging.info(f"[{strategy}] [DISTANCE COOLDOWN] Skipping {proposed_action}: Price too close.")
-                    proposed_action = "HOLD"
-        except Exception as e:
-            logging.error(f"[{strategy}] distance cooldown check: {e}")
-
     if proposed_action == "HOLD":
-        logging.info(
-            f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | EMA{ema_fast}: ${curr_ema_fast:.2f} | "
-            f"EMA{ema_slow}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | "
-            f"15mTrend: {trend_15m} | Status: HOLD"
+        log_scan_event(
+            "SCAN_IDLE", stage="SIGNAL_DETECTION", decision="HOLD", reason=trigger_type,
+            price=curr_price, adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+            details={"strategy": strategy, "mode": strategy_mode, "ema_fast": curr_ema_fast, "ema_slow": curr_ema_slow}
         )
         return
 
-    logging.info(f"[{strategy}] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
-    ai_decision = await analyze_signal_with_ai(
-        proposed_action, trigger_type, curr_price, df_5m, trend_15m,
-        adx_15m_true, strategy_mode, range_high, range_low, ema_fast, ema_slow
+    # Check 1H Directional Bias filter
+    if directional_bias != "NEUTRAL" and proposed_action != directional_bias:
+        reason = f"Blocked by 1H Directional Bias filter ({directional_bias} bias active)"
+        log_scan_event(
+            "SCAN_VETO", stage="BIAS_FILTER", action=proposed_action, trigger_type=trigger_type,
+            price=curr_price, adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+            decision="VETOED", reason=reason, details={"strategy": strategy, "directional_bias": directional_bias}
+        )
+        return
+
+    # Check Trend Exhaustion / Chop Guard
+    if strategy_mode == "TREND":
+        blocked, metrics = trend_exhaustion_guard(proposed_action, df_5m, strategy=strategy)
+        regime_metrics = metrics
+        if blocked:
+            confirmed, exp_reason = fresh_directional_expansion_confirmed(proposed_action, df_5m, trend_15m)
+            if not confirmed:
+                reason = f"Blocked by Trend Exhaustion Guard ({metrics.get('status')} state, score {metrics.get('score')}): {metrics.get('reason')} | Expansion check: {exp_reason}"
+                log_scan_event(
+                    "SCAN_VETO", stage="EXHAUSTION_GUARD", action=proposed_action, trigger_type=trigger_type,
+                    price=curr_price, adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+                    decision="VETOED", reason=reason, details={"strategy": strategy, "exhaustion": metrics}
+                )
+                return
+
+    # Pass to AI Analyst for final approval
+    ai_output = await analyze_signal_with_ai(
+        proposed_action=proposed_action,
+        trigger_type=trigger_type,
+        current_price=curr_price,
+        df_5m=df_5m,
+        trend_15m=trend_15m,
+        adx_15m_true=adx_15m_true,
+        strategy_mode=strategy_mode,
+        range_high=range_high,
+        range_low=range_low,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow
     )
 
-    atr_5m = float(df_5m["atr"].iloc[-1]) if not pd.isna(df_5m["atr"].iloc[-1]) else 3.0
-    entry_extension_atr, entry_climax_ratio = compute_entry_extension(df_5m, proposed_action)
+    if ai_output.action == "HOLD":
+        log_scan_event(
+            "SCAN_VETO", stage="AI_REVIEW", action=proposed_action, trigger_type=trigger_type,
+            price=curr_price, adx_5m=adx_5m, adx_15m=adx_15m_true, trend_15m=trend_15m,
+            decision="VETOED", reason=f"AI Veto: {ai_output.reasoning}",
+            details={"strategy": strategy, "ai_confidence": ai_output.confidence}
+        )
+        return
 
-    if strategy_mode == "RANGE":
+    # Compute Risk Parameters
+    atr_val = float(df_5m["atr"].iloc[-1]) if "atr" in df_5m.columns and not pd.isna(df_5m["atr"].iloc[-1]) else 2.5
+    if strategy_mode == "RANGE" and range_high is not None and range_low is not None:
         if proposed_action == "BUY":
-            sl_price = range_low - RANGE_SL_BUFFER_ATR_MULT * atr_5m
+            sl_price = range_low - (RANGE_SL_BUFFER_ATR_MULT * atr_val)
+            tp1_price = curr_price + (abs(curr_price - sl_price) * 1.5)
             tp2_price = range_high
-            tp1_price = curr_price + (tp2_price - curr_price) * 0.5
         else:
-            sl_price = range_high + RANGE_SL_BUFFER_ATR_MULT * atr_5m
+            sl_price = range_high + (RANGE_SL_BUFFER_ATR_MULT * atr_val)
+            tp1_price = curr_price - (abs(sl_price - curr_price) * 1.5)
             tp2_price = range_low
-            tp1_price = curr_price - (curr_price - tp2_price) * 0.5
-        tp1_r_mult = abs(tp1_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
-        tp2_r_mult = abs(tp2_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
     else:
-        risk = max(2.5, atr_5m * 1.0)
-        tp1_r_mult = 1.5
-        tp2_r_mult = 2.5
-        sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
-        tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
-        tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
-
-    if ai_decision.action == proposed_action:
-        new_id = log_trade_signal(
-            "EXECUTED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
-            float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
-            trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
-            strategy_mode, regime_metrics, strategy, execution_mode
-        )
-        mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else "🚀 TREND"
-        paper_tag = " [PAPER]" if execution_mode == "PAPER" else " [LIVE]"
-        msg = (
-            f"{mode_tag} *{strategy}{paper_tag} SIGNAL #{new_id}*\n\n"
-            f"Asset: *XAUUSD*\nAction: *{proposed_action}*\nType: *{trigger_type}*\n"
-            f"Entry Price: *${curr_price:.2f}*\n\n"
-            f"Stop Loss: *${sl_price:.2f}*\n"
-            f"TP1 ({tp1_r_mult:.1f}R): *${tp1_price:.2f}*\n"
-            f"TP2 ({tp2_r_mult:.1f}R): *${tp2_price:.2f}*\n\n"
-            f"Execution: *{execution_mode}*\nReasoning: {ai_decision.reasoning}"
-        )
-        await send_telegram_alert(client, msg, target_chat_id=alert_chat_id, target_bot_token=alert_bot_token)
-    else:
-        log_trade_signal(
-            "VETOED", proposed_action, trigger_type, curr_price, sl_price, tp1_price, tp2_price,
-            float(ai_decision.confidence), adx_5m, 0.0, "None", ai_decision.reasoning,
-            trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
-            strategy_mode, regime_metrics, strategy, execution_mode
-        )
-
-
-async def background_scanning_loop():
-    global SYSTEM_TRADING_ENABLED, CURRENT_SCAN_CYCLE_ID, cached_15m
-
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        last_processed_candle_time = None
-        last_claimed_bucket = None
-
-        while True:
-            try:
-                now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
-                current_hour_wib = now_wib.hour
-
-                if not SYSTEM_TRADING_ENABLED:
-                    if now_wib.minute % 5 == 0 and now_wib.second < 5:
-                        logging.info("[SLEEP STATUS] Bot is PAUSED via kill switch. Waiting...")
-                    await asyncio.sleep(60)
-                    continue
-
-                active_session = ACTIVE_SESSION_START_HOUR <= current_hour_wib < ACTIVE_SESSION_END_HOUR
-                if not active_session:
-                    if now_wib.minute % 5 == 0 and now_wib.second < 5:
-                        logging.info(f"[SLEEP STATUS] Out of session ({ACTIVE_SESSION_START_HOUR}:00 - {ACTIVE_SESSION_END_HOUR}:00 WIB). Waiting...")
-                    await asyncio.sleep(60)
-                    continue
-
-                if not is_forex_market_open(now_wib):
-                    if now_wib.minute % 30 == 0 and now_wib.second < 5:
-                        logging.info("[SLEEP STATUS] Market closed (weekend, WIB). Waiting for reopen...")
-                    await asyncio.sleep(120)
-                    continue
-
-                if now_wib.minute % 5 != 0 or now_wib.second > 45:
-                    await asyncio.sleep(2)
-                    continue
-
-                current_bucket = now_wib.strftime("%Y-%m-%d %H:%M")
-                if current_bucket == last_claimed_bucket:
-                    await asyncio.sleep(20)
-                    continue
-                last_claimed_bucket = current_bucket
-
-                if not twelve_data_budget_ok(now_wib):
-                    await asyncio.sleep(20)
-                    continue
-
-                # ONE shared 5M request for both strategies.
-                df_5m = await fetch_timeframe_data(client, "5min", now_wib=now_wib)
-                if df_5m is None or len(df_5m) < 6:
-                    logging.warning("[SCAN LOOP] 5M fetch failed or insufficient data this window; will retry next candle.")
-                    await asyncio.sleep(15)
-                    continue
-
-                df_5m = calculate_metrics_tf(df_5m)
-                candle_time_5m = df_5m["datetime"].iloc[-1]
-                if last_processed_candle_time is not None and candle_time_5m == last_processed_candle_time:
-                    await asyncio.sleep(5)
-                    continue
-                last_processed_candle_time = candle_time_5m
-
-                CURRENT_SCAN_CYCLE_ID = f"{now_wib.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
-                log_scan_event("SCAN_START", stage="SCAN", decision="STARTED", reason="Shared 5M market snapshot for A/B/C experiment")
-
-                curr_high = float(df_5m["high"].iloc[-1])
-                curr_low = float(df_5m["low"].iloc[-1])
-                update_open_trades(curr_high, curr_low)
-
-                # ONE shared 15M refresh/cache for both strategies.
-                need_refresh = (
-                    cached_15m["df"] is None or cached_15m["fetched_at"] is None or
-                    (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES))
-                )
-                if need_refresh and twelve_data_budget_ok(now_wib):
-                    df_15m_raw = await fetch_timeframe_data(client, "15min", now_wib=now_wib)
-                    if df_15m_raw is not None and len(df_15m_raw) >= 21:
-                        cached_15m["df"] = calculate_metrics_tf(df_15m_raw)
-                        cached_15m["fetched_at"] = datetime.now(timezone.utc)
-
-                trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
-                adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
-
-                # CONTROL A: existing Exhaustion Guard v1, EMA 5/9, LIVE.
-                await evaluate_strategy_cycle(
-                    client, df_5m, trend_15m, adx_15m_true, now_wib,
-                    CONTROL_STRATEGY, 5, 9, CONTROL_EXECUTION_MODE,
-                    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-                )
-
-                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, PAPER.
-                # It receives the exact same candles and 15M confluence snapshot.
-                await evaluate_strategy_cycle(
-                    client, df_5m, trend_15m, adx_15m_true, now_wib,
-                    EXPERIMENTAL_STRATEGY, EXPERIMENTAL_EMA_FAST, EXPERIMENTAL_EMA_SLOW,
-                    EXPERIMENTAL_EXECUTION_MODE, EXPERIMENTAL_TELEGRAM_BOT_TOKEN,
-                    EXPERIMENTAL_TELEGRAM_CHAT_ID
-                )
-
-                # STRATEGY C: Range Breakout OCO (paper), same shared market snapshot.
-                if BREAKOUT_TELEGRAM_BOT_TOKEN and BREAKOUT_TELEGRAM_CHAT_ID:
-                    await evaluate_breakout_strategy(client, df_5m, cached_15m["df"], adx_15m_true, now_wib)
-
-                del df_5m
-                gc.collect()
-                await asyncio.sleep(5)
-
-            except Exception as e:
-                logging.error(f"[SCAN LOOP ERROR] {e}")
-                await asyncio.sleep(10)
-
-
-# --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    if not EXPERIMENTAL_TELEGRAM_BOT_TOKEN or not EXPERIMENTAL_TELEGRAM_CHAT_ID:
-        logging.warning("[A/B] Experimental Telegram credentials are not configured; experimental signals will still be logged to DB but Telegram alerts will be skipped.")
-    if APP_URL:
-        try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                if TELEGRAM_BOT_TOKEN:
-                    webhook_a = f"{APP_URL.rstrip('/')}/telegram-webhook"
-                    set_a = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-                    res_a = await client.post(set_a, data={"url": webhook_a})
-                    logging.info(f"[CONTROL WEBHOOK SETUP] {res_a.text}")
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
-                        {"command":"start","description":"Show Control bot commands"},
-                        {"command":"help","description":"Show Control command menu"},
-                        {"command":"status","description":"MT5/server/API status"},
-                        {"command":"stats","description":"Live EMA 5/9 performance"},
-                        {"command":"pips","description":"Pips and USD breakdown"},
-                        {"command":"logs","description":"Last 10 live trades"},
-                        {"command":"analyze","description":"Forward-test analysis"},
-                        {"command":"pause","description":"Emergency kill switch"},
-                        {"command":"resume","description":"Resume auto-trading"}
-                    ]})
-                if EXPERIMENTAL_TELEGRAM_BOT_TOKEN:
-                    webhook_b = f"{APP_URL.rstrip('/')}/telegram-webhook-b"
-                    set_b = f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setWebhook"
-                    res_b = await client.post(set_b, data={"url": webhook_b})
-                    logging.info(f"[EXPERIMENTAL WEBHOOK SETUP] {res_b.text}")
-                    await client.post(f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
-                        {"command":"start","description":"Show A/B bot commands"},
-                        {"command":"help","description":"Show A/B command menu"},
-                        {"command":"stats","description":"A/B performance dashboard"},
-                        {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
-                        {"command":"status","description":"Read-only system status"},
-                        {"command":"last","description":"Last 10 paper trades"}
-                    ]})
-                if BREAKOUT_TELEGRAM_BOT_TOKEN:
-                    webhook_c = f"{APP_URL.rstrip('/')}/telegram-webhook-c"
-                    set_c = f"https://api.telegram.org/bot{BREAKOUT_TELEGRAM_BOT_TOKEN}/setWebhook"
-                    res_c = await client.post(set_c, data={"url": webhook_c})
-                    logging.info(f"[BREAKOUT WEBHOOK SETUP] {res_c.text}")
-                    await client.post(f"https://api.telegram.org/bot{BREAKOUT_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
-                        {"command":"start","description":"Show one-way S/R bot commands"},
-                        {"command":"help","description":"Show one-way S/R command menu"},
-                        {"command":"status","description":"One-way/S/R status"},
-                        {"command":"stats","description":"Strategy C performance"},
-                        {"command":"range","description":"Current S/R analysis"},
-                        {"command":"last","description":"Last Strategy C signals"},
-                        {"command":"cancel","description":"Cancel active paper state"}
-                    ]})
-        except Exception as e:
-            logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
-
-    scan_task = asyncio.create_task(background_scanning_loop())
-    yield
-    scan_task.cancel()
-
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "A/B/C scanner active: EMA 5/9 LIVE + EMA 5/15 PAPER + ONE-WAY S/R PAPER.", "comparison": "/ab-comparison"}
-
-
-# =====================================================================
-# MT5 COPIER BRIDGE API ENDPOINT
-# =====================================================================
-@app.get("/get-latest-signal")
-async def get_latest_signal():
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
-
-    LAST_MT5_PING_TIME = datetime.now(timezone.utc) + timedelta(hours=7)
-
-    if not SYSTEM_TRADING_ENABLED:
-        return {"signal": None, "trading_enabled": False, "status": "PAUSED"}
-    if not DATABASE_URL:
-        return {"signal": None, "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
-            FROM signals
-            WHERE status = 'EXECUTED' AND strategy = %s AND execution_mode = 'LIVE'
-            ORDER BY id DESC LIMIT 1;
-        """, (CONTROL_STRATEGY,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if row:
-            return {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "trading_enabled": True}
-        return {"signal": None, "trading_enabled": True}
-    except Exception as e:
-        logging.error(f"[MT5 BRIDGE ERROR] {e}")
-        return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
-
-
-# =====================================================================
-# A/B COMPARISON ENDPOINT (READ-ONLY)
-# =====================================================================
-@app.get("/ab-comparison")
-async def ab_comparison():
-    if not DATABASE_URL:
-        return {"error": "DATABASE_URL not set"}
-    try:
-        conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("""
-            SELECT strategy, execution_mode,
-                   COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
-                   COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
-                   COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
-                   COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
-                   COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
-            FROM signals
-            WHERE strategy IN (%s, %s)
-            GROUP BY strategy, execution_mode
-            ORDER BY strategy;
-        """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
-        rows=cur.fetchall(); cur.close(); conn.close()
-        result={}
-        for r in rows:
-            executed=int(r["executed"] or 0); wins=int(r["wins"] or 0)
-            result[str(r["strategy"])] = {
-                "execution_mode": r["execution_mode"], "executed": executed,
-                "vetoed": int(r["vetoed"] or 0), "wins": wins,
-                "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
-                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
-                "net_pips": round(float(r["net_pips"] or 0), 2),
-                "net_usd": round(float(r["net_usd"] or 0), 2),
-                "avg_r": round(float(r["avg_r"] or 0), 3),
-            }
-        return {"control": result.get(CONTROL_STRATEGY, {}), "experimental": result.get(EXPERIMENTAL_STRATEGY, {})}
-    except Exception as e:
-        logging.error(f"[A/B COMPARISON ERROR] {e}")
-        return {"error": str(e)}
-
-
-# --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
-async def _handle_telegram_webhook(request: Request, bot_role: str):
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, BREAKOUT_ACTIVE_PENDING
-    try:
-        data = await request.json()
-        message = data.get("message", {})
-        raw_text = message.get("text", "").strip().lower()
-        sender_chat_id = str(message.get("chat", {}).get("id", ""))
-
-        if not sender_chat_id or not raw_text: return {"status": "ignored"}
-
-        # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
-        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume"}
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/range", "/last", "/cancel"}
-        allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
-        if raw_text not in allowed:
-            return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
-
-        active_token = BREAKOUT_TELEGRAM_BOT_TOKEN if bot_role == "breakout" else (EXPERIMENTAL_TELEGRAM_BOT_TOKEN if bot_role == "experimental" else TELEGRAM_BOT_TOKEN)
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            async def send_reply(text: str):
-                await send_telegram_alert(client, text, target_chat_id=sender_chat_id, target_bot_token=active_token)
-
-            if raw_text in ["/help", "/start"]:
-                if bot_role == "breakout":
-                    reply = (
-                        "🟣 *ONE-WAY S/R BOT COMMANDS:*\n\n"
-                        "• `/status` - Current one-way/S/R status\n"
-                        "• `/stats` - Strategy C performance\n"
-                        "• `/range` - Current S/R and direction analysis\n"
-                        "• `/last` - Last Strategy C signals\n"
-                        "• `/cancel` - Confirm paper-only status\n"
-                        "• `/help` - Display this menu\n\n"
-                        "🟣 Strategy: *One-Way Market Structure + S/R Pullback*\n"
-                        "⚠️ PAPER ONLY — Strategy C does not place live MT5 orders."
-                    )
-                elif bot_role == "experimental":
-                    reply = (
-                        "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
-                        "• `/stats` - A/B performance dashboard\n"
-                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
-                        "• `/status` - Read-only system status\n"
-                        "• `/last` - Last 10 experimental paper trades\n"
-                        "• `/help` - Display this command menu\n\n"
-                        "🔵 Strategy: *EMA 5/15 — PAPER ONLY*\n"
-                        "🛡️ This bot cannot control MT5 live trading.\n"
-                    )
-                else:
-                    reply = (
-                        f"🤖 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
-                        "• `/status` - Real-time MT5, server & API status\n"
-                        "• `/stats` - Original live/control performance dashboard\n"
-                        "• `/pips` - Gross/net pips & USD breakdown\n"
-                        "• `/logs` - Last 10 executed trades\n"
-                        "• `/analyze` - Forward-test strategy analysis\n"
-                        "• `/pause` - 🚨 Emergency kill switch\n"
-                        "• `/resume` - 🟢 Re-enable auto-trading\n"
-                        "• `/help` - Display this command menu\n\n"
-                        f"⚖️ Execution: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
-                    )
-                await send_reply(reply)
-
-            elif raw_text == "/status":
-                if LAST_MT5_PING_TIME:
-                    now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
-                    seconds_ago = (now_wib.replace(tzinfo=None) - LAST_MT5_PING_TIME.replace(tzinfo=None)).total_seconds()
-
-                    if seconds_ago < 60:
-                        status_icon = "\U0001f7e2"
-                        conn_msg = f"Connected and Active\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
-                    elif seconds_ago < 180:
-                        status_icon = "\U0001f7e1"
-                        conn_msg = f"Slight Lag\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
-                    else:
-                        status_icon = "\U0001f534"
-                        conn_msg = f"DISCONNECTED\n\u2022 Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
-
-                    remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
-                    budget_pct = (_twelve_data_call_count / TWELVE_DATA_DAILY_LIMIT * 100) if TWELVE_DATA_DAILY_LIMIT else 0.0
-                    budget_icon = "\U0001f7e2" if budget_pct < 70 else ("\U0001f7e1" if budget_pct < 90 else "\U0001f534")
-                    reply = (
-                        f"{status_icon} *SYSTEM & BRIDGE STATUS*\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\u2022 Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
-                        f"\u2022 MT5 Bridge: *{conn_msg}*\n"
-                        f"\u2022 Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`\n\n"
-                        f"{budget_icon} *TWELVEDATA API BUDGET:*\n"
-                        f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
-                        f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']}\n\n"
-                        f"\U0001f4c8 *STRATEGY:*\n"
-                        f"\u2022 Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
-                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
-                        f"\u2022 Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
-                    )
-                else:
-                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
-                await send_reply(reply)
-
-            elif bot_role == "control" and raw_text == "/pause":
-                SYSTEM_TRADING_ENABLED = False
-                await send_reply("\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.")
-
-            elif bot_role == "control" and raw_text == "/resume":
-                SYSTEM_TRADING_ENABLED = True
-                await send_reply("\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
-
-            elif bot_role == "breakout" and raw_text == "/status":
-                try:
-                    df_cmd = await fetch_timeframe_data(client, "5min")
-                    if df_cmd is None or len(df_cmd) < 20:
-                        await send_reply("⚠️ Not enough 5M data for Strategy C status.")
-                    else:
-                        df_cmd = calculate_metrics_tf(df_cmd)
-                        atr = float(df_cmd["atr"].iloc[-1]) if not pd.isna(df_cmd["atr"].iloc[-1]) else 0.0
-                        adx5 = float(df_cmd["adx"].iloc[-1]) if not pd.isna(df_cmd["adx"].iloc[-1]) else 0.0
-                        supports, resistances = _oneway_sr_pivot_levels(df_cmd, atr)
-                        d5, _, r5 = _oneway_structure_direction(df_cmd, ONEWAY_DIRECTION_LOOKBACK_5M)
-                        reply = (
-                            "🟣 *STRATEGY C — ONE-WAY S/R STATUS*\n\n"
-                            f"5M Structure: *{d5}*\n"
-                            f"5M ADX: *{adx5:.1f}*\n"
-                            f"Support: *${(_oneway_best_below(supports, float(df_cmd['close'].iloc[-1])) or {'price': 0})['price']:.2f}*\n"
-                            f"Resistance: *${(_oneway_best_above(resistances, float(df_cmd['close'].iloc[-1])) or {'price': 0})['price']:.2f}*\n"
-                            f"Last close: *${float(df_cmd['close'].iloc[-1]):.2f}*\n"
-                            f"Paper mode: *{BREAKOUT_EXECUTION_MODE}*\n"
-                            "\nNo EMA is used by Strategy C."
-                        )
-                        await send_reply(reply)
-                except Exception as e:
-                    await send_reply(f"⚠️ Strategy C status error: {e}")
-
-            elif bot_role == "breakout" and raw_text == "/range":
-                try:
-                    df_cmd = await fetch_timeframe_data(client, "5min")
-                    df15_cmd = await fetch_timeframe_data(client, "15min")
-                    if df_cmd is None or df15_cmd is None or len(df_cmd) < 20 or len(df15_cmd) < 12:
-                        await send_reply("⚠️ Not enough market data for Strategy C analysis.")
-                    else:
-                        df_cmd = calculate_metrics_tf(df_cmd)
-                        df15_cmd = calculate_metrics_tf(df15_cmd)
-                        atr = float(df_cmd["atr"].iloc[-1]) if not pd.isna(df_cmd["atr"].iloc[-1]) else 0.0
-                        adx5 = float(df_cmd["adx"].iloc[-1]) if not pd.isna(df_cmd["adx"].iloc[-1]) else 0.0
-                        adx15 = float(df15_cmd["adx"].iloc[-1]) if not pd.isna(df15_cmd["adx"].iloc[-1]) else 0.0
-                        direction, score, reason, d5, d15 = _oneway_direction(df_cmd, df15_cmd, adx5, adx15)
-                        supports, resistances = _oneway_sr_pivot_levels(df_cmd, atr)
-                        price = float(df_cmd["close"].iloc[-1])
-                        sup = _oneway_best_below(supports, price)
-                        res = _oneway_best_above(resistances, price)
-                        pull = _oneway_pullback_signal(df_cmd, direction, supports, resistances, atr) if direction != "NEUTRAL" else None
-                        await send_reply(
-                            "🧭 *STRATEGY C — ONE-WAY MARKET STRUCTURE*\n\n"
-                            f"Direction: *{direction}* (5M {d5} / 15M {d15})\n"
-                            f"5M ADX: *{adx5:.1f}* | 15M ADX: *{adx15:.1f}*\n"
-                            f"Support: *${sup['price']:.2f}*\n" if sup else
-                            "🧭 *STRATEGY C — ONE-WAY MARKET STRUCTURE*\n\n"
-                            f"Direction: *{direction}* (5M {d5} / 15M {d15})\n"
-                            f"5M ADX: *{adx5:.1f}* | 15M ADX: *{adx15:.1f}*\n"
-                            "Support: *NONE*\n"
-                        )
-                        await send_reply(
-                            (f"Resistance: *${res['price']:.2f}*\n" if res else "Resistance: *NONE*\n") +
-                            f"Pullback trigger: *{'READY' if pull else 'WAITING'}*\n"
-                            f"Reason: {reason}\n\nNo EMA is used. C waits for a one-way S/R pullback/rejection."
-                        )
-                except Exception as e:
-                    await send_reply(f"⚠️ Strategy C analysis error: {e}")
-
-            elif bot_role == "breakout" and raw_text == "/cancel":
-                await send_reply("ℹ️ Strategy C has no live MT5 order to cancel. It is PAPER-only and uses immediate paper signals.")
-
-            elif bot_role == "breakout" and raw_text == "/stats":
-                try:
-                    conn=get_db_connection(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FILTER (WHERE status='EXECUTED') AS executed, COUNT(*) FILTER (WHERE status='CANCELLED') AS cancelled, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins, COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses, COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r, COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r FROM signals WHERE strategy=%s""",(BREAKOUT_STRATEGY,))
-                    s=cur.fetchone(); cur.close(); conn.close(); ex=int(s['executed'] or 0); wins=int(s['wins'] or 0); losses=int(s['losses'] or 0)
-                    await send_reply(f"🟣 *ONE-WAY S/R PERFORMANCE*\n━━━━━━━━━━━━━━━━━━━━\nExecuted: *{ex}* | Cancelled: *{int(s['cancelled'] or 0)}*\nWins/Losses: *{wins}/{losses}*\nWin Rate: *{(wins/ex*100 if ex else 0):.1f}%*\nTotal R: *{float(s['total_r'] or 0):+.2f}R* | Avg R: *{float(s['avg_r'] or 0):+.3f}R*\nMode: *{BREAKOUT_EXECUTION_MODE}*\nEMA: *NOT USED*\nS/R pullback: *ACTIVE*")
-                except Exception as e: await send_reply(f"⚠️ Error querying breakout stats: {e}")
-
-            elif bot_role == "breakout" and raw_text == "/last":
-                try:
-                    conn=get_db_connection(); cur=conn.cursor(); cur.execute("SELECT id,action,trigger_type,entry_price,outcome,created_at FROM signals WHERE strategy=%s ORDER BY id DESC LIMIT 10",(BREAKOUT_STRATEGY,)); rows=cur.fetchall(); cur.close(); conn.close()
-                    if not rows: reply="📋 *LAST STRATEGY C SIGNALS*\n\n_No breakout events yet._"
-                    else: reply="📋 *LAST STRATEGY C SIGNALS*\n\n"+"\n".join(f"#{r['id']} | {r['action']} | {r['trigger_type']} | ${float(r['entry_price'] or 0):.2f} | {r['outcome'] or 'N/A'}" for r in rows)
-                    await send_reply(reply)
-                except Exception as e: await send_reply(f"⚠️ Error querying breakout logs: {e}")
-
-            elif bot_role == "control" and raw_text == "/stats":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED' AND strategy = %s", (CONTROL_STRATEGY,))
-                    total_executed = cur.fetchone()["total"] or 0
-                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED' AND strategy = %s", (CONTROL_STRATEGY,))
-                    total_vetoes = cur.fetchone()["vetoes"] or 0
-                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (CONTROL_STRATEGY,))
-                    total_pending = cur.fetchone()["pending"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%%' OR outcome LIKE 'CLOSED%%')", (CONTROL_STRATEGY,))
-                    tp1_wins = cur.fetchone()["tp1_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%%'", (CONTROL_STRATEGY,))
-                    tp2_wins = cur.fetchone()["tp2_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (CONTROL_STRATEGY,))
-                    losses = cur.fetchone()["losses"] or 0
-
-                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (CONTROL_STRATEGY,))
-                    closed_trades = cur.fetchall()
-                    total_pips = win_pips = loss_pips = 0.0
-                    total_wins_count = tp1_wins + tp2_wins
-
-                    for t in closed_trades:
-                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
-                        total_pips += trade_pips
-                        if trade_pips > 0: win_pips += trade_pips
-                        elif trade_pips < 0: loss_pips += abs(trade_pips)
-
-                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                    est_dollar = total_pips * 0.10
-                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
-                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
-                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
-                    cur.close(); conn.close()
-
-                    reply = (
-                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
-                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
-                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
-                        f"\u2022 Total Executed: *{total_executed}*\n"
-                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
-                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
-                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
-                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
-                        f"\u2022 Active Pending: *{total_pending}*\n\n"
-                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
-                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
-                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
-                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
-                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
-                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
-                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
-                    )
-                    await send_reply(reply)
-                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
-
-            elif ((bot_role == "experimental" and raw_text in ("/stats", "/compare"))):
-                try:
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("""
-                        SELECT strategy, execution_mode,
-                               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
-                               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'WIN%%') AS wins,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
-                               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
-                               COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
-                               COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
-                               COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
-                        FROM signals
-                        WHERE strategy IN (%s, %s)
-                        GROUP BY strategy, execution_mode
-                        ORDER BY strategy;
-                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
-                    rows = cur.fetchall()
-                    stats = {}
-                    for r in rows:
-                        executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
-                        net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
-                        total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
-                        # Profit factor from stored result_pips, falling back to R when needed.
-                        cur.execute("""
-                            SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
-                                   COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
-                            FROM signals WHERE status='EXECUTED' AND strategy=%s AND result_pips IS NOT NULL
-                        """, (r["strategy"],))
-                        pfrow = cur.fetchone(); gross_win = float(pfrow["gross_win"] or 0); gross_loss = float(pfrow["gross_loss"] or 0)
-                        pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
-                        stats[str(r["strategy"])] = {
-                            "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
-                            "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
-                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
-                            "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
-                        }
-
-                    # Calculate current maximum consecutive SL streak per strategy.
-                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
-                        cur.execute("""
-                            SELECT outcome FROM signals
-                            WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
-                            ORDER BY id ASC
-                        """, (strategy,))
-                        streak = best = 0
-                        for rr in cur.fetchall():
-                            if str(rr["outcome"]).startswith("LOSS"):
-                                streak += 1; best = max(best, streak)
-                            else:
-                                streak = 0
-                        stats.setdefault(strategy, {})["max_loss_streak"] = best
-
-                    cur.close(); conn.close()
-                    a = stats.get(CONTROL_STRATEGY, {})
-                    b = stats.get(EXPERIMENTAL_STRATEGY, {})
-                    leader = "Not enough data"
-                    if a.get("executed", 0) or b.get("executed", 0):
-                        if a.get("total_r", 0) > b.get("total_r", 0): leader = "🟢 EMA 5/9 (CONTROL)"
-                        elif b.get("total_r", 0) > a.get("total_r", 0): leader = "🔵 EMA 5/15 (EXPERIMENT)"
-                        else: leader = "🤝 Tied"
-
-                    def block(label, d):
-                        if not d:
-                            return f"{label}\nNo data yet."
-                        return (
-                            f"{label} — *{d.get('mode','UNKNOWN')}*\n"
-                            f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
-                            f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
-                            f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
-                            f"• Net Pips: *{d.get('pips',0):+.1f}*\n"
-                            f"• Net USD: *${d.get('usd',0):+.2f}*\n"
-                            f"• Total R: *{d.get('total_r',0):+.2f}R* | Avg R: *{d.get('avg_r',0):+.3f}R*\n"
-                            f"• Profit Factor: *{d.get('pf',0):.2f}*\n"
-                            f"• Max SL Streak: *{d.get('max_loss_streak',0)}*"
-                        )
-
-                    reply = (
-                        "🔬 *A/B STRATEGY DASHBOARD*\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        "XAU/USD • Same market snapshot • Same risk framework\n\n"
-                        f"🟢 *CONTROL — EMA 5/9*\n{block('', a)}\n\n"
-                        f"🔵 *EXPERIMENT — EMA 5/15*\n{block('', b)}\n\n"
-                        f"🏆 *CURRENT LEADER:* {leader}\n"
-                        "\n_Compare again after more trades; early samples are not statistically meaningful._"
-                    )
-                    await send_reply(reply)
-                except Exception as e:
-                    await send_reply(f"⚠️ Error querying A/B dashboard: {e}")
-
-            elif bot_role == "control" and raw_text == "/pips":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
-                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
-                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
-                    """, (CONTROL_STRATEGY,))
-                    trades = cur.fetchall()
-                    cur.close(); conn.close()
-
-                    total_pips = gross_win_pips = gross_loss_pips = 0.0
-                    winning_trades_count = losing_trades_count = 0
-
-                    for t in trades:
-                        pips, _usd = compute_trade_pips({
-                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
-                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
-                            "outcome": t["outcome_val"]
-                        })
-                        total_pips += pips
-                        if pips > 0:
-                            gross_win_pips += pips; winning_trades_count += 1
-                        elif pips < 0:
-                            gross_loss_pips += abs(pips); losing_trades_count += 1
-
-                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
-                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
-                    est_profit_usd = total_pips * 0.10
-                    pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
-
-                    reply = (
-                        f"\U0001f4b5 *DETAILED PIPS & EARNINGS REPORT*\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4ca *SUMMARY:*\n"
-                        f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
-                        f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
-                        f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
-                        f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
-                        f"\U0001f3af *AVERAGE METRICS:*\n"
-                        f"\u2022 Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
-                        f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
-                        f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4a1 *Note:* Reflects your actual 2x0.01 lot execution -- "
-                        f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
-                        f"TP2 = lot1 @ TP1 + lot2 @ TP2."
-                    )
-                    await send_reply(reply)
-                except Exception as e:
-                    await send_reply(f"\u26a0\ufe0f Error calculating pips: {e}")
-
-            elif ((bot_role == "control" and raw_text == "/logs") or (bot_role == "experimental" and raw_text == "/last")):
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT id, action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
-                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val,
-                               COALESCE(timestamp, created_at::text, 'N/A') AS log_time
-                        FROM signals WHERE status = 'EXECUTED' AND strategy = %s
-                        ORDER BY id DESC LIMIT 10
-                    """, (CONTROL_STRATEGY if bot_role == 'control' else EXPERIMENTAL_STRATEGY,))
-                    logs = cur.fetchall()
-                    cur.close(); conn.close()
-
-                    if not logs:
-                        reply = "\U0001f4dc *LAST 10 TRADE LOGS:*\n\n_No executed trades in the database yet._"
-                    else:
-                        reply = "\U0001f4dc *LAST 10 DETAILED TRADE LOGS:*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\n"
-                        for l in logs:
-                            trade_id = l["id"]; action = l["action"]
-                            entry = float(l["entry_p"])
-                            exit_p = float(l["exit_price"]) if l.get("exit_price") is not None else None
-                            outcome = l["outcome_val"]
-                            date_str = str(l["log_time"])
-
-                            if exit_p is not None:
-                                pips, profit_usd = compute_trade_pips({
-                                    "action": action, "entry_price": entry, "sl_price": l["sl_p"],
-                                    "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p,
-                                    "outcome": outcome
-                                })
-                                r_multiple = compute_r_multiple(
-                                    action, entry, exit_p, float(l["sl_p"] or 0.0),
-                                    float(l["tp1_p"] or 0.0), float(l["tp2_p"] or 0.0), outcome
-                                )
-                                pip_str = f"*{pips:+.1f} pips* | {r_multiple:+.2f}R | ${profit_usd:+.2f}"
-                            else:
-                                pip_str = "*ACTIVE / IN PROGRESS*"
-
-                            if "WIN" in outcome or "CLOSED" in outcome:
-                                icon = "\U0001f7e2"
-                            elif "LOSS" in outcome:
-                                icon = "\U0001f534"
-                            else:
-                                icon = "\U0001f7e1"
-
-                            reply += (
-                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
-                                f"\u2022 Entry: ${entry:.2f} \u2192 Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
-                                f"\u2022 Outcome: *{outcome}*\n"
-                                f"\u2022 Result: {pip_str} | Time: {date_str}\n"
-                                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-                            )
-                    await send_reply(reply)
-                except Exception as e:
-                    await send_reply(f"\u26a0\ufe0f Error querying logs: {e}")
-
-            elif bot_role == "control" and raw_text == "/analyze":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
-                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
-                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
-                               COALESCE(timestamp, created_at::text, '') AS log_time,
-                               trend_15m, entry_extension_atr, regime
-                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
-                    """, (CONTROL_STRATEGY,))
-                    rows = cur.fetchall()
-                    cur.close(); conn.close()
-
-                    if not rows:
-                        reply = (
-                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
-                            "_Not enough closed trades yet to analyze. Check back after more signals complete._"
-                        )
-                    else:
-                        segments = {"Strategy": {}, "5M ADX Regime": {}, "V10 Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
-                        overall_r = []
-                        for r in rows:
-                            r_mult = compute_r_multiple(
-                                r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
-                                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
-                            )
-                            overall_r.append(r_mult)
-                            adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
-                            segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
-                            segments["5M ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
-                            segments["V10 Regime"].setdefault(r["regime"] or "Pre-V10 (unlabeled)", []).append(r_mult)
-                            segments["Entry Extension"].setdefault(bucket_extension(r["entry_extension_atr"]), []).append(r_mult)
-                            segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
-                            segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
-
-                        n_total = len(overall_r)
-                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
-                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
-
-                        reply_parts = [
-                            "\U0001f4d0 *EMA STRATEGY FORWARD-TEST ANALYSIS*",
-                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
-                            f"Sample: *{n_total} closed trades*",
-                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
-                            "",
-                        ]
-                        for dim in ["Strategy", "5M ADX Regime", "V10 Regime", "Entry Extension", "Session", "15m Confluence"]:
-                            reply_parts.append(format_performance_segment(dim, segments[dim]))
-                            reply_parts.append("")
-
-                        reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
-                        reply_parts.append(
-                            "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
-                            "but noisy). Check the Strategy breakdown for \"Range Fade (Consolidation)\" vs the "
-                            "EMA buckets to see which regime is actually working.\n\n"
-                            f"\u2696\ufe0f Mode is auto-selected by 5M ADX (\u2265{RANGE_MODE_ADX_MAX:.0f} trend, "
-                            f"<{RANGE_MODE_ADX_MAX:.0f} range) -- not a veto, both regimes are live.\n"
-                            f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
-                        )
-                        reply = "\n".join(reply_parts)
-                    await send_reply(reply)
-                except Exception as e:
-                    await send_reply(f"\u26a0\ufe0f Error: {e}")
-
-    except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
-    return {"status": "ok"}
-
-
-# =====================================================================
-# SEPARATE TELEGRAM WEBHOOKS — CONTROL vs EXPERIMENTAL
-# =====================================================================
-@app.post("/telegram-webhook")
-async def telegram_webhook_control(request: Request):
-    return await _handle_telegram_webhook(request, "control")
-
-@app.post("/telegram-webhook-b")
-async def telegram_webhook_experimental(request: Request):
-    return await _handle_telegram_webhook(request, "experimental")
-
-@app.post("/telegram-webhook-c")
-async def telegram_webhook_breakout(request: Request):
-    return await _handle_telegram_webhook(request, "breakout")
+        risk_dist = atr_val * 1.5
+        if proposed_action == "BUY":
+            sl_price = curr_price - risk_dist
+            tp1_price = curr_price + (risk_dist * 1.5)
+            tp2_price = curr_price + (risk_dist * 2.5)
+        else:
+            sl_price = curr_price + risk_dist
+            tp1_price = curr_price - (risk_dist * 1.5)
+            tp2_price = curr_price - (risk_dist * 2.5)
+
+    ext_atr, climax_r = compute_entry_extension(df_5m, proposed_action)
+
+    signal_id = log_trade_signal(
+        status="EXECUTED",
+        action=proposed_action,
+        trigger_type=trigger_type,
+        price=curr_price,
+        sl=sl_price,
+        tp1=tp1_price,
+        tp2=tp2_price,
+        confidence=ai_output.confidence,
+        adx_15m=adx_5m,
+        stoch_rsi_15m=0.0,
+        divergence_type="None",
+        reasoning=ai_output.reasoning,
+        trend_15m=trend_15m,
+        adx_15m_true=adx_15m_true,
+        entry_extension_atr=ext_atr,
+        entry_climax_ratio=climax_r,
+        regime=strategy_mode,
+        regime_metrics=regime_metrics,
+        strategy=strategy,
+        execution_mode=execution_mode
+    )
+
+    mode_tag = "🔴 LIVE EXECUTED" if execution_mode == "LIVE" else "⚠️ PAPER ONLY"
+    alert_text = (
+        f"🚨 *SIGNAL GENERATED [{strategy}]*\n\n"
+        f"Action: *{proposed_action}*\n"
+        f"Trigger: *{trigger_type}*\n"
+        f"Entry: *${curr_price:.2f}*\n"
+        f"SL: *${sl_price:.2f}*\n"
+        f"TP1: *${tp1_price:.2f}*\n"
+        f"TP2: *${tp2_price:.2f}*\n\n"
+        f"Mode: *{strategy_mode}* | 15M Trend: *{trend_15m}*\n"
+        f"AI Confidence: *{ai_output.confidence:.2f}*\n"
+        f"Reasoning: {ai_output.reasoning}\n\n"
+        f"Execution: *{mode_tag}*"
+    )
+    await send_telegram_alert(client, alert_text, alert_chat_id, alert_bot_token)

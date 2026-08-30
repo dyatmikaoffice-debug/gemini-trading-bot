@@ -1,7 +1,10 @@
 # A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
 # BASE: alert_bot_exhaustion_guard_v1.py
 # Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
-# CONTROL_5_9 remains the only MT5-live strategy; EXPERIMENTAL_5_15 is PAPER only.
+# EXPERIMENTAL_5_15 is currently the only MT5-live strategy; CONTROL_5_9 is PAPER only.
+# (Swapped from the original CONTROL=LIVE/EXPERIMENTAL=PAPER config -- the
+# get-latest-signal MT5 bridge follows whichever strategy has
+# execution_mode='LIVE', so this stays correct automatically if swapped again.)
 # 
 # CHANGES FROM V8.1:
 # 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
@@ -50,7 +53,6 @@ RAW_BREAKOUT_CHAT_ID = os.getenv("BREAKOUT_TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
-# Experimental Telegram credentials MUST be supplied through environment variables. Do not hardcode bot tokens.
 
 CLEAN_BOT_TOKEN = "".join(RAW_BOT_TOKEN.split())
 TELEGRAM_CHAT_ID = "".join(RAW_CHAT_ID.split())
@@ -92,33 +94,15 @@ LAST_MT5_PING_TIME = None
 cached_15m = {"df": None, "fetched_at": None}
 FIFTEEN_M_REFRESH_MINUTES = 15
 
-# --- 4H directional bias (seasonality-style regime filter) ---
-# Backtest on real trade data found SELL signals losing broadly on both
-# strategies while gold's higher-timeframe trend ran up -- BUY kept working,
-# SELL didn't, across nearly every trigger type. Rather than hard-block one
-# direction permanently, this reads the 4H EMA50 (same method requested) so
-# the block flips automatically if/when the broader trend reverses. A 60-min
-# refresh is once every 4H candle's worth of movement at most -- cheap
-# relative to the 800/day TwelveData budget (5M costs ~288/day, 15M ~96/day
-# on their own; this adds at most 24/day more).
+# --- 1H DIRECTIONAL BIAS (EMA 200 REGIME FILTER) ---
 cached_1h = {"df": None, "fetched_at": None}
-ONE_H_REFRESH_MINUTES = 15   # 1H candles close 4x more often than 4H did -- refresh more often to catch it
+ONE_H_REFRESH_MINUTES = 15
 ONE_H_EMA_PERIOD = 200
-ONE_H_OUTPUTSIZE = 250       # need 200+ candles for the EMA itself, so pull well past the default 100
-# Buffer before the BULLISH/BEARISH label is allowed to flip at all -- stops
-# a bare EMA touch (pure noise) from flip-flopping the bias label back and
-# forth. Separate from the ranging-regime threshold below.
+ONE_H_OUTPUTSIZE = 250
 ONE_H_BIAS_FLIP_BUFFER_PCT = 0.18
-# Separate, wider band: how close price sits to the 1H EMA200 before we
-# treat the market as "ranging near the trendline" -- shown in /status as
-# informational context only. SL sizing is NOT adjusted by this (plain
-# ATR-based risk applies to every trade, same as before the $6 cap ever
-# existed) -- the 1H bias filter above is what actually guards against a
-# losing streak on a sudden trend reversal, by blocking entries against the
-# new direction rather than resizing the stop.
 RANGING_REGIME_PCT_THRESHOLD = 0.30
 
-# --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
+# --- EMA EXECUTION SIGNAL ---
 CONTROL_STRATEGY = "CONTROL_5_9"
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
 CONTROL_EXECUTION_MODE = "PAPER"
@@ -128,39 +112,19 @@ BREAKOUT_STRATEGY = "RANGE_BREAKOUT_OCO"
 BREAKOUT_EXECUTION_MODE = "PAPER"
 
 # --- STRATEGY C: RANGE BREAKOUT + OCO PENDING ORDERS ---
-# This strategy is intentionally PAPER ONLY in this build. It models two
-# pending stop orders (BUY STOP above range / SELL STOP below range) and applies
-# one-cancels-other behavior in the Python scanner. No live MT5 pending order is
-# placed by Strategy C yet.
 BREAKOUT_RANGE_LOOKBACK_5M = 10
-# Multiple window sizes to scan, shortest first. A single fixed 10-candle
-# window misses both shorter, sharper pauses and longer, slower ones -- price
-# doesn't consolidate for the same duration every time. We now test each
-# length and use the tightest/most recent one that qualifies, instead of
-# only ever looking at one fixed-size box.
 BREAKOUT_RANGE_LOOKBACKS = (6, 8, 10, 14, 20)
-# Loosened from 0.80-2.00 ATR / ADX 20/25 -- those thresholds produced ZERO
-# triggered signals across multiple days of live scanning. This strategy is
-# PAPER-only, so the priority is volume for data-gathering (target: 10+
-# triggered signals/day) over the tightest possible setup quality -- more
-# signals means the /compare stats become trustworthy sooner rather than
-# staying stuck at n=0 indefinitely.
 BREAKOUT_MIN_WIDTH_ATR = 0.50
 BREAKOUT_MAX_WIDTH_ATR = 3.00
 BREAKOUT_MAX_5M_ADX = 28.0
 BREAKOUT_MAX_15M_ADX = 32.0
-# "Flag" consolidations (a brief pause mid-trend, right after an impulsive
-# move, before continuation) form precisely while ADX is still elevated from
-# that prior leg -- the quiet-market ADX gate above was rejecting exactly
-# this pattern. If the range itself is unusually tight, allow it through as
-# a distinct flag-type setup even when ADX doesn't clear the quiet-market gate.
 BREAKOUT_FLAG_MAX_WIDTH_ATR = 0.75
 BREAKOUT_BUFFER_ATR = 0.15
 BREAKOUT_MIN_BUFFER_PRICE = 0.15
 BREAKOUT_SL_BUFFER_ATR = 0.30
 BREAKOUT_TP1_R = 1.50
 BREAKOUT_TP2_R = 2.50
-BREAKOUT_MAX_PENDING_MINUTES = 45  # was 20 -- more time for either stop to trigger before the setup expires unfired
+BREAKOUT_MAX_PENDING_MINUTES = 45
 BREAKOUT_FAKE_WICK_ATR = 0.10
 BREAKOUT_ACTIVE_PENDING = None
 
@@ -169,78 +133,47 @@ EMA_TREND_SLOW = 9
 EXPERIMENTAL_EMA_FAST = 5
 EXPERIMENTAL_EMA_SLOW = 15
 
-# FIXED: the 15M confluence filter previously reused the same 5/9 EMA as the 5M
-# execution signal, so it reacted almost as fast as the thing it was supposed to
-# be filtering -- the confluence check added far less protection than intended.
-# Decoupled to a slower, dedicated pair so it behaves like an actual higher-
-# timeframe trend read.
 TREND_15M_EMA_FAST = 9
 TREND_15M_EMA_SLOW = 20
 TREND_15M_MIN_SEPARATION_PCT = 0.02
 
 # --- RANGE / CONSOLIDATION MODE ---
-# Trend mode (EMA cross/touch/impulse) and range mode are mutually exclusive,
-# selected purely by 5M ADX: >= RANGE_MODE_ADX_MAX runs the trend engine,
-# < RANGE_MODE_ADX_MAX runs this fade-the-edges engine instead of going silent.
 RANGE_MODE_ADX_MAX = 20.0
-RANGE_LOOKBACK_5M = 10             # candles defining the current range bracket (~50 min on 5M)
-RANGE_MAX_WIDTH_ATR_MULT = 2.0     # bracket must be no wider than this (in ATR) to count as a real range
-RANGE_MIN_WIDTH_ATR_MULT = 0.8     # bracket must be at least this wide -- too tight isn't tradeable (spread/slippage)
-RANGE_EDGE_ZONE_PCT = 0.20         # price must be within this fraction of the range width from an edge to fade it
-RANGE_SL_BUFFER_ATR_MULT = 0.3     # stop placed this many ATR beyond the bracket edge being faded
-RANGE_MODE_MAX_15M_ADX = 25.0      # skip the fade if the 15M chart itself shows a real trend (ADX >= this)
+RANGE_LOOKBACK_5M = 10
+RANGE_MAX_WIDTH_ATR_MULT = 2.0
+RANGE_MIN_WIDTH_ATR_MULT = 0.8
+RANGE_EDGE_ZONE_PCT = 0.20
+RANGE_SL_BUFFER_ATR_MULT = 0.3
+RANGE_MODE_MAX_15M_ADX = 25.0
 
 # --- TREND EXHAUSTION / CHOP GUARD v1 ---
-# Purpose: keep the original high-frequency EMA engine intact, but detect when
-# a previously strong trend is losing directional power and turning into chop.
-# Unlike V10, these are NOT hard entry filters. The guard stays dormant during
-# healthy trends and only becomes restrictive when several exhaustion signals
-# agree.
-EXHAUSTION_LOOKBACK = 12                 # 60 minutes of 5M candles
-EXHAUSTION_CROSS_LOOKBACK = 6            # 30 minutes
-EXHAUSTION_MIN_PEAK_ADX = 30.0            # only guard a trend that was meaningful
-EXHAUSTION_ADX_DROP = 5.0                 # peak ADX -> current ADX
-EXHAUSTION_DI_DROP = 8.0                  # peak directional DI gap -> current
-EXHAUSTION_EMA_CONTRACTION = 0.40         # spread contracted >=40% from recent max
-EXHAUSTION_MIN_SLOPE_ATR = 0.10           # weak current directional EMA movement
-EXHAUSTION_SCORE_CAUTION = 2              # monitor, but continue trading
-EXHAUSTION_SCORE_BLOCK_DIRECTION = 3      # block only the weakening direction
-EXHAUSTION_SCORE_CHOP = 5                 # full temporary chop guard
-EXHAUSTION_HARD_LOSS_LOCK = 3             # 3 same-direction SLs = hard directional lock
-EXHAUSTION_RESET_LOOKBACK = 3             # fresh expansion window
+EXHAUSTION_LOOKBACK = 12
+EXHAUSTION_CROSS_LOOKBACK = 6
+EXHAUSTION_MIN_PEAK_ADX = 30.0
+EXHAUSTION_ADX_DROP = 5.0
+EXHAUSTION_DI_DROP = 8.0
+EXHAUSTION_EMA_CONTRACTION = 0.40
+EXHAUSTION_MIN_SLOPE_ATR = 0.10
+EXHAUSTION_SCORE_CAUTION = 2
+EXHAUSTION_SCORE_BLOCK_DIRECTION = 3
+EXHAUSTION_SCORE_CHOP = 5
+EXHAUSTION_HARD_LOSS_LOCK = 3
+EXHAUSTION_RESET_LOOKBACK = 3
 EXHAUSTION_RESET_MIN_DI_GAP = 4.0
 EXHAUSTION_RESET_PRICE_LOOKBACK = 6
-
-# --- SAME-DIRECTION LOSS PROTECTION ---
-# Two losses do NOT immediately shut the strategy down. They make the
-# exhaustion guard more sensitive. Three consecutive SLs in one direction
-# hard-lock that direction until a fresh expansion is confirmed.
-CONSEC_LOSS_BREAKER_THRESHOLD = 2
 
 # --- SCAN SCHEDULE / TWELVE DATA BUDGET ---
 ACTIVE_SESSION_START_HOUR = 0
 ACTIVE_SESSION_END_HOUR = 24
-
-# V10.1: forex/gold is closed on weekends, but nothing above ever checked for
-# that -- ACTIVE_SESSION_START/END = 0/24 covers every HOUR but not every DAY.
-# Confirmed live: three "Range Fade - Bottom Rejection" signals fired Sat
-# Aug 22 16:45-17:25 WIB on a dead weekend feed (price frozen at ~4608.27,
-# moving <0.01 across 40 minutes) -- the AI reviewer correctly vetoed all
-# three, but the scanner should never have evaluated them in the first
-# place. In WIB (UTC+7), NY's Sun 17:00 EST reopen lands at ~05:00 WIB
-# MONDAY -- so the whole calendar Saturday AND Sunday are closed in WIB,
-# not just Saturday.
-FOREX_MONDAY_OPEN_HOUR_WIB = 5   # approx NY Sunday 17:00 EST reopen, in WIB
+FOREX_MONDAY_OPEN_HOUR_WIB = 5
 
 
 def is_forex_market_open(now_wib: datetime) -> bool:
-    weekday = now_wib.weekday()  # Monday=0 ... Sunday=6
-    if weekday == 5:  # Saturday: closed all day in WIB
-        return False
-    if weekday == 6:  # Sunday: closed all day in WIB (reopen lands on Monday)
+    weekday = now_wib.weekday()
+    if weekday == 5 or weekday == 6:
         return False
     if weekday == 0 and now_wib.hour < FOREX_MONDAY_OPEN_HOUR_WIB:
-        return False  # Monday, before the weekend reopen has actually happened
+        return False
     return True
 
 TWELVE_DATA_DAILY_LIMIT = 800
@@ -286,16 +219,6 @@ def note_twelve_data_call(timeframe: str = None):
 LOSS_COOLDOWN_MINUTES = 10
 
 def check_stat_veto(adx_5m: float, current_hour_wib: int):
-    # REMOVED (mid-session): was carried over from the old liquidity-sweep
-    # strategy's forward-test and never validated for this EMA system.
-    #
-    # REMOVED (ADX < 20 chop veto): this veto is now structurally impossible to
-    # trigger and would be dead code if left in. Trend mode and range mode are
-    # selected by ADX BEFORE either detector even runs (see
-    # background_scanning_loop) -- trend mode only ever calls this with
-    # adx_5m >= RANGE_MODE_ADX_MAX, and range mode (which specifically WANTS
-    # low ADX) never calls this at all. Kept as a shell for any future
-    # stat-based veto that isn't already handled by mode selection.
     return False, ""
 
 
@@ -381,13 +304,9 @@ def init_db():
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_15m_true REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_extension_atr REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_climax_ratio REAL;",
-            # V10: real dual-0.01-lot accounting, stored per-row (not just
-            # computed on the fly in /stats etc). See compute_trade_pips().
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_pips REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_usd REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS result_r REAL;",
-            # V10: regime/quality instrumentation at signal time, for the
-            # TRANSITION classifier and future analysis.
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime TEXT;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_sep_atr_5m REAL;",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ema_slope_atr_5m REAL;",
@@ -403,33 +322,19 @@ def init_db():
         for query in migrations:
             cursor.execute(query)
 
-        # Historical rows predate A/B tagging; preserve them as the existing 5/9 control.
         cursor.execute("UPDATE signals SET strategy = %s, execution_mode = %s WHERE strategy IS NULL", (CONTROL_STRATEGY, CONTROL_EXECUTION_MODE))
         cursor.execute("UPDATE signals SET execution_mode = %s WHERE execution_mode IS NULL", (CONTROL_EXECUTION_MODE,))
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info("[NEON DATABASE] Full schema verified and auto-migrated.")
+        logging.info("[DATABASE] Full schema verified and auto-migrated.")
 
-        # V10: one-time (idempotent) backfill of result_pips/result_usd/result_r
-        # for every historical closed trade that predates these columns. Safe
-        # to run on every boot -- it only ever touches rows where result_pips
-        # IS NULL, so already-backfilled rows are skipped and this stays cheap.
         backfill_dual_lot_accounting()
     except Exception as e:
-        logging.error(f"[NEON DB ERROR] Failed to initialize database schema: {e}")
+        logging.error(f"[DATABASE ERROR] Failed to initialize database schema: {e}")
 
 
 def backfill_dual_lot_accounting():
-    """
-    V10: fills result_pips / result_usd / result_r for any EXECUTED, closed
-    (exit_price IS NOT NULL) signal that doesn't have them yet -- covers every
-    trade logged before this migration, using the SAME compute_trade_pips /
-    compute_r_multiple functions the live bot now uses, so historical and
-    future numbers are computed identically. Idempotent: only ever updates
-    rows where result_pips IS NULL, so re-running on every boot is cheap and
-    harmless once the backfill has completed.
-    """
     if not DATABASE_URL:
         return
     try:
@@ -532,11 +437,6 @@ def log_trade_signal(
     trend_15m: str = None, adx_15m_true: float = None, entry_extension_atr: float = None,
     entry_climax_ratio: float = None, regime: str = None, regime_metrics: dict = None,
     strategy: str = CONTROL_STRATEGY, execution_mode: str = CONTROL_EXECUTION_MODE
-    # NOTE: despite the name, callers pass adx_5m (the mode-gating value) into the
-    # `adx_15m` parameter/column -- inherited from earlier versions. The genuine
-    # 15M ADX lives in `adx_15m_true`. /analyze's "5M ADX Regime" bucket reads
-    # this column and is labeled accordingly; don't rename the DB column without
-    # a migration, but don't assume it holds a real 15M value either.
 ):
     if not DATABASE_URL:
         return None
@@ -593,11 +493,11 @@ def log_trade_signal(
         cursor.close()
         conn.close()
 
-        logging.info(f"[NEON DB LOGGED] Signal ID #{new_id} | Status: {status} | Action: {action} | Price: ${price_val:.2f}")
+        logging.info(f"[DB LOGGED] Signal ID #{new_id} | Status: {status} | Action: {action} | Price: ${price_val:.2f}")
         return new_id
 
     except Exception as e:
-        logging.error(f"[NEON DB ERROR] Failed to log signal: {e}")
+        logging.error(f"[DATABASE ERROR] Failed to log signal: {e}")
         return None
 
 
@@ -668,12 +568,6 @@ def update_open_trades(current_high: float, current_low: float):
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
                 result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
 
-                # V10: result_pips/result_usd/result_r are only "final" once the
-                # trade is fully closed (LOSS, CLOSED (TP1 HIT / SL BE), or WIN
-                # (TP2 HIT)) -- the interim "WIN (TP1 HIT)" state still has an
-                # open runner leg, so its stored numbers are a running mark, not
-                # yet a settled result. They get overwritten again once the
-                # runner actually closes.
                 cursor.execute("""
                     UPDATE signals
                     SET outcome = %s, exit_price = %s, outcome_timestamp = %s,
@@ -692,7 +586,7 @@ def update_open_trades(current_high: float, current_low: float):
         cursor.close()
         conn.close()
     except Exception as e:
-        logging.error(f"[NEON DB ERROR] Failed to update trade outcomes: {e}")
+        logging.error(f"[DATABASE ERROR] Failed to update trade outcomes: {e}")
 
 
 async def fetch_timeframe_data(client: httpx.AsyncClient, timeframe: str, outputsize: int = 100, now_wib: datetime = None):
@@ -732,13 +626,9 @@ def calculate_metrics_tf(df: pd.DataFrame):
     df["adx"] = dx.rolling(14).mean()
     df["atr"] = df["tr"].rolling(window=14).mean()
     
-    # 5M execution EMAs (fast -- used for entry signals on df_5m)
     df["ema_fast"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
 
-    # FIXED: separate, slower EMAs for the 15M confluence read. These are computed
-    # on every call (cheap) so the same helper works for both the 5M and 15M frames,
-    # but compute_ema_trend() below now reads THESE columns, not the fast ones.
     df["trend_ema_fast"] = df["close"].ewm(span=TREND_15M_EMA_FAST, adjust=False).mean()
     df["trend_ema_slow"] = df["close"].ewm(span=TREND_15M_EMA_SLOW, adjust=False).mean()
 
@@ -746,10 +636,6 @@ def calculate_metrics_tf(df: pd.DataFrame):
 
 
 def compute_ema_trend(df: pd.DataFrame):
-    # FIXED: was reading df["ema_fast"]/df["ema_slow"] -- the same 5/9 pair used
-    # for 5M execution -- which made the "15M confluence filter" flip almost as
-    # fast as the signal it was supposed to be filtering. Now reads the dedicated,
-    # slower trend_ema_fast/trend_ema_slow (9/20) columns instead.
     if df is None or len(df) < TREND_15M_EMA_SLOW + 1: return "NEUTRAL", 0.0
     last_fast = float(df["trend_ema_fast"].iloc[-1])
     last_slow = float(df["trend_ema_slow"].iloc[-1])
@@ -760,14 +646,6 @@ def compute_ema_trend(df: pd.DataFrame):
 
 
 def compute_1h_directional_bias(df_1h: pd.DataFrame):
-    """1H EMA200 regime read (swapped from 4H EMA50 per user's validated
-    reasoning: 4H is too slow for a 5M-execution system, 15M is too noisy --
-    1H is the balance point). Price sustainably above EMA200 -> BULLISH bias
-    (blocks SELL for A/B this cycle), below -> BEARISH (blocks BUY).
-    Buffer rule: price must clear ONE_H_BIAS_FLIP_BUFFER_PCT beyond the EMA
-    before the label is allowed to flip at all -- stops a bare EMA touch
-    from flip-flopping the bias back and forth intraday.
-    """
     if df_1h is None or len(df_1h) < ONE_H_EMA_PERIOD + 1:
         return "NEUTRAL", 0.0
     ema200 = df_1h["close"].ewm(span=ONE_H_EMA_PERIOD, adjust=False).mean()
@@ -782,13 +660,6 @@ def compute_1h_directional_bias(df_1h: pd.DataFrame):
 
 
 def compute_ranging_regime(df_1h: pd.DataFrame):
-    """Separate, wider check from the bias-flip buffer above: is price
-    currently sitting close enough to the 1H EMA200 to call this a
-    ranging/consolidating regime? Purely informational (surfaced in
-    /status) -- does NOT adjust SL sizing. Independent of the
-    BULLISH/BEARISH label -- a signal can carry a bias label and still be
-    inside the ranging band.
-    """
     if df_1h is None or len(df_1h) < ONE_H_EMA_PERIOD + 1:
         return False, 0.0
     ema200 = df_1h["close"].ewm(span=ONE_H_EMA_PERIOD, adjust=False).mean()
@@ -800,7 +671,7 @@ def compute_ranging_regime(df_1h: pd.DataFrame):
     return (abs_sep_pct <= RANGING_REGIME_PCT_THRESHOLD), abs_sep_pct
 
 
-TOUCH_MIN_BODY_ATR_MULT = 0.15  # FIXED: touch signals previously had zero quality filter
+TOUCH_MIN_BODY_ATR_MULT = 0.15
 
 def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
@@ -813,20 +684,12 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
     p_ema_fast = prev["ema_fast"]
     p_ema_slow = prev["ema_slow"]
     
-    # 1. PRICE IMPULSE CROSS (Aggressive Early Entry)
-    # Catches massive candles that explode through both EMAs instantly
     bullish_impulse = prev["close"] <= p_ema_slow and curr["close"] > c_ema_fast and curr["close"] > c_ema_slow and curr["close"] > curr["open"]
     bearish_impulse = prev["close"] >= p_ema_slow and curr["close"] < c_ema_fast and curr["close"] < c_ema_slow and curr["close"] < curr["open"]
     
-    # 2. EMA CROSSOVER (The Standard Cross)
     bullish_cross = p_ema_fast <= p_ema_slow and c_ema_fast > c_ema_slow
     bearish_cross = p_ema_fast >= p_ema_slow and c_ema_fast < c_ema_slow
 
-    # 3. EMA TOUCH (Trend Continuation)
-    # FIXED: this trigger had no candle-quality check at all -- a tiny indecisive
-    # doji sitting on the EMA line qualified exactly the same as a strong reclaim
-    # candle, unlike every other trigger in this file which normalizes body size
-    # against ATR. Require the bounce candle to show at least modest conviction.
     raw_atr = curr["atr"] if "atr" in curr and not pd.isna(curr["atr"]) else None
     atr_val = float(raw_atr) if raw_atr is not None and raw_atr > 0 else None
     candle_body = abs(float(curr["close"]) - float(curr["open"]))
@@ -835,7 +698,6 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
     touch_bullish = c_ema_fast > c_ema_slow and curr["low"] <= c_ema_fast and curr["close"] > c_ema_fast and touch_body_ok
     touch_bearish = c_ema_fast < c_ema_slow and curr["high"] >= c_ema_fast and curr["close"] < c_ema_fast and touch_body_ok
     
-    # Evaluate Hierarchy: Impulse > Crossover > Touch
     if bullish_impulse and trend_15m == "BULLISH":
         return "BUY", "Aggressive Price Impulse (Bullish)"
     if bearish_impulse and trend_15m == "BEARISH":
@@ -855,18 +717,9 @@ def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_T
 
 
 def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
-    """
-    Fade-the-edges consolidation strategy. Only ever called when 5M ADX is
-    below RANGE_MODE_ADX_MAX (see background_scanning_loop) -- this is the
-    counterpart to detect_ema_signal(), not a supplement to it. The two never
-    run in the same cycle.
-    """
     if len(df_5m) < RANGE_LOOKBACK_5M + 1:
         return "HOLD", "Insufficient data for range detection", None, None
 
-    # Bracket is defined by the N candles BEFORE the current one, same pattern
-    # as the old V7 consolidation-breakout detector -- but here we fade INSIDE
-    # the bracket instead of trading a breakout beyond it.
     bracket = df_5m.iloc[-(RANGE_LOOKBACK_5M + 1):-1]
     bracket_high = float(bracket["high"].max())
     bracket_low = float(bracket["low"].min())
@@ -877,22 +730,11 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
         return "HOLD", "ATR unavailable", bracket_high, bracket_low
     atr_5m = float(raw_atr)
 
-    # Reject anything that isn't a genuine tight range: too wide means this is
-    # actually a slow drift/pullback, not consolidation; too tight means the
-    # edges are inside normal noise/spread and not worth trading.
     if width > RANGE_MAX_WIDTH_ATR_MULT * atr_5m:
         return "HOLD", "Range too wide -- likely a drift, not consolidation", bracket_high, bracket_low
     if width < RANGE_MIN_WIDTH_ATR_MULT * atr_5m:
         return "HOLD", "Range too tight -- inside normal noise/spread", bracket_high, bracket_low
 
-    # FIXED: this used to require compute_ema_trend() to read exactly NEUTRAL,
-    # which needs the 15M 9/20 EMA pair within TREND_15M_MIN_SEPARATION_PCT
-    # (0.02%, roughly $0.90 at $4490 gold) of each other -- a bar so tight it
-    # was almost never met, silently blocking range mode nearly 100% of the
-    # time (confirmed: 0 of 63 closed trades were Range Fade). Gated on 15M ADX
-    # instead -- a properly calibrated "is there a real higher-timeframe trend"
-    # check, using the same ADX language as the 5M gate rather than a brittle
-    # EMA-separation threshold.
     if adx_15m_true >= RANGE_MODE_MAX_15M_ADX:
         return "HOLD", f"15M ADX {adx_15m_true:.1f} still shows a real trend -- skipping fade to avoid trading against it", bracket_high, bracket_low
 
@@ -915,7 +757,6 @@ def detect_range_reversal(df_5m: pd.DataFrame, adx_15m_true: float):
 
 
 def get_recent_signals_for_direction(action: str, limit: int = 3, strategy: str = CONTROL_STRATEGY):
-    """Return recent closed EXECUTED trades in one direction, newest first."""
     if not DATABASE_URL:
         return []
     try:
@@ -952,20 +793,6 @@ def _directional_di_gap(df_5m: pd.DataFrame, action: str, idx: int) -> float:
 
 
 def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CONTROL_STRATEGY):
-    """
-    Soft trend-health guard for the original EMA engine.
-
-    Score components:
-      +1 ADX dropped materially from a recent strong peak
-      +1 directional DI advantage has deteriorated materially
-      +1 EMA5/EMA9 spread contracted materially from its recent maximum
-      +1 EMA5 directional slope is currently weak
-      +1/+2 repeated EMA crosses indicate developing chop
-      +2 three consecutive same-direction SLs (hard lock)
-
-    The guard does NOT reject a signal for one weak metric. It only blocks a
-    direction when multiple pieces of evidence agree.
-    """
     metrics = {"score": 0, "peak_adx": None, "adx_drop": 0.0, "peak_di_gap": None,
                "di_drop": 0.0, "ema_spread_atr": None, "spread_contraction": 0.0,
                "ema_slope_atr": 0.0, "cross_count": 0, "loss_count": 0,
@@ -1009,7 +836,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
     score = 0
     reasons = []
 
-    # Only score ADX/DI deterioration if there really was a strong directional move.
     strong_trend_context = peak_adx >= EXHAUSTION_MIN_PEAK_ADX and peak_di_gap >= EXHAUSTION_RESET_MIN_DI_GAP
     if strong_trend_context and adx_drop >= EXHAUSTION_ADX_DROP:
         score += 1
@@ -1035,8 +861,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
     if loss_count >= EXHAUSTION_HARD_LOSS_LOCK:
         reasons.append(f"{loss_count} consecutive {action} SLs")
 
-    # Losses are handled by the explicit directional-lock path below so a
-    # potential fresh expansion can actually release the lock.
     block_direction = score >= EXHAUSTION_SCORE_BLOCK_DIRECTION
     full_chop = score >= EXHAUSTION_SCORE_CHOP
 
@@ -1062,7 +886,6 @@ def trend_exhaustion_guard(action: str, df_5m: pd.DataFrame, strategy: str = CON
 
 
 def fresh_directional_expansion_confirmed(action: str, df_5m: pd.DataFrame, trend_15m: str) -> tuple[bool, str]:
-    """Confirm that a genuinely new directional expansion is underway."""
     if df_5m is None or len(df_5m) < max(EXHAUSTION_RESET_PRICE_LOOKBACK + 2, 8):
         return False, "Insufficient 5M history"
 
@@ -1100,27 +923,6 @@ def fresh_directional_expansion_confirmed(action: str, df_5m: pd.DataFrame, tren
 
 
 def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RANGE_LOOKBACK_5M):
-    """
-    Instrumentation only -- does NOT affect entry/veto decisions. Measures two
-    things at the moment a signal fires, for both TREND and RANGE signals:
-
-    1. extension_atr: how far price has already traveled beyond the edge of
-       its own recent N-candle bracket (the same bracket concept range mode
-       uses), in ATR units. A large value means the move is already well away
-       from its last consolidation zone -- a proxy for "chasing a move that's
-       already run" rather than catching it at the start.
-
-    2. climax_ratio: the current candle's own range (high-low) relative to
-       ATR. A candle several times the normal ATR is a classic "climax" shape
-       often followed by a shakeout/retracement even when the larger move is
-       intact -- this is the pattern behind stops getting tagged mid-impulse
-       before the move continues.
-
-    Logged to signals.entry_extension_atr / entry_climax_ratio so /analyze can
-    bucket outcomes by these values once enough trades accumulate. Nothing
-    here changes what fires or when -- purely for building the evidence base
-    before any logic changes, per the "track first" approach.
-    """
     if len(df_5m) < lookback + 1:
         return None, None
 
@@ -1151,27 +953,6 @@ def compute_entry_extension(df_5m: pd.DataFrame, action: str, lookback: int = RA
     return extension_atr, climax_ratio
 
 
-# --- FORWARD-TEST ANALYTICS HELPERS ---
-# V10 (REPLACES partial-close model): your MT5 EA does not run a single
-# 0.01 lot with a 50/50 partial close. It opens TWO separate 0.01-lot
-# positions per signal -- lot 1 targets TP1 and closes there in full, lot 2
-# ("the runner") either rides to TP2 or has its SL moved to breakeven once
-# lot 1 hits TP1. If price never reaches TP1 at all, BOTH lots are still
-# live and BOTH get stopped out at the original SL. Every dollar figure
-# below now reflects that two-position reality:
-#
-#   Outcome                        | pips (2x0.01 lot)          | R
-#   --------------------------------------------------------------------
-#   LOSS (SL HIT, before TP1)      | -2 x sl_dist                | -2.0
-#   CLOSED (TP1 HIT / SL BE)       | +tp1_dist (lot2 nets 0 @BE) | +tp1_r_mult
-#   WIN (TP1 HIT) [interim/open]   | +tp1_dist (lot2 still open) | +tp1_r_mult
-#   WIN (TP2 HIT)                  | +tp1_dist +tp2_dist         | +tp1_r_mult+tp2_r_mult
-#
-# 1 pip = $0.10 on a single 0.01 lot (confirmed against your own bot's SL
-# alert messages, e.g. ID#79: 43.5 pips SL = $4.35 on one 0.01 lot). Two
-# lots at $0.10/pip each is $0.20/pip combined -- captured below by simply
-# not halving the distances the way the old TP1_PARTIAL_CLOSE_RATIO did.
-
 def compute_trade_pips(trade: dict) -> tuple[float, float]:
     action = str(trade.get("action") or "BUY").upper()
     entry = float(trade.get("entry_price") or trade.get("entry_p") or trade.get("price") or 0.0)
@@ -1187,24 +968,16 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
 
     if "LOSS" in outcome:
-        # Neither lot ever reached TP1 -- both close at SL. Two 0.01 lots,
-        # each risking sl_dist, so the combined loss is 2x a single-lot SL.
         total_pips = -(sl_dist * 10.0) * 2.0
     elif outcome == "CLOSED (TP1 HIT / SL BE)":
-        # Lot 1 banked tp1_dist in full. Lot 2 (the runner) was stopped at
-        # breakeven -- zero pips, not a loss and not additional profit.
         total_pips = tp1_dist * 10.0
     elif outcome == "WIN (TP1 HIT)":
-        # Interim state: lot 1 has closed at TP1; lot 2 is still open and
-        # not yet resolved, so only lot 1's pips are realized so far.
         total_pips = tp1_dist * 10.0
     elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
-        # Lot 1 closed at TP1, lot 2 (the runner) continued on to TP2 --
-        # both legs are realized profit, so both are counted in full.
         total_pips = (tp1_dist + tp2_dist) * 10.0
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
+        total_pips = diff * 10.0 * 2.0
     profit_usd = total_pips * 0.10
     return total_pips, profit_usd
 
@@ -1214,10 +987,6 @@ def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, 
         risk_dist = abs(entry - exit_price) if "LOSS" in outcome else 2.5
         if risk_dist == 0: risk_dist = 2.5
 
-    # V10: same dual-0.01-lot model as compute_trade_pips. R is expressed
-    # per unit of SINGLE-LOT risk (risk_dist), so a full loss on both lots
-    # is exactly -2.0R, matching "every signal risks 1R per lot, two lots
-    # per signal" rather than the old hardcoded -1.0.
     if "LOSS" in outcome:
         return -2.0
     if outcome == "CLOSED (TP1 HIT / SL BE)":
@@ -1238,8 +1007,6 @@ def bucket_adx(adx: float) -> str:
     return "ADX 45+ (Overextended)"
 
 def bucket_extension(extension_atr) -> str:
-    # Instrumentation bucket -- how far price had already moved beyond its
-    # recent consolidation bracket (in ATR) at the moment a signal fired.
     if extension_atr is None: return "Extension N/A"
     e = float(extension_atr)
     if e < 0.5: return "Extension <0.5 ATR (Early)"
@@ -1279,9 +1046,9 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
         avg_r = (sum(r_values) / n) if n else 0.0
         flag = ""
         if n >= min_sample_to_flag:
-            if win_rate < 35: flag = " ⚠️ underperforming"
-            elif win_rate > 65: flag = " ✅ strong"
-        lines.append(f"• {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
+            if win_rate < 35: flag = " \u26a0\ufe0f underperforming"
+            elif win_rate > 65: flag = " \u2705 strong"
+        lines.append(f"\u2022 {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
     return "\n".join(lines)
 
 
@@ -1299,7 +1066,6 @@ async def send_telegram_alert(client: httpx.AsyncClient, text: str, target_chat_
 
 
 def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.DataFrame:
-    """Apply strategy-specific 5M EMA columns without refetching market data."""
     df_5m = df_5m.copy()
     df_5m["ema_fast"] = df_5m["close"].ewm(span=fast, adjust=False).mean()
     df_5m["ema_slow"] = df_5m["close"].ewm(span=slow, adjust=False).mean()
@@ -1307,26 +1073,13 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 
 
 # =====================================================================
-# STRATEGY C: RANGE BREAKOUT + OCO PENDING ORDERS (PAPER)
-# =====================================================================
-# =====================================================================
 # STRATEGY C: RANGE BREAKOUT + SUPPORT / RESISTANCE (PAPER)
 # =====================================================================
-# C deliberately does NOT use EMA. The existing 10-candle consolidation
-# breakout remains the foundation; S/R is added as a structural layer for
-# breakout quality, stop placement and targets.
 BREAKOUT_SR_LOOKBACK_5M = 72
 BREAKOUT_SR_PIVOT_LEFT = 2
 BREAKOUT_SR_PIVOT_RIGHT = 2
 BREAKOUT_SR_CLUSTER_ATR = 0.25
 BREAKOUT_SR_MIN_TOUCHES = 2
-# Loosened from 2.0/8.0/1.10 -- arming only needs ONE side (BUY or SELL) to
-# find a usable level, but requiring 2+ touches (or a forced-recent single
-# touch) within only 8 ATR was still routinely failing on BOTH sides at
-# once on thin 5M pivot data. A single touch anywhere now counts, and the
-# search radius and minimum reward room are both wider -- same reasoning
-# as the range-detection loosening above: PAPER-only, volume matters more
-# than perfect setup quality right now.
 BREAKOUT_SR_MIN_STRENGTH = 1.0
 BREAKOUT_SR_MAX_TP_ATR = 14.0
 BREAKOUT_SR_MIN_ROOM_R = 0.75
@@ -1335,7 +1088,6 @@ BREAKOUT_SR_TP_BUFFER_ATR = 0.10
 
 
 def _sr_pivot_levels(df_5m: pd.DataFrame, atr: float):
-    """Find clustered confirmed 5M swing-high resistance and swing-low support."""
     if atr <= 0 or len(df_5m) < 15:
         return [], []
     look = df_5m.iloc[-BREAKOUT_SR_LOOKBACK_5M:].copy()
@@ -1385,7 +1137,6 @@ def _sr_best_above(levels, price):
 
 
 def _breakout_sr_plan(df_5m: pd.DataFrame, range_high: float, range_low: float, atr: float, action: str):
-    """Create structural SL/TP from historical S/R around the breakout range."""
     supports,resistances=_sr_pivot_levels(df_5m,atr)
     buffer=max(BREAKOUT_MIN_BUFFER_PRICE,BREAKOUT_BUFFER_ATR*atr)
     entry=range_high+buffer if action=='BUY' else range_low-buffer
@@ -1424,22 +1175,6 @@ def _breakout_sr_plan(df_5m: pd.DataFrame, range_high: float, range_low: float, 
 
 
 def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
-    """Range detector: scans several lookback windows (not one fixed size)
-    and recognizes two distinct kinds of consolidation:
-
-      1. QUIET_CONSOLIDATION -- low ADX on both 5m and 15m, the classic
-         "market is asleep, coiling before it picks a direction" range.
-      2. FLAG_CONTINUATION -- ADX is still elevated from a prior impulsive
-         move, but price has paused in an unusually tight band right now.
-         This is the "small range in the middle of a trend, before the next
-         leg" pattern -- price rarely jumps straight from one zone to the
-         next without a pause like this in between, so excluding it purely
-         because ADX hasn't cooled off yet was leaving real setups on the
-         table.
-
-    Both still go through the same fake-breakout wick filter and SR-based
-    SL/TP planning afterward -- only the detection gate changes.
-    """
     atr = float(df_5m['atr'].iloc[-1]) if not pd.isna(df_5m['atr'].iloc[-1]) else 0.0
     adx5 = float(df_5m['adx'].iloc[-1]) if not pd.isna(df_5m['adx'].iloc[-1]) else 0.0
     if atr <= 0 or len(df_5m) < max(BREAKOUT_RANGE_LOOKBACKS) + 1:
@@ -1449,10 +1184,8 @@ def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
     curr = df_5m.iloc[-1]
     c_close = float(curr['close']); c_high = float(curr['high']); c_low = float(curr['low'])
 
-    best = None  # tightest qualifying range across all scanned window sizes
+    best = None
     rejections = []
-    # Fallback display range (shortest window) for when nothing qualifies --
-    # /range still needs something to show the user even on a rejection.
     fallback_bracket = df_5m.iloc[-(BREAKOUT_RANGE_LOOKBACKS[0] + 1):-1]
     fallback_high = float(fallback_bracket['high'].max()); fallback_low = float(fallback_bracket['low'].min())
 
@@ -1474,7 +1207,6 @@ def detect_range_breakout_setup(df_5m: pd.DataFrame, adx_15m_true: float):
             rejections.append(f'{lookback}c ADX still elevated (5m {adx5:.1f}, 15m {adx_15m_true:.1f}) and range not tight enough for a flag ({width_atr:.2f} ATR > {BREAKOUT_FLAG_MAX_WIDTH_ATR:.2f})')
             continue
 
-        # Prefer the tightest qualifying range (most precise, most recent pause).
         if best is None or width_atr < best['width_atr']:
             best = {'lookback': lookback, 'high': high, 'low': low, 'width': width,
                     'width_atr': width_atr, 'range_type': range_type}
@@ -1597,10 +1329,6 @@ async def analyze_signal_with_ai(
     c_ema_fast = float(df_5m["ema_fast"].iloc[-1])
     c_ema_slow = float(df_5m["ema_slow"].iloc[-1])
 
-    # FIXED: the veto-rule text is now mode-aware. Range mode ONLY ever fires
-    # when 5M ADX < RANGE_MODE_ADX_MAX by design -- if this prompt still told
-    # the AI reviewer "VETO if ADX < 20", every single range signal would get
-    # auto-vetoed regardless of quality, silently defeating the whole feature.
     if strategy_mode == "RANGE":
         strategy_desc = f"Range Fade / Consolidation (5M Execution, active only when ADX < {RANGE_MODE_ADX_MAX:.0f})"
         range_text = f"5. Range Bracket: High=${range_high:.2f}, Low=${range_low:.2f}" if range_high else ""
@@ -1638,7 +1366,8 @@ Respond strictly in valid JSON matching schema:
 
     if GROQ_API_KEY:
         try:
-            res = groq_client.chat.completions.create(
+            res = await asyncio.to_thread(
+                groq_client.chat.completions.create,
                 model="openai/gpt-oss-120b",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1, response_format={"type": "json_object"}
@@ -1649,7 +1378,8 @@ Respond strictly in valid JSON matching schema:
 
     if GEMINI_API_KEY:
         try:
-            res = genai_client.models.generate_content(
+            res = await asyncio.to_thread(
+                genai_client.models.generate_content,
                 model="gemini-3.7-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -1662,7 +1392,8 @@ Respond strictly in valid JSON matching schema:
         except Exception as e:
             logging.error(f"[AI ERROR] Gemini call failed: {e}")
 
-    return SignalOutput(action=proposed_action, confidence=0.7, reasoning="Fallback: Executed on pure EMA structural alignment.")
+    logging.warning("[AI FAIL-SAFE] Both Groq and Gemini failed or are unconfigured -- holding this signal rather than executing blind.")
+    return SignalOutput(action="HOLD", confidence=0.0, reasoning="AI fail-safe: both Groq and Gemini were unavailable, so this signal was held rather than executed without review.")
 
 
 # --- SIDE-BY-SIDE BACKGROUND SCANNING LOOP ---
@@ -1680,9 +1411,6 @@ async def evaluate_strategy_cycle(
     alert_chat_id: str,
     directional_bias: str = "NEUTRAL",
 ):
-    """Evaluate one strategy on the SAME market snapshot used by the other strategy."""
-    # Strategy-specific EMA pair is passed explicitly; no global EMA state is mutated.
-    # This keeps Control A and Experimental B fully independent.
     df_5m = set_execution_ema_columns(market_df_5m, ema_fast, ema_slow)
 
     curr_price = float(df_5m["close"].iloc[-1])
@@ -1700,12 +1428,6 @@ async def evaluate_strategy_cycle(
         strategy_mode = "RANGE"
         proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
 
-    # 1H EMA200 directional bias gate (seasonality-style regime filter -- see
-    # compute_1h_directional_bias). BULLISH blocks SELL, BEARISH blocks BUY,
-    # NEUTRAL blocks neither. This is a real-money finding: SELL signals lost
-    # broadly on both strategies while gold's 1H trend ran up, across nearly
-    # every trigger type -- this is meant to auto-flip if/when that reverses,
-    # instead of needing a manual switch every time the regime changes.
     if proposed_action == "SELL" and directional_bias == "BULLISH":
         logging.info(f"[{strategy}] [1H BIAS BLOCK] SELL blocked -- 1H EMA200 regime is BULLISH.")
         proposed_action = "HOLD"
@@ -1713,7 +1435,6 @@ async def evaluate_strategy_cycle(
         logging.info(f"[{strategy}] [1H BIAS BLOCK] BUY blocked -- 1H EMA200 regime is BEARISH.")
         proposed_action = "HOLD"
 
-    # Same exhaustion/chop guard for both strategies, isolated by strategy history.
     if proposed_action in ("BUY", "SELL") and strategy_mode == "TREND":
         guard_block, guard_metrics = trend_exhaustion_guard(proposed_action, df_5m, strategy)
         regime_metrics["exhaustion_guard"] = guard_metrics
@@ -1728,7 +1449,6 @@ async def evaluate_strategy_cycle(
             logging.info(f"[{strategy}] [EXHAUSTION GUARD] Blocking {proposed_action}: score={guard_metrics.get('score')} reason={guard_metrics.get('reason')}")
             proposed_action = "HOLD"
 
-    # Isolated three-loss directional lock.
     for guarded_direction in ("BUY", "SELL"):
         if proposed_action != guarded_direction:
             continue
@@ -1744,7 +1464,6 @@ async def evaluate_strategy_cycle(
             else:
                 logging.info(f"[{strategy}] [DIRECTION LOCK] {guarded_direction} released: {reset_reason}")
 
-    # Strategy-isolated global loss cooldown.
     if proposed_action != "HOLD":
         try:
             conn = get_db_connection(); cursor = conn.cursor()
@@ -1763,7 +1482,6 @@ async def evaluate_strategy_cycle(
         except Exception as e:
             logging.error(f"[{strategy}] loss cooldown check: {e}")
 
-    # Strategy-isolated distance cooldown.
     if proposed_action != "HOLD":
         try:
             conn = get_db_connection(); cursor = conn.cursor()
@@ -1817,11 +1535,6 @@ async def evaluate_strategy_cycle(
         sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
         tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
         tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
-        # No SL compression, no dollar cap, no dynamic lot sizing -- plain
-        # ATR-based risk for every trade, same as before the $6 cap was ever
-        # introduced. The 1H EMA200 bias filter above (kept) is what guards
-        # against a losing streak on a sudden trend reversal -- it blocks
-        # entries against the new direction rather than resizing the stop.
 
     if ai_decision.action == proposed_action:
         new_id = log_trade_signal(
@@ -1896,7 +1609,6 @@ async def background_scanning_loop():
                     await asyncio.sleep(20)
                     continue
 
-                # ONE shared 5M request for both strategies.
                 df_5m = await fetch_timeframe_data(client, "5min", now_wib=now_wib)
                 if df_5m is None or len(df_5m) < 6:
                     logging.warning("[SCAN LOOP] 5M fetch failed or insufficient data this window; will retry next candle.")
@@ -1917,7 +1629,6 @@ async def background_scanning_loop():
                 curr_low = float(df_5m["low"].iloc[-1])
                 update_open_trades(curr_high, curr_low)
 
-                # ONE shared 15M refresh/cache for both strategies.
                 need_refresh = (
                     cached_15m["df"] is None or cached_15m["fetched_at"] is None or
                     (datetime.now(timezone.utc) - cached_15m["fetched_at"] >= timedelta(minutes=FIFTEEN_M_REFRESH_MINUTES))
@@ -1931,8 +1642,6 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                # ONE shared 1H refresh/cache for both strategies -- the
-                # directional bias + ranging-regime gate.
                 need_1h_refresh = (
                     cached_1h["df"] is None or cached_1h["fetched_at"] is None or
                     (datetime.now(timezone.utc) - cached_1h["fetched_at"] >= timedelta(minutes=ONE_H_REFRESH_MINUTES))
@@ -1945,15 +1654,14 @@ async def background_scanning_loop():
 
                 directional_bias, bias_sep = compute_1h_directional_bias(cached_1h["df"])
 
-                # CONTROL A: existing Exhaustion Guard v1, EMA 5/9, PAPER.
+                # CONTROL A: EMA 5/9, PAPER
                 await evaluate_strategy_cycle(
                     client, df_5m, trend_15m, adx_15m_true, now_wib,
                     CONTROL_STRATEGY, 5, 9, CONTROL_EXECUTION_MODE,
                     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, directional_bias
                 )
 
-                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, LIVE.
-                # It receives the exact same candles and 15M confluence snapshot.
+                # EXPERIMENT B: EMA 5/15, LIVE
                 await evaluate_strategy_cycle(
                     client, df_5m, trend_15m, adx_15m_true, now_wib,
                     EXPERIMENTAL_STRATEGY, EXPERIMENTAL_EMA_FAST, EXPERIMENTAL_EMA_SLOW,
@@ -1961,7 +1669,7 @@ async def background_scanning_loop():
                     EXPERIMENTAL_TELEGRAM_CHAT_ID, directional_bias
                 )
 
-                # STRATEGY C: Range Breakout OCO (paper), same shared market snapshot.
+                # STRATEGY C: Range Breakout OCO (PAPER)
                 if BREAKOUT_TELEGRAM_BOT_TOKEN and BREAKOUT_TELEGRAM_CHAT_ID:
                     await evaluate_breakout_strategy(client, df_5m, adx_15m_true, now_wib)
 
@@ -1992,9 +1700,9 @@ async def lifespan(app: FastAPI):
                         {"command":"start","description":"Show Control bot commands"},
                         {"command":"help","description":"Show Control command menu"},
                         {"command":"status","description":"MT5/server/API status"},
-                        {"command":"stats","description":"Live EMA 5/9 performance"},
+                        {"command":"stats","description":"Control performance dashboard"},
                         {"command":"pips","description":"Pips and USD breakdown"},
-                        {"command":"logs","description":"Last 10 live trades"},
+                        {"command":"logs","description":"Last 10 trades"},
                         {"command":"analyze","description":"Forward-test analysis"},
                         {"command":"pause","description":"Emergency kill switch"},
                         {"command":"resume","description":"Resume auto-trading"}
@@ -2010,7 +1718,7 @@ async def lifespan(app: FastAPI):
                         {"command":"stats","description":"A/B performance dashboard"},
                         {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
                         {"command":"status","description":"Read-only system status"},
-                        {"command":"last","description":"Last 10 paper trades"}
+                        {"command":"last","description":"Last 10 live trades"}
                     ]})
                 if BREAKOUT_TELEGRAM_BOT_TOKEN:
                     webhook_c = f"{APP_URL.rstrip('/')}/telegram-webhook-c"
@@ -2038,7 +1746,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "A/B/C scanner active: EMA 5/9 LIVE + EMA 5/15 PAPER + RANGE BREAKOUT OCO PAPER.", "comparison": "/ab-comparison"}
+    return {"status": "ok", "message": "A/B/C scanner active: EMA 5/9 PAPER + EMA 5/15 LIVE + RANGE BREAKOUT OCO PAPER.", "comparison": "/ab-comparison"}
 
 
 # =====================================================================
@@ -2046,14 +1754,6 @@ def home():
 # =====================================================================
 _latest_signal_cache = {"response": None, "cached_at": None}
 LATEST_SIGNAL_CACHE_TTL_SECONDS = 12
-# A new LIVE signal can only ever appear once per 5-minute scan cycle at the
-# absolute fastest -- so caching this endpoint's DB read for a few seconds
-# costs nothing in responsiveness (worst case: the EA sees a new trade up to
-# ~12s later than instant) but cuts Postgres connections from one per EA
-# poll (every 10s by default = ~8,640/day) down to one per ~12s regardless
-# of how often or how many EAs poll. This was the dominant driver behind
-# Neon's compute-hour limit being hit: constant fresh connections never let
-# the compute endpoint go idle long enough to auto-suspend.
 
 @app.get("/get-latest-signal")
 async def get_latest_signal():
@@ -2153,7 +1853,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
-        # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume"}
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last"}
         BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/range", "/last", "/cancel"}
@@ -2185,23 +1884,24 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/stats` - A/B performance dashboard\n"
                         "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
                         "• `/status` - Read-only system status\n"
-                        "• `/last` - Last 10 experimental paper trades\n"
+                        "• `/last` - Last 10 experimental trades\n"
                         "• `/help` - Display this command menu\n\n"
-                        "🔵 Strategy: *EMA 5/15 — PAPER ONLY*\n"
-                        "🛡️ This bot cannot control MT5 live trading.\n"
+                        "🔴 Strategy: *EMA 5/15 — LIVE (real MT5 trades)*\n"
+                        "🚨 This bot IS connected to live MT5 execution. Use /pause on the Control bot for the emergency kill switch.\n"
                     )
                 else:
                     reply = (
                         f"🤖 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
                         "• `/status` - Real-time MT5, server & API status\n"
-                        "• `/stats` - Original live/control performance dashboard\n"
+                        "• `/stats` - Control performance dashboard (PAPER)\n"
                         "• `/pips` - Gross/net pips & USD breakdown\n"
-                        "• `/logs` - Last 10 executed trades\n"
+                        "• `/logs` - Last 10 trades\n"
                         "• `/analyze` - Forward-test strategy analysis\n"
-                        "• `/pause` - 🚨 Emergency kill switch\n"
+                        "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live B)\n"
                         "• `/resume` - 🟢 Re-enable auto-trading\n"
                         "• `/help` - Display this command menu\n\n"
-                        f"⚖️ Execution: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW}* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"🟡 Strategy: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} — PAPER ONLY* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"\u2139\ufe0f Live MT5 execution is currently on the *Experimental* bot (EMA 5/15), not this one.\n"
                     )
                 await send_reply(reply)
 
@@ -2211,55 +1911,55 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     seconds_ago = (now_wib.replace(tzinfo=None) - LAST_MT5_PING_TIME.replace(tzinfo=None)).total_seconds()
 
                     if seconds_ago < 60:
-                        status_icon = "🟢"
-                        conn_msg = f"Connected and Active\n• Last ping: *{seconds_ago:.0f}s ago*"
+                        status_icon = "\U0001f7e2"
+                        conn_msg = f"Connected and Active\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
                     elif seconds_ago < 180:
-                        status_icon = "🟡"
-                        conn_msg = f"Slight Lag\n• Last ping: *{seconds_ago:.0f}s ago*"
+                        status_icon = "\U0001f7e1"
+                        conn_msg = f"Slight Lag\n\u2022 Last ping: *{seconds_ago:.0f}s ago*"
                     else:
-                        status_icon = "🔴"
-                        conn_msg = f"DISCONNECTED\n• Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
+                        status_icon = "\U0001f534"
+                        conn_msg = f"DISCONNECTED\n\u2022 Last ping was *{seconds_ago:.0f}s ago*! Please check your MT5 terminal."
 
                     remaining = TWELVE_DATA_DAILY_LIMIT - _twelve_data_call_count
                     budget_pct = (_twelve_data_call_count / TWELVE_DATA_DAILY_LIMIT * 100) if TWELVE_DATA_DAILY_LIMIT else 0.0
-                    budget_icon = "🟢" if budget_pct < 70 else ("🟡" if budget_pct < 90 else "🔴")
+                    budget_icon = "\U0001f7e2" if budget_pct < 70 else ("\U0001f7e1" if budget_pct < 90 else "\U0001f534")
                     bias_val, bias_sep_val = compute_1h_directional_bias(cached_1h["df"])
                     ranging_now, ranging_sep_val = compute_ranging_regime(cached_1h["df"])
-                    bias_icon = {"BULLISH": "🟢📈", "BEARISH": "🔴📉", "NEUTRAL": "⚪"}.get(bias_val, "⚪")
+                    bias_icon = {"BULLISH": "\U0001f7e2\U0001f4c8", "BEARISH": "\U0001f534\U0001f4c9", "NEUTRAL": "\u26aa"}.get(bias_val, "\u26aa")
                     bias_note = {
                         "BULLISH": "SELL blocked on A/B this cycle",
                         "BEARISH": "BUY blocked on A/B this cycle",
                         "NEUTRAL": "Neither direction blocked",
                     }.get(bias_val, "")
-                    ranging_note = f"🟠 Near EMA200 (ranging zone) -- informational only, SL unaffected" if ranging_now else f"🟢 Trending -- outside ranging zone"
+                    ranging_note = f"\U0001f7e0 Near EMA200 (ranging zone) -- informational only, SL unaffected" if ranging_now else "\U0001f7e2 Trending -- outside ranging zone"
                     reply = (
                         f"{status_icon} *SYSTEM & BRIDGE STATUS*\n"
-                        f"―――――――――――――――――――――――――\n"
-                        f"• Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
-                        f"• MT5 Bridge: *{conn_msg}*\n"
-                        f"• Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`\n\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\u2022 Trading State: *{'ACTIVE' if SYSTEM_TRADING_ENABLED else 'PAUSED (Kill-Switch)'}*\n"
+                        f"\u2022 MT5 Bridge: *{conn_msg}*\n"
+                        f"\u2022 Server Time: `{now_wib.strftime('%Y-%m-%d %H:%M:%S WIB')}`\n\n"
                         f"{bias_icon} *1H DIRECTIONAL BIAS (EMA{ONE_H_EMA_PERIOD}):* *{bias_val}* ({bias_sep_val:+.3f}% sep)\n"
-                        f"• {bias_note}\n"
-                        f"• {ranging_note} ({ranging_sep_val:.3f}% from EMA)\n\n"
+                        f"\u2022 {bias_note}\n"
+                        f"\u2022 {ranging_note} ({ranging_sep_val:.3f}% from EMA)\n\n"
                         f"{budget_icon} *TWELVEDATA API BUDGET:*\n"
-                        f"• Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
-                        f"  └─ 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']} | 1H: {_twelve_data_calls_by_tf['1h']}\n\n"
-                        f"📈 *STRATEGY:*\n"
-                        f"• Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}* (trend mode, ADX≥{RANGE_MODE_ADX_MAX:.0f})\n"
-                        f"• Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
-                        f"• Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
+                        f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
+                        f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']} | 1H: {_twelve_data_calls_by_tf['1h']}\n\n"
+                        f"\U0001f4c8 *STRATEGY:*\n"
+                        f"\u2022 Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}* (trend mode, ADX\u2265{RANGE_MODE_ADX_MAX:.0f})\n"
+                        f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"\u2022 Range Fade: *ADX<{RANGE_MODE_ADX_MAX:.0f}*, {RANGE_LOOKBACK_5M}-candle bracket"
                     )
                 else:
-                    reply = "🔴 *MT5 DISCONNECTED*\n―――――――――――――――――――――――――\nThe server is running, but MT5 has not sent any pings since the last reboot."
+                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_reply(reply)
 
             elif bot_role == "control" and raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
-                await send_reply("🛑 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.")
+                await send_reply("\U0001f6d1 *EMERGENCY KILL SWITCH ACTIVATED*\nMarket scanner paused. Send `/resume` to reactivate.")
 
             elif bot_role == "control" and raw_text == "/resume":
                 SYSTEM_TRADING_ENABLED = True
-                await send_reply("🟢 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
+                await send_reply("\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
 
             elif bot_role == "breakout" and raw_text == "/status":
                 p = BREAKOUT_ACTIVE_PENDING or _breakout_pending_from_db()
@@ -2349,28 +2049,28 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.close(); conn.close()
 
                     reply = (
-                        f"📊 *PERFORMANCE ANALYTICS DASHBOARD*\n"
-                        f"―――――――――――――――――――――――――\n"
-                        f"💰 *NET PIPS & PROFIT:*\n"
-                        f"• Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
-                        f"• Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
-                        f"📈 *WIN / LOSS BREAKDOWN:*\n"
-                        f"• Total Executed: *{total_executed}*\n"
-                        f"• Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
-                        f"  └─ Hit TP1 (BE Runner): *{tp1_wins}*\n"
-                        f"  └─ Hit TP2 (Full Target): *{tp2_wins}*\n"
-                        f"• Total Losses (SL Hit): *{losses}*\n"
-                        f"• Active Pending: *{total_pending}*\n\n"
-                        f"⚡ *SYSTEM & AI EFFICIENCY:*\n"
-                        f"• Total Signals: *{total_executed + total_vetoes}*\n"
-                        f"• AI Vetoed Signals: *{total_vetoes}*\n\n"
-                        f"🎯 *RISK & TRADE METRICS:*\n"
-                        f"• Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
-                        f"• Profit Factor: *{profit_factor:.2f}*\n"
-                        f"• Win Rate: *{win_rate:.1f}%*"
+                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
+                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
+                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
+                        f"\u2022 Total Executed: *{total_executed}*\n"
+                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
+                        f"\u2022 Active Pending: *{total_pending}*\n\n"
+                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
+                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
+                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
+                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
+                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
                     )
                     await send_reply(reply)
-                except Exception as e: await send_reply(f"⚠️ Error querying stats: {e}")
+                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
 
             elif (bot_role == "experimental" and raw_text in ("/stats", "/compare")):
                 try:
@@ -2397,7 +2097,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
                         net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
                         total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
-                        # Profit factor from stored result_pips, falling back to R when needed.
                         cur.execute("""
                             SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
                                    COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
@@ -2412,7 +2111,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                             "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
                         }
 
-                    # Calculate current maximum consecutive SL streak per strategy.
                     for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY):
                         cur.execute("""
                             SELECT outcome FROM signals
@@ -2505,26 +2203,26 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
 
                     reply = (
-                        f"💲 *DETAILED PIPS & EARNINGS REPORT*\n"
-                        f"―――――――――――――――――――――――――\n"
-                        f"📊 *SUMMARY:*\n"
-                        f"• Total Net Pips: *{total_pips:+.1f} pips*\n"
-                        f"• Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
-                        f"📈 *PIPS BREAKDOWN:*\n"
-                        f"• Gross Gain: *+{gross_win_pips:.1f} pips*\n"
-                        f"• Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
-                        f"🎯 *AVERAGE METRICS:*\n"
-                        f"• Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
-                        f"• Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
-                        f"• Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
-                        f"―――――――――――――――――――――――――\n"
-                        f"💡 *Note:* Reflects your actual 2x0.01 lot execution -- "
+                        f"\U0001f4b5 *DETAILED PIPS & EARNINGS REPORT*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4ca *SUMMARY:*\n"
+                        f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
+                        f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                        f"\U0001f3af *AVERAGE METRICS:*\n"
+                        f"\u2022 Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4a1 *Note:* Reflects your actual 2x0.01 lot execution -- "
                         f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
                         f"TP2 = lot1 @ TP1 + lot2 @ TP2."
                     )
                     await send_reply(reply)
                 except Exception as e:
-                    await send_reply(f"⚠️ Error calculating pips: {e}")
+                    await send_reply(f"\u26a0\ufe0f Error calculating pips: {e}")
 
             elif ((bot_role == "control" and raw_text == "/logs") or (bot_role == "experimental" and raw_text == "/last")):
                 try:
@@ -2543,9 +2241,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     cur.close(); conn.close()
 
                     if not logs:
-                        reply = "📜 *LAST 10 TRADE LOGS:*\n\n_No executed trades in the database yet._"
+                        reply = "\U0001f4dc *LAST 10 TRADE LOGS:*\n\n_No executed trades in the database yet._"
                     else:
-                        reply = "📜 *LAST 10 DETAILED TRADE LOGS:*\n―――――――――――――――――――――――――\n\n"
+                        reply = "\U0001f4dc *LAST 10 DETAILED TRADE LOGS:*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\n"
                         for l in logs:
                             trade_id = l["id"]; action = l["action"]
                             entry = float(l["entry_p"])
@@ -2568,22 +2266,22 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                 pip_str = "*ACTIVE / IN PROGRESS*"
 
                             if "WIN" in outcome or "CLOSED" in outcome:
-                                icon = "🟢"
+                                icon = "\U0001f7e2"
                             elif "LOSS" in outcome:
-                                icon = "🔴"
+                                icon = "\U0001f534"
                             else:
-                                icon = "🟡"
+                                icon = "\U0001f7e1"
 
                             reply += (
                                 f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
-                                f"• Entry: ${entry:.2f} → Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
-                                f"• Outcome: *{outcome}*\n"
-                                f"• Result: {pip_str} | Time: {date_str}\n"
-                                f"──────────────────────────\n"
+                                f"\u2022 Entry: ${entry:.2f} \u2192 Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
+                                f"\u2022 Outcome: *{outcome}*\n"
+                                f"\u2022 Result: {pip_str} | Time: {date_str}\n"
+                                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
                             )
                     await send_reply(reply)
                 except Exception as e:
-                    await send_reply(f"⚠️ Error querying logs: {e}")
+                    await send_reply(f"\u26a0\ufe0f Error querying logs: {e}")
 
             elif bot_role == "control" and raw_text == "/analyze":
                 try:
@@ -2603,7 +2301,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
                     if not rows:
                         reply = (
-                            "📐 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
+                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
                             "_Not enough closed trades yet to analyze. Check back after more signals complete._"
                         )
                     else:
@@ -2628,8 +2326,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
 
                         reply_parts = [
-                            "📐 *EMA STRATEGY FORWARD-TEST ANALYSIS*",
-                            "―――――――――――――――――――――――――",
+                            "\U0001f4d0 *EMA STRATEGY FORWARD-TEST ANALYSIS*",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
                             f"Sample: *{n_total} closed trades*",
                             f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
                             "",
@@ -2638,19 +2336,19 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                             reply_parts.append(format_performance_segment(dim, segments[dim]))
                             reply_parts.append("")
 
-                        reply_parts.append("―――――――――――――――――――――――――")
+                        reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
                         reply_parts.append(
-                            "💡 Segments need n≥8 to be flagged ⚠️/✅ (smaller samples are shown "
+                            "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
                             "but noisy). Check the Strategy breakdown for \"Range Fade (Consolidation)\" vs the "
                             "EMA buckets to see which regime is actually working.\n\n"
-                            f"⚖️ Mode is auto-selected by 5M ADX (≥{RANGE_MODE_ADX_MAX:.0f} trend, "
+                            f"\u2696\ufe0f Mode is auto-selected by 5M ADX (\u2265{RANGE_MODE_ADX_MAX:.0f} trend, "
                             f"<{RANGE_MODE_ADX_MAX:.0f} range) -- not a veto, both regimes are live.\n"
-                            f"⏱️ Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
+                            f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
                         )
                         reply = "\n".join(reply_parts)
                     await send_reply(reply)
                 except Exception as e:
-                    await send_reply(f"⚠️ Error: {e}")
+                    await send_reply(f"\u26a0\ufe0f Error: {e}")
 
     except Exception as e: logging.error(f"[WEBHOOK ERROR] {e}")
     return {"status": "ok"}

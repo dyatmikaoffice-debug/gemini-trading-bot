@@ -1571,7 +1571,7 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
         """, (
             (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
             action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
-            0.90, reasoning, "EXTREME_M5", BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
+            0.90, reasoning, None, "EXTREME_M5", BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
         ))
         row = cur.fetchone(); sid = int(row["id"]) if row else None
         conn.commit(); cur.close(); conn.close()

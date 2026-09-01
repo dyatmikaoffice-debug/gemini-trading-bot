@@ -1601,33 +1601,6 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
 async def evaluate_breakout_strategy(client, market_df_5m, adx_15m_true, now_wib):
     await evaluate_extreme_strategy(client, market_df_5m, now_wib)
 
-# Real-MT5 market-data ingress. The EA should POST a small rolling M5 history.
-@app.post("/mt5-market-data")
-async def mt5_market_data(request: Request):
-    global mt5_market_cache
-    try:
-        if MT5_DATA_SECRET:
-            supplied = request.headers.get("X-MT5-SECRET", "")
-            if supplied != MT5_DATA_SECRET:
-                return {"ok": False, "error": "unauthorized"}
-        payload = await request.json()
-        df = _df_from_mt5_payload(payload)
-        if df is None or len(df) < EXTREME_ATR_PERIOD + 3:
-            return {"ok": False, "error": "invalid_or_insufficient_m5_bars"}
-        mt5_market_cache["df"] = df
-        mt5_market_cache["updated_at"] = datetime.now(timezone.utc)
-        mt5_market_cache["source"] = "MT5_EA"
-        return {
-            "ok": True,
-            "source": "MT5_EA",
-            "bars": len(df),
-            "last_bar": str(df["datetime"].iloc[-1]),
-            "updated_at": mt5_market_cache["updated_at"].isoformat(),
-        }
-    except Exception as e:
-        logging.error(f"[MT5 DATA INGEST ERROR] {e}")
-        return {"ok": False, "error": str(e)}
-
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
     proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, 
@@ -2115,6 +2088,33 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Real-MT5 market-data ingress. The EA should POST a small rolling M5 history.
+@app.post("/mt5-market-data")
+async def mt5_market_data(request: Request):
+    global mt5_market_cache
+    try:
+        if MT5_DATA_SECRET:
+            supplied = request.headers.get("X-MT5-SECRET", "")
+            if supplied != MT5_DATA_SECRET:
+                return {"ok": False, "error": "unauthorized"}
+        payload = await request.json()
+        df = _df_from_mt5_payload(payload)
+        if df is None or len(df) < EXTREME_ATR_PERIOD + 3:
+            return {"ok": False, "error": "invalid_or_insufficient_m5_bars"}
+        mt5_market_cache["df"] = df
+        mt5_market_cache["updated_at"] = datetime.now(timezone.utc)
+        mt5_market_cache["source"] = "MT5_EA"
+        return {
+            "ok": True,
+            "source": "MT5_EA",
+            "bars": len(df),
+            "last_bar": str(df["datetime"].iloc[-1]),
+            "updated_at": mt5_market_cache["updated_at"].isoformat(),
+        }
+    except Exception as e:
+        logging.error(f"[MT5 DATA INGEST ERROR] {e}")
+        return {"ok": False, "error": str(e)}
 
 @app.get("/")
 def home():

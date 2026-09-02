@@ -1315,9 +1315,10 @@ EXTREME_MIN_REENTRY_DISTANCE_ATR = 0.20
 EXTREME_COOLDOWN_SECONDS = 10
 EXTREME_REQUIRE_VWAP_ALIGNMENT = True
 EXTREME_ALLOW_BOTH_DIRECTIONS = True
-EXTREME_MAX_TRADES_PER_DAY = 50
-EXTREME_SESSION_START_HOUR = 7
-EXTREME_SESSION_END_HOUR = 23
+EXTREME_MAX_TRADES_PER_DAY = None  # None = unlimited (was 50)
+EXTREME_MAX_TRADES_PER_DAY_LABEL = "Unlimited" if EXTREME_MAX_TRADES_PER_DAY is None else str(EXTREME_MAX_TRADES_PER_DAY)
+EXTREME_SESSION_START_HOUR = 0     # No time gate: runs all day (was 7)
+EXTREME_SESSION_END_HOUR = 24      # No time gate: runs all day (was 23)
 
 _extreme_state = {
     "last_signal_time": None,
@@ -1515,7 +1516,7 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     if not _extreme_session_ok(now_wib):
         return
 
-    if _extreme_state["trades_today"] >= EXTREME_MAX_TRADES_PER_DAY:
+    if EXTREME_MAX_TRADES_PER_DAY is not None and _extreme_state["trades_today"] >= EXTREME_MAX_TRADES_PER_DAY:
         return
 
     # Prefer the EA-fed MT5 market snapshot when available.
@@ -1589,7 +1590,7 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             f"TP2: *${tp2:.2f}* ({EXTREME_TP2_R:.2f}R)\n"
             f"EMA: *9/21* | VWAP: *aligned* | ATR: *{atr:.3f}*\n"
             f"Data source: *{source}*\n"
-            f"Daily C signals: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY}*\n\n"
+            f"Daily C signals: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n\n"
             f"⚠️ PAPER ONLY",
             BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN
         )
@@ -2236,7 +2237,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both"}
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -2252,6 +2253,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "📦 *EXTREME M5 BOT COMMANDS:*\n\n"
                         "• `/status` - Extreme M5 status\n"
                         "• `/stats` - Extreme M5 performance\n"
+                        "• `/pips` - Detailed pips/earnings report (TP1/TP2/SL breakdown)\n"
                         "• `/last` - Last Extreme M5 signals\n"
                         "• `/help` - Display this menu\n\n"
                         "🟣 Strategy: *Extreme M5 Impulse/Pullback/Re-entry*\n"
@@ -2356,10 +2358,10 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 A/B Direction Mode: *{ONE_DIRECTION_MODE}*\n"
                         f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
-                        f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY}/day"
+                        f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day"
                     )
                 else:
-                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
+                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_reply(reply)
 
             elif bot_role == "control" and raw_text == "/pause":
@@ -2377,7 +2379,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     "⚡ *EXTREME M5 STRATEGY C STATUS*\n\n"
                     f"Engine: *EMA9/EMA21 + Session VWAP + ATR*\n"
                     f"Data source: *{mt5_src}*\n"
-                    f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY}*\n"
+                    f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n"
                     f"Execution: *{BREAKOUT_EXECUTION_MODE}*\n"
                     f"MT5 feed cache: *{'FRESH' if _mt5_cache_fresh() else 'NOT FRESH'}*"
                 )
@@ -2398,6 +2400,73 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     else: reply="📋 *LAST EXTREME M5 SIGNALS*\n\n"+"\n".join(f"#{r['id']} | {r['action']} | {r['trigger_type']} | ${float(r['entry_price'] or 0):.2f} | {r['outcome'] or 'N/A'}" for r in rows)
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"⚠️ Error querying breakout logs: {e}")
+
+            elif bot_role == "breakout" and raw_text == "/pips":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p,
+                               exit_price, COALESCE(outcome, 'PENDING') AS outcome_val
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (BREAKOUT_STRATEGY,))
+                    trades = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    total_pips = gross_win_pips = gross_loss_pips = 0.0
+                    winning_trades_count = losing_trades_count = 0
+                    tp1_be_count = tp2_count = sl_count = 0
+
+                    for t in trades:
+                        pips, _usd = compute_trade_pips({
+                            "action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"],
+                            "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"],
+                            "outcome": t["outcome_val"]
+                        })
+                        total_pips += pips
+                        if pips > 0:
+                            gross_win_pips += pips; winning_trades_count += 1
+                        elif pips < 0:
+                            gross_loss_pips += abs(pips); losing_trades_count += 1
+
+                        ov = t["outcome_val"]
+                        if ov == "CLOSED (TP1 HIT / SL BE)":
+                            tp1_be_count += 1
+                        elif ov in ("WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"):
+                            tp2_count += 1
+                        elif "LOSS" in ov:
+                            sl_count += 1
+
+                    avg_win_pips = (gross_win_pips / winning_trades_count) if winning_trades_count > 0 else 0.0
+                    avg_loss_pips = (gross_loss_pips / losing_trades_count) if losing_trades_count > 0 else 0.0
+                    est_profit_usd = total_pips * 0.10
+                    pip_efficiency = gross_win_pips / (gross_loss_pips + 1e-5)
+
+                    reply = (
+                        f"⚡ *EXTREME M5 DETAILED PIPS & EARNINGS REPORT*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4ca *SUMMARY:*\n"
+                        f"\u2022 Total Net Pips: *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (0.01 Lot): *${est_profit_usd:+.2f}*\n\n"
+                        f"\U0001f3af *TP/SL BREAKDOWN:*\n"
+                        f"\u2022 TP1 Hit + Runner @ BE: *{tp1_be_count}*\n"
+                        f"\u2022 TP2 Hit (full runner): *{tp2_count}*\n"
+                        f"\u2022 SL Hit (full loss): *{sl_count}*\n\n"
+                        f"\U0001f4c8 *PIPS BREAKDOWN:*\n"
+                        f"\u2022 Gross Gain: *+{gross_win_pips:.1f} pips*\n"
+                        f"\u2022 Gross Loss: *-{gross_loss_pips:.1f} pips*\n\n"
+                        f"\U0001f3af *AVERAGE METRICS:*\n"
+                        f"\u2022 Avg Win Trade: *+{avg_win_pips:.1f} pips*\n"
+                        f"\u2022 Avg Loss Trade: *-{avg_loss_pips:.1f} pips*\n"
+                        f"\u2022 Pip Efficiency Ratio: *{pip_efficiency:.2f}*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4a1 *Note:* PAPER simulation, same 2x0.01 lot model as A/B -- "
+                        f"SL (before TP1) = both lots @ SL, TP1/BE = lot1 @ TP1 + lot2 @ BE, "
+                        f"TP2 = lot1 @ TP1 + lot2 @ TP2."
+                    )
+                    await send_reply(reply)
+                except Exception as e: await send_reply(f"⚠️ Error querying breakout pips: {e}")
 
             elif bot_role == "control" and raw_text == "/stats":
                 try:

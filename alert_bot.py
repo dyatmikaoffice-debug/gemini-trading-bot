@@ -164,6 +164,10 @@ TREND_15M_MIN_SEPARATION_PCT = 0.02
 # selected purely by 5M ADX: >= RANGE_MODE_ADX_MAX runs the trend engine,
 # < RANGE_MODE_ADX_MAX runs this fade-the-edges engine instead of going silent.
 RANGE_MODE_ADX_MAX = 20.0
+CONTROL_TREND_ADX_MIN = 27.0  # A-only distinctive filter: shared RANGE_MODE_ADX_MAX=20 lets weak-trend
+                              # entries (adx 20-27) through to A same as B. Forward test showed A's
+                              # 75 executed trades were 100% classified TREND -- this raises the bar so
+                              # A only takes the stronger-trend subset. B is untouched.
 RANGE_LOOKBACK_5M = 10             # candles defining the current range bracket (~50 min on 5M)
 RANGE_MAX_WIDTH_ATR_MULT = 2.0     # bracket must be no wider than this (in ATR) to count as a real range
 RANGE_MIN_WIDTH_ATR_MULT = 0.8     # bracket must be at least this wide -- too tight isn't tradeable (spread/slippage)
@@ -1302,8 +1306,9 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 EXTREME_EMA_FAST = 9
 EXTREME_EMA_SLOW = 21
 EXTREME_ATR_PERIOD = 14
-EXTREME_IMPULSE_MIN_BODY_ATR = 0.30
-EXTREME_PULLBACK_MAX_DISTANCE_ATR = 0.35
+EXTREME_IMPULSE_MIN_BODY_ATR = 0.38  # was 0.30 -- forward test showed Impulse Breakout net -$0.29/trade at 0.30
+EXTREME_PULLBACK_MAX_DISTANCE_ATR = 0.35  # unchanged -- only trigger with positive edge (+$0.92/trade)
+EXTREME_REENTRY_BODY_MULTIPLIER = 1.10  # was implicit 0.75x impulse -- Momentum Re-entry was the weakest filter AND worst performer (-$0.84/trade)
 EXTREME_BREAKOUT_LOOKBACK = 6
 EXTREME_MIN_RANGE_ATR = 0.20
 EXTREME_MAX_SPREAD_ATR = 0.25
@@ -1314,7 +1319,8 @@ EXTREME_MAX_HOLD_CANDLES = 6
 EXTREME_MIN_REENTRY_DISTANCE_ATR = 0.20
 EXTREME_COOLDOWN_SECONDS = 10
 EXTREME_REQUIRE_VWAP_ALIGNMENT = True
-EXTREME_ALLOW_BOTH_DIRECTIONS = True
+EXTREME_DIRECTION_MODE = "BOTH"  # BOTH | BUY_ONLY | SELL_ONLY -- toggle via /c_both, /c_buyonly, /c_sellonly on Bot C
+EXTREME_DIRECTION_MODES = {"BOTH", "BUY_ONLY", "SELL_ONLY"}
 EXTREME_MAX_TRADES_PER_DAY = None  # None = unlimited (was 50)
 EXTREME_MAX_TRADES_PER_DAY_LABEL = "Unlimited" if EXTREME_MAX_TRADES_PER_DAY is None else str(EXTREME_MAX_TRADES_PER_DAY)
 EXTREME_SESSION_START_HOUR = 0     # No time gate: runs all day (was 7)
@@ -1438,11 +1444,11 @@ def detect_extreme_m5_signal(df_5m: pd.DataFrame):
     # continues through its high/low without requiring a new EMA crossover.
     reentry_long = (
         long_regime and close > float(prev["high"]) and close > op and
-        body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR * 0.75
+        body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR * EXTREME_REENTRY_BODY_MULTIPLIER
     )
     reentry_short = (
         short_regime and close < float(prev["low"]) and close < op and
-        body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR * 0.75
+        body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR * EXTREME_REENTRY_BODY_MULTIPLIER
     )
 
     metrics = {
@@ -1527,6 +1533,10 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
 
     action, trigger, metrics = detect_extreme_m5_signal(df)
     if action == "HOLD":
+        return
+    if EXTREME_DIRECTION_MODE == "BUY_ONLY" and action == "SELL":
+        return
+    if EXTREME_DIRECTION_MODE == "SELL_ONLY" and action == "BUY":
         return
 
     # Optional repeated-entry spacing. This prevents duplicate signals from
@@ -1733,6 +1743,13 @@ async def evaluate_strategy_cycle(
     else:
         strategy_mode = "RANGE"
         proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
+
+    # A-only distinctive filter: require stronger 5M trend confirmation than
+    # the shared RANGE_MODE_ADX_MAX gate B still uses. Does not reclassify
+    # into RANGE mode -- just holds A on borderline-strength trend entries.
+    if strategy == CONTROL_STRATEGY and strategy_mode == "TREND" and adx_5m < CONTROL_TREND_ADX_MIN:
+        logging.info(f"[{strategy}] [STRICT REGIME FILTER] Holding: adx_5m={adx_5m:.1f} below {CONTROL_TREND_ADX_MIN}")
+        proposed_action = "HOLD"
 
     # A/B one-direction controller.
     # Default is BUY_ONLY: the old dynamic 1H one-direction system is OFF.
@@ -2225,7 +2242,7 @@ async def ab_comparison():
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 async def _handle_telegram_webhook(request: Request, bot_role: str):
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, ONE_DIRECTION_MODE
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, ONE_DIRECTION_MODE, EXTREME_DIRECTION_MODE
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -2237,7 +2254,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both"}
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/c_both", "/c_buyonly", "/c_sellonly"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -2255,6 +2272,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/stats` - Extreme M5 performance\n"
                         "• `/pips` - Detailed pips/earnings report (TP1/TP2/SL breakdown)\n"
                         "• `/last` - Last Extreme M5 signals\n"
+                        "• `/c_both` - Allow both BUY and SELL (default)\n"
+                        "• `/c_buyonly` - Restrict to BUY only\n"
+                        "• `/c_sellonly` - Restrict to SELL only\n"
                         "• `/help` - Display this menu\n\n"
                         "🟣 Strategy: *Extreme M5 Impulse/Pullback/Re-entry*\n"
                         "⚠️ PAPER ONLY — Strategy C uses MT5-fed market data when available."
@@ -2262,8 +2282,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 elif bot_role == "experimental":
                     reply = (
                         "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
-                        "• `/stats` - A/B performance dashboard\n"
-                        "• `/compare` - EMA 5/9 vs EMA 5/15 comparison\n"
+                        "• `/stats` - Detailed B performance dashboard (TP1/TP2/SL breakdown, $, efficiency)\n"
+                        "• `/compare` - A vs B vs C summary comparison\n"
                         "• `/status` - Read-only system status\n"
                         "• `/last` - Last 10 experimental trades\n"
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
@@ -2361,7 +2381,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day"
                     )
                 else:
-                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\nThe server is running, but MT5 has not sent any pings since the last reboot."
+                    reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_reply(reply)
 
             elif bot_role == "control" and raw_text == "/pause":
@@ -2379,6 +2399,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     "⚡ *EXTREME M5 STRATEGY C STATUS*\n\n"
                     f"Engine: *EMA9/EMA21 + Session VWAP + ATR*\n"
                     f"Data source: *{mt5_src}*\n"
+                    f"Direction mode: *{EXTREME_DIRECTION_MODE}*\n"
                     f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n"
                     f"Execution: *{BREAKOUT_EXECUTION_MODE}*\n"
                     f"MT5 feed cache: *{'FRESH' if _mt5_cache_fresh() else 'NOT FRESH'}*"
@@ -2468,6 +2489,18 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"⚠️ Error querying breakout pips: {e}")
 
+            elif bot_role == "breakout" and raw_text == "/c_both":
+                EXTREME_DIRECTION_MODE = "BOTH"
+                await send_reply("⚡ Strategy C direction mode: *BOTH* -- BUY and SELL signals both active.")
+
+            elif bot_role == "breakout" and raw_text == "/c_buyonly":
+                EXTREME_DIRECTION_MODE = "BUY_ONLY"
+                await send_reply("⚡ Strategy C direction mode: *BUY_ONLY* -- SELL signals are now blocked.")
+
+            elif bot_role == "breakout" and raw_text == "/c_sellonly":
+                EXTREME_DIRECTION_MODE = "SELL_ONLY"
+                await send_reply("⚡ Strategy C direction mode: *SELL_ONLY* -- BUY signals are now blocked.")
+
             elif bot_role == "control" and raw_text == "/stats":
                 try:
                     conn = get_db_connection()
@@ -2527,7 +2560,66 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
 
-            elif (bot_role == "experimental" and raw_text in ("/stats", "/compare")):
+            elif bot_role == "experimental" and raw_text == "/stats":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
+                    total_executed = cur.fetchone()["total"] or 0
+                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
+                    total_vetoes = cur.fetchone()["vetoes"] or 0
+                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
+                    total_pending = cur.fetchone()["pending"] or 0
+                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%%' OR outcome LIKE 'CLOSED%%')", (EXPERIMENTAL_STRATEGY,))
+                    tp1_wins = cur.fetchone()["tp1_wins"] or 0
+                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%%'", (EXPERIMENTAL_STRATEGY,))
+                    tp2_wins = cur.fetchone()["tp2_wins"] or 0
+                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (EXPERIMENTAL_STRATEGY,))
+                    losses = cur.fetchone()["losses"] or 0
+
+                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
+                    closed_trades = cur.fetchall()
+                    total_pips = win_pips = loss_pips = 0.0
+                    total_wins_count = tp1_wins + tp2_wins
+
+                    for t in closed_trades:
+                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
+                        total_pips += trade_pips
+                        if trade_pips > 0: win_pips += trade_pips
+                        elif trade_pips < 0: loss_pips += abs(trade_pips)
+
+                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
+                    est_dollar = total_pips * 0.10
+                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
+                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
+                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
+                    cur.close(); conn.close()
+
+                    reply = (
+                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD (LIVE)*\n"
+                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
+                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
+                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
+                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
+                        f"\u2022 Total Executed: *{total_executed}*\n"
+                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
+                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
+                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
+                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
+                        f"\u2022 Active Pending: *{total_pending}*\n\n"
+                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
+                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
+                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
+                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
+                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
+                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
+                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
+                    )
+                    await send_reply(reply)
+                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
+
+            elif bot_role == "experimental" and raw_text == "/compare":
                 try:
                     conn = get_db_connection(); cur = conn.cursor()
                     cur.execute("""

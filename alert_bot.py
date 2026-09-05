@@ -136,7 +136,8 @@ BREAKOUT_EXECUTION_MODE = "PAPER"
 # /oneway_on  -> DYNAMIC (1H EMA200 decides which side is allowed)
 # /oneway_off -> BUY_ONLY
 # /both       -> BOTH (no one-direction gate)
-ONE_DIRECTION_MODE = "BUY_ONLY"
+CONTROL_DIRECTION_MODE = "BUY_ONLY"       # A's own switch -- independent of B
+EXPERIMENTAL_DIRECTION_MODE = "BUY_ONLY"  # B's own switch -- independent of A
 ONE_DIRECTION_MODES = {"BUY_ONLY", "DYNAMIC", "BOTH"}
 
 # Optional real-MT5 market-data ingress for Strategy C.
@@ -213,16 +214,18 @@ ACTIVE_SESSION_END_HOUR = 24
 # Aug 22 16:45-17:25 WIB on a dead weekend feed (price frozen at ~4608.27,
 # moving <0.01 across 40 minutes) -- the AI reviewer correctly vetoed all
 # three, but the scanner should never have evaluated them in the first
-# place. In WIB (UTC+7), NY's Sun 17:00 EST reopen lands at ~05:00 WIB
-# MONDAY -- so the whole calendar Saturday AND Sunday are closed in WIB,
-# not just Saturday.
+# place. In WIB (UTC+7), NY's Fri 17:00 EST close lands at ~04:00 WIB
+# SATURDAY, and NY's Sun 17:00 EST reopen lands at ~05:00 WIB MONDAY --
+# so the market is actually open the first few hours of WIB Saturday
+# before the real close, and all of Sunday is closed.
+FOREX_SATURDAY_CLOSE_HOUR_WIB = 4  # approx NY Friday 17:00 EST close, in WIB
 FOREX_MONDAY_OPEN_HOUR_WIB = 5   # approx NY Sunday 17:00 EST reopen, in WIB
 
 
 def is_forex_market_open(now_wib: datetime) -> bool:
     weekday = now_wib.weekday()  # Monday=0 ... Sunday=6
-    if weekday == 5:  # Saturday: closed all day in WIB
-        return False
+    if weekday == 5 and now_wib.hour >= FOREX_SATURDAY_CLOSE_HOUR_WIB:
+        return False  # Saturday, after the Friday session has actually closed
     if weekday == 6:  # Sunday: closed all day in WIB (reopen lands on Monday)
         return False
     if weekday == 0 and now_wib.hour < FOREX_MONDAY_OPEN_HOUR_WIB:
@@ -1751,15 +1754,16 @@ async def evaluate_strategy_cycle(
         logging.info(f"[{strategy}] [STRICT REGIME FILTER] Holding: adx_5m={adx_5m:.1f} below {CONTROL_TREND_ADX_MIN}")
         proposed_action = "HOLD"
 
-    # A/B one-direction controller.
+    # A/B one-direction controller -- now fully independent per strategy.
     # Default is BUY_ONLY: the old dynamic 1H one-direction system is OFF.
     # /oneway_on switches back to DYNAMIC; /oneway_off returns to BUY_ONLY.
     # /both disables the one-direction restriction entirely.
     if strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY):
-        if ONE_DIRECTION_MODE == "BUY_ONLY" and proposed_action == "SELL":
+        active_direction_mode = CONTROL_DIRECTION_MODE if strategy == CONTROL_STRATEGY else EXPERIMENTAL_DIRECTION_MODE
+        if active_direction_mode == "BUY_ONLY" and proposed_action == "SELL":
             logging.info(f"[{strategy}] [BUY-ONLY] SELL blocked.")
             proposed_action = "HOLD"
-        elif ONE_DIRECTION_MODE == "DYNAMIC":
+        elif active_direction_mode == "DYNAMIC":
             if proposed_action == "SELL" and directional_bias == "BULLISH":
                 logging.info(f"[{strategy}] [DYNAMIC 1H BLOCK] SELL blocked -- 1H bias BULLISH.")
                 proposed_action = "HOLD"
@@ -1992,11 +1996,11 @@ async def background_scanning_loop():
                 trend_15m, trend_15m_sep = compute_ema_trend(cached_15m["df"]) if cached_15m["df"] is not None else ("NEUTRAL", 0.0)
                 adx_15m_true = float(cached_15m["df"]["adx"].iloc[-1]) if cached_15m["df"] is not None and not pd.isna(cached_15m["df"]["adx"].iloc[-1]) else 0.0
 
-                # 1H data is fetched ONLY when the dynamic one-direction mode
-                # is enabled. BUY_ONLY/BOTH therefore spend zero Twelve Data
-                # credits on the old directional system.
+                # 1H data is fetched ONLY when at least one of A/B's dynamic
+                # one-direction modes is enabled. If both are BUY_ONLY/BOTH,
+                # zero Twelve Data credits are spent on the old directional system.
                 directional_bias, bias_sep = "NEUTRAL", 0.0
-                if ONE_DIRECTION_MODE == "DYNAMIC":
+                if CONTROL_DIRECTION_MODE == "DYNAMIC" or EXPERIMENTAL_DIRECTION_MODE == "DYNAMIC":
                     need_1h_refresh = (
                         cached_1h["df"] is None or cached_1h["fetched_at"] is None or
                         (datetime.now(timezone.utc) - cached_1h["fetched_at"] >= timedelta(minutes=ONE_H_REFRESH_MINUTES))
@@ -2242,7 +2246,7 @@ async def ab_comparison():
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 async def _handle_telegram_webhook(request: Request, bot_role: str):
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, ONE_DIRECTION_MODE, EXTREME_DIRECTION_MODE
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -2312,21 +2316,29 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                 await send_reply(reply)
 
-            elif raw_text in ("/oneway_on", "/oneway_off", "/both"):
+            elif raw_text in ("/oneway_on", "/oneway_off", "/both") and bot_role in ("control", "experimental"):
                 if raw_text == "/oneway_on":
-                    ONE_DIRECTION_MODE = "DYNAMIC"
+                    new_mode = "DYNAMIC"
                     mode_text = "DYNAMIC — 1H EMA200 decides allowed direction"
                 elif raw_text == "/oneway_off":
-                    ONE_DIRECTION_MODE = "BUY_ONLY"
+                    new_mode = "BUY_ONLY"
                     mode_text = "BUY_ONLY — dynamic 1H one-direction system OFF"
                 else:
-                    ONE_DIRECTION_MODE = "BOTH"
+                    new_mode = "BOTH"
                     mode_text = "BOTH — BUY and SELL allowed; one-direction restriction OFF"
+
+                if bot_role == "control":
+                    CONTROL_DIRECTION_MODE = new_mode
+                    label = "Strategy A (Control) only"
+                else:
+                    EXPERIMENTAL_DIRECTION_MODE = new_mode
+                    label = "Strategy B (Experimental) only"
+
                 await send_reply(
-                    f"🎛️ *A/B DIRECTION MODE UPDATED*\n\n"
-                    f"Mode: *{ONE_DIRECTION_MODE}*\n"
+                    f"🎛️ *DIRECTION MODE UPDATED*\n\n"
+                    f"Mode: *{new_mode}*\n"
                     f"{mode_text}\n\n"
-                    f"Applies to *Strategy A + B*. Strategy C keeps its own extreme-frequency engine."
+                    f"Applies to *{label}* — A and B now have independent direction switches."
                 )
 
             elif raw_text == "/status":
@@ -2350,12 +2362,13 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     bias_val, bias_sep_val = compute_1h_directional_bias(cached_1h["df"])
                     ranging_now, ranging_sep_val = compute_ranging_regime(cached_1h["df"])
                     bias_icon = {"BULLISH": "\U0001f7e2\U0001f4c8", "BEARISH": "\U0001f534\U0001f4c9", "NEUTRAL": "\u26aa"}.get(bias_val, "\u26aa")
-                    if ONE_DIRECTION_MODE == "BUY_ONLY":
+                    active_direction_mode = CONTROL_DIRECTION_MODE if bot_role == "control" else EXPERIMENTAL_DIRECTION_MODE
+                    if active_direction_mode == "BUY_ONLY":
                         bias_note = "Dynamic 1H system OFF — SELL blocked; BUY only"
-                    elif ONE_DIRECTION_MODE == "DYNAMIC":
+                    elif active_direction_mode == "DYNAMIC":
                         bias_note = {
-                            "BULLISH": "SELL blocked on A/B this cycle",
-                            "BEARISH": "BUY blocked on A/B this cycle",
+                            "BULLISH": "SELL blocked this cycle",
+                            "BEARISH": "BUY blocked this cycle",
                             "NEUTRAL": "Neither direction blocked",
                         }.get(bias_val, "")
                     else:
@@ -2375,7 +2388,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']} | 1H: {_twelve_data_calls_by_tf['1h']}\n\n"
                          f"⚡ *C DATA SOURCE:* {'MT5 EA (fresh)' if _mt5_cache_fresh() else 'Twelve Data M5 fallback'}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
-                        f"\u2022 A/B Direction Mode: *{ONE_DIRECTION_MODE}*\n"
+                        f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
                         f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
                         f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day"

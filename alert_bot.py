@@ -873,7 +873,9 @@ def get_macro_status_line() -> str:
     return f"🌐 Macro (gold): *{_macro_cache['label']}* ({_macro_cache['score']:+d}/3) -- see /macro for detail"
 
 
-
+def compute_ema_trend(df: pd.DataFrame):
+    """15M EMA9/20 confluence read, used only as a report/label -- range mode
+    now gates on 15M ADX instead (see RANGE_MODE_MAX_15M_ADX)."""
     # FIXED: was reading df["ema_fast"]/df["ema_slow"] -- the same 5/9 pair used
     # for 5M execution -- which made the "15M confluence filter" flip almost as
     # fast as the signal it was supposed to be filtering. Now reads the dedicated,

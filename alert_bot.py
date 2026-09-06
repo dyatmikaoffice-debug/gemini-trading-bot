@@ -734,7 +734,146 @@ def calculate_metrics_tf(df: pd.DataFrame):
     return df
 
 
-def compute_ema_trend(df: pd.DataFrame):
+# =============================================================================
+# MACRO CONTEXT MODULE
+# Read-only, informational only -- does NOT gate or filter any A/B/C signal.
+# Shared across all three bots via /macro and appended to each bot's /status.
+#
+# Three public, traceable inputs (no insider/secret-network framing -- this
+# is literally what macro/gold traders watch):
+#   1. Real yields (US 10Y TIPS, FRED series DFII10). Falling real yields =
+#      bullish for non-yielding gold; rising = bearish. This is usually the
+#      single strongest fundamental driver of gold.
+#   2. Dollar strength, via a EUR/USD proxy (EUR is ~57% of the real ICE
+#      Dollar Index by weight, so its inverse is a reasonable single-pair
+#      stand-in -- NOT the real DXY). Gold is priced in USD, so USD
+#      strength (EUR/USD falling) is mechanically bearish for gold in other
+#      currencies' terms; USD weakness is bullish.
+#   3. Speculative positioning, via CFTC's weekly Commitment of Traders
+#      report for COMEX gold. Rising non-commercial (large speculator) net
+#      length = bullish confirmation; falling = bearish. NOTE: at historic
+#      extremes this flips to a contrarian crowding signal in practice --
+#      not implemented here, flagged as a known simplification.
+#
+# Each fetch is independently wrapped so one dead source degrades to "N/A"
+# rather than breaking the whole feature. Refreshed at most once per WIB day
+# (all three sources update daily or slower anyway).
+# =============================================================================
+
+FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
+CFTC_APP_TOKEN = os.getenv("CFTC_APP_TOKEN", "").strip()  # optional, raises Socrata rate limit if set
+
+_macro_cache = {
+    "date": None, "score": 0, "label": "NEUTRAL",
+    "components": [], "text": "Macro context not yet refreshed today."
+}
+
+
+async def _fetch_real_yield_signal(client: httpx.AsyncClient):
+    if not FRED_API_KEY:
+        return {"name": "Real Yields (10Y TIPS)", "direction": 0, "detail": "FRED_API_KEY not set -- skipped"}
+    try:
+        url = (f"https://api.stlouisfed.org/fred/series/observations?series_id=DFII10"
+               f"&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=10")
+        res = await client.get(url, timeout=15)
+        data = res.json()
+        obs = [o for o in data.get("observations", []) if o.get("value") not in (None, ".")]
+        if len(obs) < 6:
+            return {"name": "Real Yields (10Y TIPS)", "direction": 0, "detail": "Insufficient FRED data"}
+        latest = float(obs[0]["value"])
+        prior = float(obs[5]["value"])  # ~5 business days back
+        change = latest - prior
+        direction = -1 if change > 0.02 else (1 if change < -0.02 else 0)
+        arrow = "falling" if direction == 1 else ("rising" if direction == -1 else "flat")
+        return {
+            "name": "Real Yields (10Y TIPS)", "direction": direction,
+            "detail": f"{latest:.2f}% ({arrow}, {change:+.2f} pts / ~5 sessions) -- {'bullish' if direction == 1 else ('bearish' if direction == -1 else 'neutral')} for gold"
+        }
+    except Exception as e:
+        return {"name": "Real Yields (10Y TIPS)", "direction": 0, "detail": f"Fetch failed: {e}"}
+
+
+async def _fetch_dollar_proxy_signal(client: httpx.AsyncClient):
+    try:
+        url = f"https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=1day&outputsize=6&apikey={TWELVE_DATA_API_KEY}"
+        res = await client.get(url, timeout=15)
+        note_twelve_data_call("1day")
+        data = res.json()
+        if "values" not in data or len(data["values"]) < 6:
+            return {"name": "Dollar Strength (EUR/USD proxy)", "direction": 0, "detail": "Insufficient Twelve Data"}
+        closes = [float(v["close"]) for v in data["values"]]
+        latest, prior = closes[0], closes[-1]
+        pct_change = (latest - prior) / prior * 100
+        direction = 1 if pct_change > 0.15 else (-1 if pct_change < -0.15 else 0)
+        usd_move = "weakening" if direction == 1 else ("strengthening" if direction == -1 else "flat")
+        return {
+            "name": "Dollar Strength (EUR/USD proxy)", "direction": direction,
+            "detail": f"EUR/USD {pct_change:+.2f}% / 5 sessions -- USD {usd_move}, {'bullish' if direction == 1 else ('bearish' if direction == -1 else 'neutral')} for gold. NOTE: proxy only, not the real DXY."
+        }
+    except Exception as e:
+        return {"name": "Dollar Strength (EUR/USD proxy)", "direction": 0, "detail": f"Fetch failed: {e}"}
+
+
+async def _fetch_cot_positioning_signal(client: httpx.AsyncClient):
+    try:
+        url = ("https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+               "?$where=market_and_exchange_names like '%25GOLD - COMMODITY EXCHANGE%25'"
+               "&$order=report_date_as_yyyy_mm_dd DESC&$limit=2")
+        headers = {"X-App-Token": CFTC_APP_TOKEN} if CFTC_APP_TOKEN else {}
+        res = await client.get(url, headers=headers, timeout=15)
+        rows = res.json()
+        if not isinstance(rows, list) or len(rows) < 2:
+            return {"name": "Speculative Positioning (CFTC COT)", "direction": 0, "detail": "Insufficient CFTC data"}
+        def net_long(row):
+            return float(row.get("noncomm_positions_long_all", 0)) - float(row.get("noncomm_positions_short_all", 0))
+        latest_net, prior_net = net_long(rows[0]), net_long(rows[1])
+        change = latest_net - prior_net
+        direction = 1 if change > 0 else (-1 if change < 0 else 0)
+        report_date = rows[0].get("report_date_as_yyyy_mm_dd", "")[:10]
+        return {
+            "name": "Speculative Positioning (CFTC COT)", "direction": direction,
+            "detail": f"Net large-spec longs {change:+,.0f} contracts vs prior week (as of {report_date}) -- "
+                      f"{'bullish confirmation' if direction == 1 else ('bearish' if direction == -1 else 'flat')}. "
+                      f"NOTE: at multi-year-extreme crowding this can flip contrarian -- not modeled here."
+        }
+    except Exception as e:
+        return {"name": "Speculative Positioning (CFTC COT)", "direction": 0, "detail": f"Fetch failed: {e}"}
+
+
+async def refresh_macro_context(client: httpx.AsyncClient, now_wib: datetime):
+    """Refreshes at most once per WIB day. Never raises -- worst case leaves
+    yesterday's cached text in place with its own date still visible."""
+    global _macro_cache
+    today = now_wib.date()
+    if _macro_cache["date"] == today:
+        return
+    try:
+        yields, dollar, cot = await asyncio.gather(
+            _fetch_real_yield_signal(client),
+            _fetch_dollar_proxy_signal(client),
+            _fetch_cot_positioning_signal(client),
+        )
+        components = [yields, dollar, cot]
+        score = sum(c["direction"] for c in components)
+        label = {3: "STRONG BULLISH", 2: "BULLISH", 1: "BULLISH", 0: "NEUTRAL",
+                  -1: "BEARISH", -2: "BEARISH", -3: "STRONG BEARISH"}[score]
+        lines = [f"🌐 *MACRO CONTEXT FOR GOLD* (score {score:+d}/3 -> *{label}*)"]
+        lines.append("Informational only -- does not filter or gate any A/B/C signal.\n")
+        for c in components:
+            arrow = "🟢" if c["direction"] == 1 else ("🔴" if c["direction"] == -1 else "⚪")
+            lines.append(f"{arrow} *{c['name']}*\n   {c['detail']}")
+        text = "\n".join(lines)
+        _macro_cache = {"date": today, "score": score, "label": label, "components": components, "text": text}
+    except Exception as e:
+        logging.warning(f"[MACRO CONTEXT] Refresh failed, keeping stale cache: {e}")
+
+
+def get_macro_status_line() -> str:
+    """Short one-liner for embedding inside /status -- full detail lives in /macro."""
+    return f"🌐 Macro (gold): *{_macro_cache['label']}* ({_macro_cache['score']:+d}/3) -- see /macro for detail"
+
+
+
     # FIXED: was reading df["ema_fast"]/df["ema_slow"] -- the same 5/9 pair used
     # for 5M execution -- which made the "15M confluence filter" flip almost as
     # fast as the signal it was supposed to be filtering. Now reads the dedicated,
@@ -1309,22 +1448,24 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 EXTREME_EMA_FAST = 9
 EXTREME_EMA_SLOW = 21
 EXTREME_ATR_PERIOD = 14
-EXTREME_IMPULSE_MIN_BODY_ATR = 0.38  # was 0.30 -- forward test showed Impulse Breakout net -$0.29/trade at 0.30
-EXTREME_PULLBACK_MAX_DISTANCE_ATR = 0.35  # unchanged -- only trigger with positive edge (+$0.92/trade)
-EXTREME_REENTRY_BODY_MULTIPLIER = 1.10  # was implicit 0.75x impulse -- Momentum Re-entry was the weakest filter AND worst performer (-$0.84/trade)
+EXTREME_IMPULSE_ENABLED = False  # Impulse Breakout retired -- see detect_extreme_m5_signal comment
+EXTREME_IMPULSE_MIN_BODY_ATR = 0.38
+EXTREME_PULLBACK_MAX_DISTANCE_ATR = 0.35  # only trigger that ever showed positive edge, still unproven long-term
+EXTREME_REENTRY_BODY_MULTIPLIER = 1.10
+EXTREME_DAILY_LOSS_LIMIT_R = -6.0  # circuit breaker: stop new C signals for the rest of the WIB day past this
+EXTREME_MAX_TRADES_PER_DAY = 40    # reinstated after unlimited proved to just scale a negative-edge day (Sep 4: 66 trades, -$247)
 EXTREME_BREAKOUT_LOOKBACK = 6
 EXTREME_MIN_RANGE_ATR = 0.20
 EXTREME_MAX_SPREAD_ATR = 0.25
 EXTREME_SL_ATR = 0.70
 EXTREME_TP1_R = 0.70
-EXTREME_TP2_R = 1.20
+EXTREME_TP2_R = 1.80  # widened from 1.20 -- realized R:R was only ~0.76:1, needing >56% WR to break even at ~50% actual WR
 EXTREME_MAX_HOLD_CANDLES = 6
 EXTREME_MIN_REENTRY_DISTANCE_ATR = 0.20
 EXTREME_COOLDOWN_SECONDS = 10
 EXTREME_REQUIRE_VWAP_ALIGNMENT = True
 EXTREME_DIRECTION_MODE = "BOTH"  # BOTH | BUY_ONLY | SELL_ONLY -- toggle via /c_both, /c_buyonly, /c_sellonly on Bot C
 EXTREME_DIRECTION_MODES = {"BOTH", "BUY_ONLY", "SELL_ONLY"}
-EXTREME_MAX_TRADES_PER_DAY = None  # None = unlimited (was 50)
 EXTREME_MAX_TRADES_PER_DAY_LABEL = "Unlimited" if EXTREME_MAX_TRADES_PER_DAY is None else str(EXTREME_MAX_TRADES_PER_DAY)
 EXTREME_SESSION_START_HOUR = 0     # No time gate: runs all day (was 7)
 EXTREME_SESSION_END_HOUR = 24      # No time gate: runs all day (was 23)
@@ -1421,11 +1562,19 @@ def detect_extreme_m5_signal(df_5m: pd.DataFrame):
     prior_high = float(d["high"].iloc[-EXTREME_BREAKOUT_LOOKBACK-1:-1].max())
     prior_low = float(d["low"].iloc[-EXTREME_BREAKOUT_LOOKBACK-1:-1].min())
 
+    # Impulse Breakout retired (EXTREME_IMPULSE_ENABLED = False): worst
+    # performer in both forward-test rounds -- -$17.78 before tightening,
+    # -$126.47 AFTER tightening its body threshold. Two different settings
+    # both lost money; this is not a threshold problem, the pattern itself
+    # doesn't have edge in this exit structure. Kept dormant (not deleted)
+    # in case a differently-designed variant is worth testing later.
     bullish_impulse = (
+        EXTREME_IMPULSE_ENABLED and
         long_regime and close > prior_high and close > op and
         body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR
     )
     bearish_impulse = (
+        EXTREME_IMPULSE_ENABLED and
         short_regime and close < prior_low and close < op and
         body_atr >= EXTREME_IMPULSE_MIN_BODY_ATR
     )
@@ -1527,6 +1676,28 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
 
     if EXTREME_MAX_TRADES_PER_DAY is not None and _extreme_state["trades_today"] >= EXTREME_MAX_TRADES_PER_DAY:
         return
+
+    # Daily-loss circuit breaker. Sep 4 forward test lost -$247 across 66
+    # trades spread over nearly every hour of the day with nothing to stop
+    # it once the day turned bad. This checks today's realized R before
+    # allowing a new signal and halts C for the rest of the WIB day if the
+    # loss limit is breached -- it does not touch any already-open trade.
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(SUM(result_r), 0) AS daily_r FROM signals "
+                "WHERE strategy = %s AND outcome_timestamp LIKE %s",
+                (BREAKOUT_STRATEGY, now_wib.strftime("%Y-%m-%d") + "%")
+            )
+            daily_r = float(cur.fetchone()["daily_r"] or 0.0)
+            cur.close(); conn.close()
+            if daily_r <= EXTREME_DAILY_LOSS_LIMIT_R:
+                logging.info(f"[EXTREME C] [DAILY LOSS BREAKER] Halted for today: daily_r={daily_r:.2f}R <= {EXTREME_DAILY_LOSS_LIMIT_R}R")
+                return
+        except Exception as e:
+            logging.warning(f"[EXTREME C] [DAILY LOSS BREAKER] Check failed, continuing without it: {e}")
 
     # Prefer the EA-fed MT5 market snapshot when available.
     source = "MT5"
@@ -2256,9 +2427,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
-        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both"}
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/c_both", "/c_buyonly", "/c_sellonly"}
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/c_both", "/c_buyonly", "/c_sellonly", "/macro"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -2279,6 +2450,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/c_both` - Allow both BUY and SELL (default)\n"
                         "• `/c_buyonly` - Restrict to BUY only\n"
                         "• `/c_sellonly` - Restrict to SELL only\n"
+                        "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this menu\n\n"
                         "🟣 Strategy: *Extreme M5 Impulse/Pullback/Re-entry*\n"
                         "⚠️ PAPER ONLY — Strategy C uses MT5-fed market data when available."
@@ -2293,6 +2465,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
                          "• `/oneway_off` - Dynamic direction OFF → BUY ONLY\n"
                          "• `/both` - Allow BUY + SELL\n"
+                        "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
                         "🔴 Strategy: *EMA 5/15 — LIVE (real MT5 trades)*\n"
                         "🚨 This bot IS connected to live MT5 execution. Use /pause on the Control bot for the emergency kill switch.\n"
@@ -2310,6 +2483,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
                          "• `/oneway_off` - Dynamic direction OFF → BUY ONLY\n"
                          "• `/both` - Allow BUY + SELL\n"
+                        "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
                         f"🟡 Strategy: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} — PAPER ONLY* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
                         f"\u2139\ufe0f Live MT5 execution is currently on the *Experimental* bot (EMA 5/15), not this one.\n"
@@ -2391,11 +2565,18 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
                         f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
-                        f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day"
+                        f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n\n"
+                        f"{get_macro_status_line()}"
                     )
                 else:
                     reply = "\U0001f534 *MT5 DISCONNECTED*\n\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\nThe server is running, but MT5 has not sent any pings since the last reboot."
                 await send_reply(reply)
+
+            elif raw_text == "/macro":
+                now_wib_macro = datetime.now(timezone.utc) + timedelta(hours=7)
+                async with httpx.AsyncClient() as macro_client:
+                    await refresh_macro_context(macro_client, now_wib_macro)
+                await send_reply(_macro_cache["text"])
 
             elif bot_role == "control" and raw_text == "/pause":
                 SYSTEM_TRADING_ENABLED = False
@@ -2406,16 +2587,35 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 await send_reply("\U0001f7e2 *AUTO-TRADING SYSTEM RESUMED*\nScanner loop is now active.")
 
             elif bot_role == "breakout" and raw_text == "/status":
-                _extreme_roll_day(datetime.now(timezone.utc) + timedelta(hours=7))
+                now_wib_c = datetime.now(timezone.utc) + timedelta(hours=7)
+                _extreme_roll_day(now_wib_c)
                 mt5_src = "MT5 EA" if _mt5_cache_fresh() else "Twelve Data fallback"
+                daily_r_today = 0.0
+                breaker_tripped = False
+                if DATABASE_URL:
+                    try:
+                        conn = get_db_connection(); cur = conn.cursor()
+                        cur.execute(
+                            "SELECT COALESCE(SUM(result_r), 0) AS daily_r FROM signals WHERE strategy = %s AND outcome_timestamp LIKE %s",
+                            (BREAKOUT_STRATEGY, now_wib_c.strftime("%Y-%m-%d") + "%")
+                        )
+                        daily_r_today = float(cur.fetchone()["daily_r"] or 0.0)
+                        cur.close(); conn.close()
+                        breaker_tripped = daily_r_today <= EXTREME_DAILY_LOSS_LIMIT_R
+                    except Exception:
+                        pass
+                breaker_label = "\U0001f534 TRIPPED -- no new signals until tomorrow" if breaker_tripped else "\U0001f7e2 OK"
                 reply = (
                     "⚡ *EXTREME M5 STRATEGY C STATUS*\n\n"
                     f"Engine: *EMA9/EMA21 + Session VWAP + ATR*\n"
                     f"Data source: *{mt5_src}*\n"
                     f"Direction mode: *{EXTREME_DIRECTION_MODE}*\n"
                     f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n"
+                    f"Today's R: *{daily_r_today:+.2f}R* (breaker at {EXTREME_DAILY_LOSS_LIMIT_R}R)\n"
+                    f"Daily loss breaker: *{breaker_label}*\n"
                     f"Execution: *{BREAKOUT_EXECUTION_MODE}*\n"
-                    f"MT5 feed cache: *{'FRESH' if _mt5_cache_fresh() else 'NOT FRESH'}*"
+                    f"MT5 feed cache: *{'FRESH' if _mt5_cache_fresh() else 'NOT FRESH'}*\n\n"
+                    f"{get_macro_status_line()}"
                 )
                 await send_reply(reply)
 

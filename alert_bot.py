@@ -2565,7 +2565,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          f"⚡ *C DATA SOURCE:* {'MT5 EA (fresh)' if _mt5_cache_fresh() else 'Twelve Data M5 fallback'}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
                         f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
-                        f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
+                        f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
                         f"\u2022 Strategy C: *EXTREME M5 EMA9/21 + VWAP + ATR* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n\n"
                         f"{get_macro_status_line()}"

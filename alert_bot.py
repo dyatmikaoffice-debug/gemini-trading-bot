@@ -140,6 +140,25 @@ CONTROL_DIRECTION_MODE = "BUY_ONLY"       # A's own switch -- independent of B
 EXPERIMENTAL_DIRECTION_MODE = "BUY_ONLY"  # B's own switch -- independent of A
 ONE_DIRECTION_MODES = {"BUY_ONLY", "DYNAMIC", "BOTH"}
 
+# --- STRATEGY A REPLACEMENT: RANGE BRACKET BREAKOUT (5M) ---
+# CONTROL_5_9's EMA logic is retired. This is a straddle/OCO-style breakout
+# system built from a consolidation range on the 5M chart: a virtual
+# buy-stop sits above range high and a virtual sell-stop below range low;
+# whichever side actually breaks with a confirmed candle CLOSE (not a wick)
+# is taken, and the other side is treated as auto-cancelled for that range.
+# Stays PAPER-only (CONTROL_EXECUTION_MODE above is unchanged).
+BRACKET_LOOKBACK_BARS = 30          # ~2.5h of 5M bars used to define the range
+BRACKET_MIN_RANGE_ATR = 1.0         # range must be at least this many ATRs wide -- skip noise-tight ranges
+BRACKET_MAX_RANGE_ATR = 6.0         # range wider than this isn't a real consolidation anymore (likely a drift)
+BRACKET_BREAKOUT_BUFFER_ATR = 0.15  # close must clear the level by this much -- filters marginal pokes
+BRACKET_SL_BUFFER_ATR = 0.25        # stop sits just back inside the broken level, not across the whole range
+BRACKET_MIN_RISK_ATR = 0.5          # floor on stop distance so spread/noise can't produce an unrealistically tight stop
+BRACKET_TP1_RANGE_MULT = 0.5        # TP1 = 0.5x the range height, projected from the breakout (measured-move target)
+BRACKET_TP2_RANGE_MULT = 1.0        # TP2 = 1.0x the range height, projected from the breakout
+BRACKET_STOCH_PERIOD = 14
+BRACKET_STOCH_OVERBOUGHT = 95       # skip a BUY breakout if stoch is already this extreme -- likely exhausted, not fresh
+BRACKET_STOCH_OVERSOLD = 5          # skip a SELL breakout if stoch is already this extreme
+
 # Optional real-MT5 market-data ingress for Strategy C.
 # The MT5 EA can POST fresh M5 bars/ticks to /mt5-market-data. C prefers this cache.
 MT5_DATA_SECRET = os.getenv("MT5_DATA_SECRET", "").strip()
@@ -1026,6 +1045,98 @@ def compute_ranging_regime(df_1h: pd.DataFrame):
 
 
 TOUCH_MIN_BODY_ATR_MULT = 0.15  # FIXED: touch signals previously had zero quality filter
+
+def _compute_stochastic_k(df: pd.DataFrame, period: int = BRACKET_STOCH_PERIOD) -> float:
+    """Plain %K stochastic over `period` bars. Returns 50.0 (neutral) if there
+    isn't enough history yet -- callers treat that as "no opinion", not a veto."""
+    if df is None or len(df) < period:
+        return 50.0
+    window = df.iloc[-period:]
+    hi = float(window["high"].max())
+    lo = float(window["low"].min())
+    if hi - lo <= 0:
+        return 50.0
+    close = float(df["close"].iloc[-1])
+    return max(0.0, min(100.0, (close - lo) / (hi - lo) * 100.0))
+
+
+def detect_bracket_breakout_signal(df_5m: pd.DataFrame):
+    """STRATEGY A: Range Bracket Breakout (OCO-style), 5M chart.
+
+    Defines a consolidation range from the BRACKET_LOOKBACK_BARS candles
+    before the current one (same "prior N candles, not including current"
+    pattern used by detect_range_reversal), then treats the range edges as
+    a virtual buy-stop / sell-stop pair. A signal only fires when:
+      1. The range itself is a genuine consolidation (width bounded in ATR
+         terms -- not noise-tight, not a slow drift).
+      2. The PREVIOUS candle closed back inside the range (so this is the
+         actual break bar, not something already several bars past it).
+      3. The CURRENT candle CLOSES beyond the level by at least the buffer
+         (a wick poke through the line does not count -- this is the main
+         defense against M1/M5 false breakouts).
+      4. The breakout candle's own body agrees with the direction (bullish
+         body for a BUY break, bearish body for a SELL break).
+    Only one side can ever qualify on a given candle, which is the OCO
+    property: whichever level actually gets taken out cancels the other.
+    A soft stochastic filter (not a hard structural gate) skips breakouts
+    that are already at an extreme reading, since those are more likely to
+    be the tail end of a move than a fresh one.
+    """
+    if len(df_5m) < BRACKET_LOOKBACK_BARS + 2:
+        return "HOLD", "Insufficient data for bracket range", None, None
+
+    raw_atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
+    if raw_atr is None or pd.isna(raw_atr) or float(raw_atr) <= 0:
+        return "HOLD", "ATR unavailable", None, None
+    atr_5m = float(raw_atr)
+
+    bracket = df_5m.iloc[-(BRACKET_LOOKBACK_BARS + 1):-1]
+    range_high = float(bracket["high"].max())
+    range_low = float(bracket["low"].min())
+    width = range_high - range_low
+
+    if width < BRACKET_MIN_RANGE_ATR * atr_5m:
+        return "HOLD", "Bracket range too tight -- inside normal noise/spread", range_high, range_low
+    if width > BRACKET_MAX_RANGE_ATR * atr_5m:
+        return "HOLD", "Bracket range too wide -- likely a drift, not consolidation", range_high, range_low
+
+    prev = df_5m.iloc[-2]
+    curr = df_5m.iloc[-1]
+    prev_close = float(prev["close"])
+    curr_open = float(curr["open"])
+    curr_close = float(curr["close"])
+
+    # Require the break to be fresh: the bar right before this one must
+    # still have closed inside the range (with a little slack for the
+    # buffer itself), otherwise we're catching a move several bars late.
+    prev_was_inside = (range_low - BRACKET_BREAKOUT_BUFFER_ATR * atr_5m) <= prev_close <= (range_high + BRACKET_BREAKOUT_BUFFER_ATR * atr_5m)
+    if not prev_was_inside:
+        return "HOLD", "No fresh break -- previous candle already outside range", range_high, range_low
+
+    buy_trigger = range_high + BRACKET_BREAKOUT_BUFFER_ATR * atr_5m
+    sell_trigger = range_low - BRACKET_BREAKOUT_BUFFER_ATR * atr_5m
+
+    bullish_break = curr_close > buy_trigger and curr_close > curr_open
+    bearish_break = curr_close < sell_trigger and curr_close < curr_open
+
+    if bullish_break and bearish_break:
+        # Shouldn't happen given the trigger math, but stay OCO-safe if it ever does.
+        return "HOLD", "Ambiguous break -- both sides tagged", range_high, range_low
+
+    stoch_k = _compute_stochastic_k(df_5m)
+
+    if bullish_break:
+        if stoch_k >= BRACKET_STOCH_OVERBOUGHT:
+            return "HOLD", f"Buy-stop hit but Stoch {stoch_k:.0f} already extreme -- skipping", range_high, range_low
+        return "BUY", "Bracket Breakout (Buy-Stop, close-confirmed)", range_high, range_low
+
+    if bearish_break:
+        if stoch_k <= BRACKET_STOCH_OVERSOLD:
+            return "HOLD", f"Sell-stop hit but Stoch {stoch_k:.0f} already extreme -- skipping", range_high, range_low
+        return "SELL", "Bracket Breakout (Sell-Stop, close-confirmed)", range_high, range_low
+
+    return "HOLD", "Price still inside bracket", range_high, range_low
+
 
 def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
@@ -2209,7 +2320,13 @@ async def evaluate_strategy_cycle(
     range_high = range_low = None
     regime_metrics = {}
 
-    if adx_5m >= RANGE_MODE_ADX_MAX:
+    if strategy == CONTROL_STRATEGY:
+        # A no longer branches on ADX at all -- the bracket detector defines
+        # its own range and only cares whether that range has just been
+        # broken with a confirmed close. TREND/RANGE ADX split below is B-only now.
+        strategy_mode = "BRACKET"
+        proposed_action, trigger_type, range_high, range_low = detect_bracket_breakout_signal(df_5m)
+    elif adx_5m >= RANGE_MODE_ADX_MAX:
         strategy_mode = "TREND"
         proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m, ema_fast, ema_slow)
     else:
@@ -2239,9 +2356,11 @@ async def evaluate_strategy_cycle(
             proposed_action, trigger_type = sr_action, sr_trigger
             range_high, range_low = sr_high, sr_low
 
-    # A-only distinctive filter: require stronger 5M trend confirmation than
-    # the shared RANGE_MODE_ADX_MAX gate B still uses. Does not reclassify
-    # into RANGE mode -- just holds A on borderline-strength trend entries.
+    # Dead for A as of the bracket-breakout replacement: CONTROL_STRATEGY now
+    # always runs strategy_mode == "BRACKET" (set above), never "TREND", so
+    # this condition can no longer be true for A. Left in place rather than
+    # deleted since CONTROL_TREND_ADX_MIN and the guard are still referenced
+    # in a few status/analytics strings elsewhere; harmless no-op.
     if strategy == CONTROL_STRATEGY and strategy_mode == "TREND" and adx_5m < CONTROL_TREND_ADX_MIN:
         logging.info(f"[{strategy}] [STRICT REGIME FILTER] Holding: adx_5m={adx_5m:.1f} below {CONTROL_TREND_ADX_MIN}")
         proposed_action = "HOLD"
@@ -2333,11 +2452,18 @@ async def evaluate_strategy_cycle(
             logging.error(f"[{strategy}] distance cooldown check: {e}")
 
     if proposed_action == "HOLD":
-        logging.info(
-            f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | EMA{ema_fast}: ${curr_ema_fast:.2f} | "
-            f"EMA{ema_slow}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | "
-            f"15mTrend: {trend_15m} | Status: HOLD"
-        )
+        if strategy_mode == "BRACKET":
+            range_str = f"Range: ${range_low:.2f}-${range_high:.2f}" if (range_high is not None and range_low is not None) else "Range: n/a"
+            logging.info(
+                f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | {range_str} | "
+                f"ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | Reason: {trigger_type} | Status: HOLD"
+            )
+        else:
+            logging.info(
+                f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | EMA{ema_fast}: ${curr_ema_fast:.2f} | "
+                f"EMA{ema_slow}: ${curr_ema_slow:.2f} | ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | "
+                f"15mTrend: {trend_15m} | Status: HOLD"
+            )
         return
 
     logging.info(f"[{strategy}] [{strategy_mode}] Triggered {proposed_action} ({trigger_type}) at ${curr_price:.2f}. Running AI...")
@@ -2395,6 +2521,36 @@ async def evaluate_strategy_cycle(
             tp1_price = curr_price - (curr_price - tp2_price) * 0.5
         tp1_r_mult = abs(tp1_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
         tp2_r_mult = abs(tp2_price - curr_price) / max(abs(curr_price - sl_price), 0.01)
+    elif strategy_mode == "BRACKET":
+        # SL sits just back inside the broken level (not across the whole
+        # range) -- a genuine confirmed-close breakout that immediately
+        # gives the level back is treated as a fast invalidation, not
+        # something to ride out. TP is a measured-move projection: the
+        # range's own height, projected forward from the breakout point --
+        # the classic range-breakout target, and it scales with whatever
+        # size range actually formed instead of a fixed ATR multiple.
+        range_width = abs(range_high - range_low) if (range_high is not None and range_low is not None) else atr_5m * 3.0
+        if proposed_action == "BUY":
+            sl_price = range_high - BRACKET_SL_BUFFER_ATR * atr_5m
+        else:
+            sl_price = range_low + BRACKET_SL_BUFFER_ATR * atr_5m
+
+        min_risk = max(BRACKET_MIN_RISK_ATR * atr_5m, 1.0)
+        risk = abs(curr_price - sl_price)
+        if risk < min_risk:
+            # Breakout candle barely cleared the level -- widen the stop to a
+            # sane floor rather than leaving it inside normal spread/noise.
+            sl_price = curr_price - min_risk if proposed_action == "BUY" else curr_price + min_risk
+            risk = min_risk
+
+        if proposed_action == "BUY":
+            tp1_price = curr_price + range_width * BRACKET_TP1_RANGE_MULT
+            tp2_price = curr_price + range_width * BRACKET_TP2_RANGE_MULT
+        else:
+            tp1_price = curr_price - range_width * BRACKET_TP1_RANGE_MULT
+            tp2_price = curr_price - range_width * BRACKET_TP2_RANGE_MULT
+        tp1_r_mult = abs(tp1_price - curr_price) / max(risk, 0.01)
+        tp2_r_mult = abs(tp2_price - curr_price) / max(risk, 0.01)
     else:
         if strategy == EXPERIMENTAL_STRATEGY:
             # Short TP1 to bank the quick leg, wide TP2 since lot 2 is
@@ -2423,7 +2579,7 @@ async def evaluate_strategy_cycle(
             trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
             strategy_mode, regime_metrics, strategy, execution_mode
         )
-        mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else "🚀 TREND"
+        mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else ("🧱 BRACKET" if strategy_mode == "BRACKET" else "🚀 TREND")
         paper_tag = " [PAPER]" if execution_mode == "PAPER" else " [LIVE]"
         msg = (
             f"{mode_tag} *{strategy}{paper_tag} SIGNAL #{new_id}*\n\n"

@@ -12,8 +12,16 @@
 # 3. Added "Aggressive Price Impulse" trigger logic to catch massive candles that 
 #    cross both EMAs before the moving averages have time to untangle.
 # 4. Made EMA column mapping dynamic so logging automatically updates if EMA speeds change.
+#
+# STRATEGY A REPLACEMENT (this revision): CONTROL_5_9's EMA engine, then its
+# range-bracket-breakout successor, are both retired. A now trades classic
+# XABCD harmonic reversal patterns (Gartley/Bat/Butterfly/Crab) built from a
+# 5M zigzag of swing pivots -- see detect_harmonic_signal() and the
+# HARMONIC_* constants. Still PAPER-only; B (EXPERIMENTAL_5_15) remains the
+# only LIVE strategy, untouched by this change.
 
 import os
+import re
 import json
 import asyncio
 import psycopg2
@@ -114,11 +122,11 @@ ONE_H_OUTPUTSIZE = 250       # need 200+ candles for the EMA itself, so pull wel
 ONE_H_BIAS_FLIP_BUFFER_PCT = 0.18
 # Separate, wider band: how close price sits to the 1H EMA200 before we
 # treat the market as "ranging near the trendline" -- shown in /status as
-# informational context only. SL sizing is NOT adjusted by this (plain
-# ATR-based risk applies to every trade, same as before the $6 cap ever
-# existed) -- the 1H bias filter above is what actually guards against a
-# losing streak on a sudden trend reversal, by blocking entries against the
-# new direction rather than resizing the stop.
+# informational context only. This threshold itself doesn't affect SL sizing;
+# the 1H bias filter above is what guards against a losing streak on a sudden
+# trend reversal, by blocking entries against the new direction rather than
+# resizing the stop. (A separate, unrelated risk cap on B's stop DISTANCE was
+# reintroduced later -- see EXPERIMENTAL_MAX_RISK_PRICE below.)
 RANGING_REGIME_PCT_THRESHOLD = 0.30
 
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
@@ -158,6 +166,46 @@ BRACKET_TP2_RANGE_MULT = 1.0        # TP2 = 1.0x the range height, projected fro
 BRACKET_STOCH_PERIOD = 14
 BRACKET_STOCH_OVERBOUGHT = 95       # skip a BUY breakout if stoch is already this extreme -- likely exhausted, not fresh
 BRACKET_STOCH_OVERSOLD = 5          # skip a SELL breakout if stoch is already this extreme
+
+# --- STRATEGY A REPLACEMENT v2: HARMONIC PATTERN (XABCD), 5M CHART ---
+# detect_bracket_breakout_signal() below is retired for CONTROL_STRATEGY (kept
+# in place, unused, same as this file's convention elsewhere). Bot A now
+# trades classic XABCD harmonic reversal patterns -- Gartley, Bat, Butterfly,
+# Crab -- built off a zigzag of 5M swing pivots. X-A-B-C are confirmed swing
+# points; D is never a confirmed pivot, it's the *live* price testing a
+# computed Potential Reversal Zone (PRZ). A signal only fires when:
+#   1. Four alternating pivots (X,A,B,C) exist with a big-enough XA leg.
+#   2. The AB/XA and BC/AB ratios fall inside a known pattern's tolerance --
+#      that pattern's PRZ for D is computed from its AD/XA Fibonacci range.
+#   3. Current price is actually inside that PRZ right now.
+#   4. The current candle shows a reversal in the completion direction (not
+#      just a wick poke through the zone).
+#   5. Stochastic confirms exhaustion (oversold for a bullish D, overbought
+#      for a bearish D) -- momentum confluence, same spirit as the stoch
+#      filter already used on the bracket breakout.
+# Stays PAPER-only (CONTROL_EXECUTION_MODE above is unchanged).
+HARMONIC_ZIGZAG_ATR_MULT = 0.8     # min swing size (in ATR) to register a new zigzag pivot -- tuned smaller
+                                    # than a typical 1.2-1.5x zigzag so more, smaller patterns qualify.
+HARMONIC_MIN_XA_ATR = 2.0          # XA leg must be at least this many ATRs -- lowered from 3.0 for more
+                                    # frequent, smaller-scale patterns; still enough to filter pure noise.
+HARMONIC_MAX_PIVOTS_TRACKED = 8    # how many recent zigzag pivots to keep around
+HARMONIC_SL_BUFFER_ATR = 0.25      # stop sits just beyond X, not a fixed distance from entry
+HARMONIC_MIN_RISK_ATR = 0.5        # floor on stop distance, same purpose as BRACKET_MIN_RISK_ATR
+HARMONIC_TP1_AD_FRACTION = 0.382   # TP1 = 38.2% of the way from D back toward A (first partial)
+HARMONIC_TP2_R_FALLBACK = 2.5      # used only if point A doesn't make sense as TP2 (e.g. already tagged)
+HARMONIC_STOCH_PERIOD = 14
+HARMONIC_STOCH_OVERSOLD_MAX = 35   # bullish D completion needs stoch at/under this
+HARMONIC_STOCH_OVERBOUGHT_MIN = 65 # bearish D completion needs stoch at/over this
+
+# Fibonacci tolerance bands per pattern: (ab_xa_range, bc_ab_range, ad_xa_range).
+# ad_xa is measured from A, i.e. D = A - ad_ratio * (A - X) -- values <1.0
+# retrace back toward X (Gartley/Bat), values >1.0 extend past X (Butterfly/Crab).
+HARMONIC_PATTERNS = {
+    "Gartley":   {"ab_xa": (0.55, 0.68), "bc_ab": (0.38, 0.90), "ad_xa": (0.75, 0.82)},
+    "Bat":       {"ab_xa": (0.35, 0.52), "bc_ab": (0.38, 0.90), "ad_xa": (0.84, 0.90)},
+    "Butterfly": {"ab_xa": (0.74, 0.82), "bc_ab": (0.38, 0.90), "ad_xa": (1.24, 1.65)},
+    "Crab":      {"ab_xa": (0.32, 0.68), "bc_ab": (0.38, 0.90), "ad_xa": (1.55, 1.70)},
+}
 
 # Optional real-MT5 market-data ingress for Strategy C.
 # The MT5 EA can POST fresh M5 bars/ticks to /mt5-market-data. C prefers this cache.
@@ -218,6 +266,22 @@ EXPERIMENTAL_EFFICIENCY_MAX = 0.35      # below this ratio = choppy enough to fa
 EXPERIMENTAL_RISK_ATR_MULT = 1.15       # was 1.0 (shared with Control A)
 EXPERIMENTAL_TP1_R = 1.2                # was 1.5 (shared)
 EXPERIMENTAL_TP2_R = 3.5                # was 2.5 (shared) -- runner leg, already risk-free at BE
+# BUG FIX (B's R-vs-$ mismatch): your MT5 EA always opens two FIXED 0.01-lot
+# positions per signal -- lot size never scales with stop distance. That
+# means the real $ risked on a loss is directly proportional to how wide the
+# ATR-based stop happened to be that trade, while result_r normalizes every
+# loss to a flat -2.0R regardless of width. Those two only agree if stop
+# width stays roughly constant. It doesn't: pulling the historical B trades,
+# sl_dist was usually 2.5-7 (median ~5, ~$10 combined risk) but spiked to
+# 15-21 during a few volatile stretches -- $30-42 lost on ONE trade, same
+# -2.0R as a routine $10 loss. That's what produced +5.11R alongside -$82 on
+# the same trade set: the R ledger was blind to the fixed-lot $ reality.
+# Capping the ATR-based risk distance directly shrinks the real stop sent to
+# MT5 on those outlier-volatility trades, so both ledgers describe the same
+# risk again. $18 combined (9.0 price-distance on a single 0.01 lot) only
+# clamps the top ~7% widest-stop trades historically -- the routine ones are
+# untouched.
+EXPERIMENTAL_MAX_RISK_PRICE = 9.0
 
 # --- EXPERIMENTAL-ONLY (Bot B): STRUCTURAL S/R BRACKET STRATEGY ---
 # Real support/resistance from swing pivots over a wider lookback, not just
@@ -1138,6 +1202,138 @@ def detect_bracket_breakout_signal(df_5m: pd.DataFrame):
     return "HOLD", "Price still inside bracket", range_high, range_low
 
 
+def find_zigzag_pivots(df_5m: pd.DataFrame, deviation_atr_mult: float = HARMONIC_ZIGZAG_ATR_MULT,
+                        max_pivots: int = HARMONIC_MAX_PIVOTS_TRACKED):
+    """ATR-deviation zigzag. Tracks the running extreme (high in an up leg,
+    low in a down leg); once price retraces from that extreme by at least
+    `deviation_atr_mult` x ATR, the extreme is locked in as a confirmed pivot
+    and the zigzag flips direction. Returns a list of (bar_index, price,
+    'H'/'L') pivots, oldest first, alternating type by construction -- the
+    live/unconfirmed price action after the last pivot is NOT included
+    (that's the D-completion zone the caller tests against)."""
+    if df_5m is None or len(df_5m) < 20 or "atr" not in df_5m.columns:
+        return []
+    raw_atr = df_5m["atr"].iloc[-1]
+    if pd.isna(raw_atr) or raw_atr <= 0:
+        return []
+    atr = float(raw_atr)
+    threshold = deviation_atr_mult * atr
+
+    highs = df_5m["high"].astype(float).values
+    lows = df_5m["low"].astype(float).values
+    closes = df_5m["close"].astype(float).values
+    n = len(df_5m)
+
+    pivots = []
+    trend = None  # None until the first leg is established, then 'up'/'down'
+    extreme_idx = 0
+    extreme_price = closes[0]
+
+    for i in range(1, n):
+        if trend is None:
+            move = closes[i] - extreme_price
+            if abs(move) >= threshold:
+                trend = "up" if move > 0 else "down"
+                extreme_idx, extreme_price = i, closes[i]
+            continue
+
+        if trend == "up":
+            if highs[i] > extreme_price:
+                extreme_price, extreme_idx = highs[i], i
+            elif extreme_price - lows[i] >= threshold:
+                pivots.append((extreme_idx, float(extreme_price), "H"))
+                trend = "down"
+                extreme_price, extreme_idx = lows[i], i
+        else:
+            if lows[i] < extreme_price:
+                extreme_price, extreme_idx = lows[i], i
+            elif highs[i] - extreme_price >= threshold:
+                pivots.append((extreme_idx, float(extreme_price), "L"))
+                trend = "up"
+                extreme_price, extreme_idx = highs[i], i
+
+    return pivots[-max_pivots:]
+
+
+def detect_harmonic_signal(df_5m: pd.DataFrame):
+    """STRATEGY A (v2): XABCD Harmonic Pattern completion, 5M chart.
+    See the HARMONIC_* constants block above for the full rationale. Returns
+    the same (action, trigger_type, level_1, level_2) shape as the other
+    detectors -- level_1 is point X (used for SL placement beyond X),
+    level_2 is point A (used as the classic TP2 projection target)."""
+    if len(df_5m) < HARMONIC_MIN_XA_ATR + 20:
+        return "HOLD", "Insufficient data for harmonic structure", None, None
+
+    raw_atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
+    if raw_atr is None or pd.isna(raw_atr) or float(raw_atr) <= 0:
+        return "HOLD", "ATR unavailable", None, None
+    atr = float(raw_atr)
+
+    pivots = find_zigzag_pivots(df_5m)
+    if len(pivots) < 4:
+        return "HOLD", "Not enough confirmed swing structure yet", None, None
+
+    (_, X, x_type), (_, A, a_type), (_, B, b_type), (_, C, c_type) = pivots[-4:]
+
+    # Zigzag construction already guarantees strict alternation, but stay
+    # defensive -- a malformed/duplicated pivot list should never fire.
+    if x_type == a_type or a_type == b_type or b_type == c_type:
+        return "HOLD", "Pivot sequence not alternating -- skipping", None, None
+
+    XA = A - X
+    AB = B - A
+    BC = C - B
+    if abs(XA) < HARMONIC_MIN_XA_ATR * atr or AB == 0:
+        return "HOLD", "XA leg too small for a valid harmonic pattern", X, A
+
+    ab_xa = abs(AB / XA)
+    bc_ab = abs(BC / AB)
+
+    candidates = []
+    for name, spec in HARMONIC_PATTERNS.items():
+        ab_lo, ab_hi = spec["ab_xa"]
+        bc_lo, bc_hi = spec["bc_ab"]
+        if not (ab_lo <= ab_xa <= ab_hi and bc_lo <= bc_ab <= bc_hi):
+            continue
+        ad_lo, ad_hi = spec["ad_xa"]
+        d1 = A - ad_lo * (A - X)
+        d2 = A - ad_hi * (A - X)
+        prz_low, prz_high = (d1, d2) if d1 <= d2 else (d2, d1)
+        candidates.append((name, prz_low, prz_high))
+
+    if not candidates:
+        return "HOLD", "No harmonic pattern ratios matched this swing", X, A
+
+    curr = df_5m.iloc[-1]
+    price = float(curr["close"])
+    in_zone = [c for c in candidates if c[1] <= price <= c[2]]
+    if not in_zone:
+        names = ", ".join(c[0] for c in candidates)
+        return "HOLD", f"Forming ({names}) -- price hasn't reached the PRZ yet", X, A
+
+    # Prefer the narrowest matching PRZ -- the most precisely-defined pattern.
+    in_zone.sort(key=lambda c: c[2] - c[1])
+    name, prz_low, prz_high = in_zone[0]
+
+    bullish_completion = (c_type == "H")  # C is a high -> D completes as a low -> BUY
+    stoch_k = _compute_stochastic_k(df_5m, HARMONIC_STOCH_PERIOD)
+
+    if bullish_completion:
+        reversal_candle = curr["close"] > curr["open"]
+        if not reversal_candle:
+            return "HOLD", f"{name} PRZ reached, waiting for a bullish reversal candle", X, A
+        if stoch_k > HARMONIC_STOCH_OVERSOLD_MAX:
+            return "HOLD", f"{name} PRZ reached but Stoch {stoch_k:.0f} not oversold yet", X, A
+        return "BUY", f"Harmonic {name} (Bullish D Completion)", X, A
+    else:
+        reversal_candle = curr["close"] < curr["open"]
+        if not reversal_candle:
+            return "HOLD", f"{name} PRZ reached, waiting for a bearish reversal candle", X, A
+        if stoch_k < HARMONIC_STOCH_OVERBOUGHT_MIN:
+            return "HOLD", f"{name} PRZ reached but Stoch {stoch_k:.0f} not overbought yet", X, A
+        return "SELL", f"Harmonic {name} (Bearish D Completion)", X, A
+
+
 def detect_ema_signal(df_5m: pd.DataFrame, trend_15m: str, ema_fast: int = EMA_TREND_FAST, ema_slow: int = EMA_TREND_SLOW):
     if len(df_5m) < 2: return "HOLD", "Insufficient data"
     
@@ -1691,6 +1887,11 @@ def bucket_extension(extension_atr) -> str:
 
 def bucket_strategy(trigger_type: str) -> str:
     t = trigger_type or ""
+    if "Harmonic" in t:
+        for pattern_name in ("Gartley", "Bat", "Butterfly", "Crab"):
+            if pattern_name in t:
+                return f"Harmonic ({pattern_name})"
+        return "Harmonic (Other)"
     if "Range Fade" in t: return "Range Fade (Consolidation)"
     if "Impulse" in t: return "Aggressive Price Impulse"
     if "Cross" in t: return "EMA Crossovers"
@@ -1724,6 +1925,50 @@ def format_performance_segment(dim_name: str, buckets: dict, min_sample_to_flag:
             elif win_rate > 65: flag = " \u2705 strong"
         lines.append(f"\u2022 {label}: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}")
     return "\n".join(lines)
+
+def format_entry_condition_segment(buckets: dict, min_sample_to_flag: int = 5) -> str:
+    """Same idea as format_performance_segment, but per entry-condition
+    category (trigger_type) and carrying pips/$ alongside R, not just R --
+    for bot C's /analyze, where 'which entry condition is actually paying
+    for itself' is the whole point of the report. buckets maps
+    category_name -> list of (r_mult, pips, usd) tuples."""
+    lines = []
+    for label, rows in sorted(buckets.items(), key=lambda item: -len(item[1])):
+        n = len(rows)
+        r_vals = [r for r, _, _ in rows]
+        pips_vals = [p for _, p, _ in rows]
+        usd_vals = [u for _, _, u in rows]
+        wins = sum(1 for r in r_vals if r > 0)
+        win_rate = (wins / n * 100) if n else 0.0
+        avg_r = (sum(r_vals) / n) if n else 0.0
+        total_pips = sum(pips_vals)
+        total_usd = sum(usd_vals)
+        flag = ""
+        if n >= min_sample_to_flag:
+            if win_rate < 35: flag = " \u26a0\ufe0f underperforming"
+            elif win_rate > 65: flag = " \u2705 strong"
+        lines.append(
+            f"\u2022 *{label}*: n={n}, WR={win_rate:.0f}%, AvgR={avg_r:+.2f}{flag}\n"
+            f"   Pips: {total_pips:+.1f} | $: {total_usd:+.2f}"
+        )
+    return "\n".join(lines)
+
+def extract_mb_data_source(regime_val: str, reasoning: str) -> str:
+    """C's signal rows logged after this fix store the real feed used for
+    that bar ('MT5' or 'TWELVE_DATA_FALLBACK') directly in the `regime`
+    column -- see evaluate_extreme_strategy. Rows logged before this fix
+    still have regime='MOTHER_BAR_MICRO' (a constant, not actually useful)
+    and only recorded the source inside the free-text `reasoning` field
+    (e.g. '...ATR=5.267, data=TWELVE_DATA_FALLBACK.') -- fall back to
+    parsing that so older trades still show up in the breakdown instead of
+    silently disappearing into 'Unknown'."""
+    if regime_val in ("MT5", "TWELVE_DATA_FALLBACK"):
+        return regime_val
+    if reasoning:
+        m = re.search(r"data=([A-Z0-9_]+)\.", reasoning)
+        if m:
+            return m.group(1)
+    return "Unknown (pre-tracking)"
 
 
 # --- TELEGRAM NOTIFICATIONS ---
@@ -2163,8 +2408,14 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             RETURNING id
         """, (
             (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            # DATA SOURCE FIX: `regime` used to just re-store the strategy
+            # name ("MOTHER_BAR_MICRO" -- identical for every row, so it was
+            # dead weight). It now holds the actual feed used for this bar
+            # ("MT5" or "TWELVE_DATA_FALLBACK") so /analyze can break
+            # performance down by data source. Still also embedded in
+            # `reasoning`'s free text as before, for readability in /last.
             action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
-            0.90, reasoning, None, "MOTHER_BAR_MICRO", BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
+            0.90, reasoning, None, source, BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
         ))
         row = cur.fetchone(); sid = int(row["id"]) if row else None
         conn.commit(); cur.close(); conn.close()
@@ -2221,6 +2472,20 @@ async def analyze_signal_with_ai(
             f"- VETO if 5M ADX >= {RANGE_MODE_ADX_MAX:.0f} (a real trend has resumed -- fading it is wrong).\n"
             f"- VETO if the entry isn't clearly near a range edge with a genuine rejection candle, not just noise.\n"
             f"- This is a mean-reversion fade, not a breakout -- do NOT expect trend-style follow-through."
+        )
+    elif strategy_mode == "HARMONIC":
+        strategy_desc = "XABCD Harmonic Pattern Completion (Gartley/Bat/Butterfly/Crab, 5M Execution)"
+        range_text = (
+            f"5. Pattern Points: X=${range_high:.2f}, A=${range_low:.2f} "
+            f"(D completing now at ${current_price:.2f}; SL sits just beyond X, TP2 targets A)"
+        ) if range_high else ""
+        veto_rules_text = (
+            "- VETO if this looks like a fresh impulsive breakout rather than an exhaustion reversal at "
+            "the pattern's completion (D) point -- harmonic trades fade momentum, they don't chase it.\n"
+            "- VETO if the reversal candle is weak/indecisive (small body, long opposing wick) given how "
+            "far price has already traveled through the XA-AB-BC-CD structure.\n"
+            "- This is a reversal trade against the CD leg -- do NOT expect trend-style follow-through "
+            "past point A; the primary target IS point A."
         )
     else:
         strategy_desc = f"EMA {ema_fast}+{ema_slow} Trend Follower (5M Execution + 15M Confluence)"
@@ -2321,11 +2586,12 @@ async def evaluate_strategy_cycle(
     regime_metrics = {}
 
     if strategy == CONTROL_STRATEGY:
-        # A no longer branches on ADX at all -- the bracket detector defines
-        # its own range and only cares whether that range has just been
-        # broken with a confirmed close. TREND/RANGE ADX split below is B-only now.
-        strategy_mode = "BRACKET"
-        proposed_action, trigger_type, range_high, range_low = detect_bracket_breakout_signal(df_5m)
+        # A no longer branches on ADX at all -- the harmonic detector defines
+        # its own XABCD structure and only cares whether price is currently
+        # inside a computed Potential Reversal Zone with a confirming candle.
+        # TREND/RANGE ADX split below is B-only now.
+        strategy_mode = "HARMONIC"
+        proposed_action, trigger_type, range_high, range_low = detect_harmonic_signal(df_5m)
     elif adx_5m >= RANGE_MODE_ADX_MAX:
         strategy_mode = "TREND"
         proposed_action, trigger_type = detect_ema_signal(df_5m, trend_15m, ema_fast, ema_slow)
@@ -2356,8 +2622,8 @@ async def evaluate_strategy_cycle(
             proposed_action, trigger_type = sr_action, sr_trigger
             range_high, range_low = sr_high, sr_low
 
-    # Dead for A as of the bracket-breakout replacement: CONTROL_STRATEGY now
-    # always runs strategy_mode == "BRACKET" (set above), never "TREND", so
+    # Dead for A as of the harmonic-pattern replacement: CONTROL_STRATEGY now
+    # always runs strategy_mode == "HARMONIC" (set above), never "TREND", so
     # this condition can no longer be true for A. Left in place rather than
     # deleted since CONTROL_TREND_ADX_MIN and the guard are still referenced
     # in a few status/analytics strings elsewhere; harmless no-op.
@@ -2458,6 +2724,12 @@ async def evaluate_strategy_cycle(
                 f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | {range_str} | "
                 f"ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | Reason: {trigger_type} | Status: HOLD"
             )
+        elif strategy_mode == "HARMONIC":
+            xa_str = f"X: ${range_high:.2f} A: ${range_low:.2f}" if (range_high is not None and range_low is not None) else "X/A: n/a"
+            logging.info(
+                f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | {xa_str} | "
+                f"ADX5m: {adx_5m:.1f} | Mode: {strategy_mode} | Reason: {trigger_type} | Status: HOLD"
+            )
         else:
             logging.info(
                 f"[{strategy}] [MARKET SCAN] Price: ${curr_price:.2f} | EMA{ema_fast}: ${curr_ema_fast:.2f} | "
@@ -2551,12 +2823,55 @@ async def evaluate_strategy_cycle(
             tp2_price = curr_price - range_width * BRACKET_TP2_RANGE_MULT
         tp1_r_mult = abs(tp1_price - curr_price) / max(risk, 0.01)
         tp2_r_mult = abs(tp2_price - curr_price) / max(risk, 0.01)
+    elif strategy_mode == "HARMONIC":
+        # SL sits just beyond point X (the pattern's structural invalidation
+        # level -- if X gets taken out, this was never really the pattern).
+        # TP1 is a partial back toward point A (first Fib retracement of the
+        # D->A leg); TP2 is point A itself, the classic harmonic profit
+        # target. Both projections fall naturally out of X/A -- no fixed
+        # ATR multiple needed, same measured-move spirit as the bracket TPs.
+        harmonic_x, harmonic_a = range_high, range_low
+        if harmonic_x is None or harmonic_a is None:
+            # Shouldn't happen once a signal fires (detect_harmonic_signal
+            # always returns X/A alongside BUY/SELL), but fall back to a
+            # plain ATR risk rather than crash if it ever does.
+            risk = max(2.5, atr_5m * 1.0)
+            sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
+            tp1_r_mult, tp2_r_mult = 1.5, 2.5
+            tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
+            tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
+        else:
+            if proposed_action == "BUY":
+                sl_price = harmonic_x - HARMONIC_SL_BUFFER_ATR * atr_5m
+            else:
+                sl_price = harmonic_x + HARMONIC_SL_BUFFER_ATR * atr_5m
+
+            min_risk = max(HARMONIC_MIN_RISK_ATR * atr_5m, 1.0)
+            risk = abs(curr_price - sl_price)
+            if risk < min_risk:
+                sl_price = curr_price - min_risk if proposed_action == "BUY" else curr_price + min_risk
+                risk = min_risk
+
+            tp1_price = curr_price + (harmonic_a - curr_price) * HARMONIC_TP1_AD_FRACTION
+            tp2_price = harmonic_a
+            # Point A can end up on the wrong side of TP1 (or of entry) if
+            # the D leg already ran unusually far -- fall back to a plain
+            # R-multiple target rather than log a nonsensical TP2.
+            wrong_side = (proposed_action == "BUY" and tp2_price <= tp1_price) or \
+                         (proposed_action == "SELL" and tp2_price >= tp1_price)
+            if wrong_side:
+                tp2_price = curr_price + risk * HARMONIC_TP2_R_FALLBACK if proposed_action == "BUY" \
+                    else curr_price - risk * HARMONIC_TP2_R_FALLBACK
+
+            tp1_r_mult = abs(tp1_price - curr_price) / max(risk, 0.01)
+            tp2_r_mult = abs(tp2_price - curr_price) / max(risk, 0.01)
     else:
         if strategy == EXPERIMENTAL_STRATEGY:
             # Short TP1 to bank the quick leg, wide TP2 since lot 2 is
             # already risk-free at breakeven past TP1, slightly wider SL
             # so ordinary noise doesn't stop it before the idea plays out.
             risk = max(2.5, atr_5m * EXPERIMENTAL_RISK_ATR_MULT)
+            risk = min(risk, EXPERIMENTAL_MAX_RISK_PRICE)  # BUG FIX: see constant's comment above
             tp1_r_mult = EXPERIMENTAL_TP1_R
             tp2_r_mult = EXPERIMENTAL_TP2_R
         else:
@@ -2566,11 +2881,13 @@ async def evaluate_strategy_cycle(
         sl_price = curr_price - risk if proposed_action == "BUY" else curr_price + risk
         tp1_price = curr_price + risk * tp1_r_mult if proposed_action == "BUY" else curr_price - risk * tp1_r_mult
         tp2_price = curr_price + risk * tp2_r_mult if proposed_action == "BUY" else curr_price - risk * tp2_r_mult
-        # No SL compression, no dollar cap, no dynamic lot sizing -- plain
-        # ATR-based risk for every trade, same as before the $6 cap was ever
-        # introduced. The 1H EMA200 bias filter above (kept) is what guards
-        # against a losing streak on a sudden trend reversal -- it blocks
-        # entries against the new direction rather than resizing the stop.
+        # SL is now capped for B (EXPERIMENTAL_MAX_RISK_PRICE) so a volatile-
+        # ATR trade can't silently risk 3-4x a normal trade's $ under the
+        # fixed 2x0.01-lot execution model. TPs are computed off the same
+        # (possibly capped) risk, so R-multiples still line up with the
+        # actual stop that gets sent to MT5. The 1H EMA200 bias filter above
+        # (kept) still guards against a losing streak on a trend reversal by
+        # blocking entries against the new direction, not by resizing stops.
 
     if ai_decision.action == proposed_action:
         new_id = log_trade_signal(
@@ -2579,7 +2896,12 @@ async def evaluate_strategy_cycle(
             trend_15m, adx_15m_true, entry_extension_atr, entry_climax_ratio,
             strategy_mode, regime_metrics, strategy, execution_mode
         )
-        mode_tag = "📊 RANGE FADE" if strategy_mode == "RANGE" else ("🧱 BRACKET" if strategy_mode == "BRACKET" else "🚀 TREND")
+        mode_tag = (
+            "📊 RANGE FADE" if strategy_mode == "RANGE" else
+            "🧱 BRACKET" if strategy_mode == "BRACKET" else
+            "🦋 HARMONIC" if strategy_mode == "HARMONIC" else
+            "🚀 TREND"
+        )
         paper_tag = " [PAPER]" if execution_mode == "PAPER" else " [LIVE]"
         msg = (
             f"{mode_tag} *{strategy}{paper_tag} SIGNAL #{new_id}*\n\n"
@@ -2960,7 +3282,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro"}
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/c_both", "/c_buyonly", "/c_sellonly", "/macro"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -2974,16 +3296,17 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 if bot_role == "breakout":
                     reply = (
                         "📦 *MOTHER BAR MICRO-BREAKOUT (C) BOT COMMANDS:*\n\n"
-                        "• `/status` - Extreme M5 status\n"
-                        "• `/stats` - Extreme M5 performance\n"
+                        "• `/status` - Mother Bar status\n"
+                        "• `/stats` - Mother Bar performance\n"
                         "• `/pips` - Detailed pips/earnings report (TP1/TP2/SL breakdown)\n"
-                        "• `/last` - Last Extreme M5 signals\n"
+                        "• `/analyze` - Entry condition category breakdown (pips/$/R per trigger type)\n"
+                        "• `/last` - Last Mother Bar signals\n"
                         "• `/c_both` - Allow both BUY and SELL (default)\n"
                         "• `/c_buyonly` - Restrict to BUY only\n"
                         "• `/c_sellonly` - Restrict to SELL only\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this menu\n\n"
-                        "🟣 Strategy: *Extreme M5 Impulse/Pullback/Re-entry*\n"
+                        "🟣 Strategy: *Mother Bar + Inside Bars (Momentum Break / Close Break / Fib Retrace)*\n"
                         "⚠️ PAPER ONLY — Strategy C uses MT5-fed market data when available."
                     )
                 elif bot_role == "experimental":
@@ -3016,7 +3339,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          "• `/both` - Allow BUY + SELL\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
-                        f"🟡 Strategy: *EMA {EMA_TREND_FAST}/{EMA_TREND_SLOW} — PAPER ONLY* | 15M confluence: *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}*\n"
+                        f"🟡 Strategy: *Harmonic Pattern (XABCD) — PAPER ONLY* | Patterns: *Gartley/Bat/Butterfly/Crab*\n"
                         f"\u2139\ufe0f Live MT5 execution is currently on the *Experimental* bot (EMA 5/15), not this one.\n"
                     )
                 await send_reply(reply)
@@ -3096,7 +3419,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          f"⚡ *C DATA SOURCE:* {'MT5 EA (fresh)' if _mt5_cache_fresh() else 'Twelve Data M5 fallback'}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
                         f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
-                        f"\u2022 A/B Execution (5M): *EMA {(EXPERIMENTAL_EMA_FAST if bot_role == 'experimental' else EMA_TREND_FAST)}/{(EXPERIMENTAL_EMA_SLOW if bot_role == 'experimental' else EMA_TREND_SLOW)}*\n"
+                        f"\u2022 A Execution (5M): *Harmonic Pattern (XABCD: Gartley/Bat/Butterfly/Crab)*\n"
+                        f"\u2022 B Execution (5M): *EMA {EXPERIMENTAL_EMA_FAST}/{EXPERIMENTAL_EMA_SLOW}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
                         f"\u2022 Strategy C: *Mother Bar Micro-Breakout (MBMB)* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n\n"
                         f"{get_macro_status_line()}"
@@ -3234,6 +3558,88 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"⚠️ Error querying breakout pips: {e}")
+
+            elif bot_role == "breakout" and raw_text == "/analyze":
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
+                               COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
+                               COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+                               COALESCE(outcome, 'PENDING') AS outcome_val, regime, reasoning
+                        FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+                    """, (BREAKOUT_STRATEGY,))
+                    rows = cur.fetchall()
+                    cur.close(); conn.close()
+
+                    if not rows:
+                        reply = (
+                            "\U0001f4d0 *MOTHER BAR C -- ENTRY CONDITION ANALYSIS*\n\n"
+                            "_Not enough closed trades yet to analyze. Check back after more signals complete._"
+                        )
+                    else:
+                        # "Entry condition category" = trigger_type as returned by
+                        # find_mother_bar_signal: "MB Momentum Break", "MB Close
+                        # Break", or "MB Fib Retrace NN%" (one bucket per level,
+                        # since a shallow vs deep retracement is a different bet).
+                        categories = {}
+                        data_sources = {}
+                        overall_r, overall_pips, overall_usd = [], [], []
+                        tp1_be_count = tp2_count = sl_count = 0
+
+                        for r in rows:
+                            r_mult = compute_r_multiple(
+                                r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
+                                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
+                            )
+                            pips, usd = compute_trade_pips({
+                                "action": r["action"], "entry_price": r["entry_p"], "sl_price": r["sl_p"],
+                                "tp1_price": r["tp1_p"], "tp2_price": r["tp2_p"], "exit_price": r["exit_price"],
+                                "outcome": r["outcome_val"]
+                            })
+                            overall_r.append(r_mult); overall_pips.append(pips); overall_usd.append(usd)
+                            cat = r["trigger_type"] or "Unknown"
+                            categories.setdefault(cat, []).append((r_mult, pips, usd))
+                            src = extract_mb_data_source(r["regime"], r["reasoning"])
+                            data_sources.setdefault(src, []).append((r_mult, pips, usd))
+
+                            ov = r["outcome_val"]
+                            if ov == "CLOSED (TP1 HIT / SL BE)": tp1_be_count += 1
+                            elif ov in ("WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"): tp2_count += 1
+                            elif "LOSS" in ov: sl_count += 1
+
+                        n_total = len(overall_r)
+                        overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
+                        overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
+                        total_pips = sum(overall_pips)
+                        total_usd = sum(overall_usd)
+
+                        reply_parts = [
+                            "\U0001f4d0 *MOTHER BAR C -- ENTRY CONDITION ANALYSIS*",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+                            f"Sample: *{n_total} closed trades*",
+                            f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
+                            f"Total Pips: *{total_pips:+.1f}* | Total $ (2x0.01 lot): *${total_usd:+.2f}*",
+                            f"TP1\u2192BE: *{tp1_be_count}* | TP2 (full runner): *{tp2_count}* | SL: *{sl_count}*",
+                            "",
+                            "\U0001f9ee *Entry Condition Category Counter:*",
+                            format_entry_condition_segment(categories),
+                            "",
+                            "\U0001f4e1 *By Data Source (MT5 live feed vs Twelve Data fallback):*",
+                            format_entry_condition_segment(data_sources),
+                            "",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+                            "\U0001f4a1 Categories need n\u22655 to be flagged \u26a0\ufe0f/\u2705 (smaller samples shown but noisy). "
+                            "\"MB Fib Retrace NN%\" buckets separately per level -- a shallow retrace and a deep one "
+                            "are different entries even off the same Mother Bar. Trades logged before this "
+                            "breakdown existed show as \"Unknown (pre-tracking)\" under Data Source.\n"
+                            "Pips/$ use the same 2x0.01-lot PAPER model as /pips."
+                        ]
+                        reply = "\n".join(reply_parts)
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"⚠️ Error: {e}")
 
             elif bot_role == "breakout" and raw_text == "/c_both":
                 EXTREME_DIRECTION_MODE = "BOTH"

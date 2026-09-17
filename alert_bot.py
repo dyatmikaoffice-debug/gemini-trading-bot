@@ -2061,7 +2061,60 @@ MB_RETRACE_TOLERANCE_ATR = 0.08
 MB_SL_BUFFER_ATR = 0.05          # small buffer placed beyond the opposite MB extreme so SL isn't sitting exactly on the level
 MB_TP1_MULT = 1.0                # TP1 = 1x the MB's own range (source method's baseline 1:1 RR rule)
 MB_TP2_MULT = 1.5                # TP2 = 1.5x the MB's own range (source method's stated alternative RR)
+# BUG FIX (trade #551, FOMC night): C's SL is "opposite MB extreme" -- risk
+# is literally the Mother Bar's own candle range, with no ceiling. During
+# the FOMC spike, three consecutive Mother Bars ballooned to 5-10x their
+# normal size (typical MB range here is ~4-15; that stretch hit 29.3, 39.7,
+# then 48.6) and, under the fixed 2x0.01-lot PAPER model, produced real
+# losses of -$41.52 / -$45.01 / -$116.32 on trades that R-multiple still
+# just called -2.0R each -- same blind spot as B's fix earlier. #551 alone
+# gave back more than half of the cumulative $ the strategy had built up
+# ($211.90 -> $95.58 in one trade). TP1/TP2 are left untouched -- a bigger
+# real range earning a bigger real target is legitimate; it's the loss side
+# that can't be allowed to scale unbounded under fixed lot size. Capping at
+# 20.0 catches exactly that FOMC cluster (and two elevated post-event
+# trades right after) while leaving the other ~84% of C's history untouched
+# (next-highest risk outside that cluster was 16.65).
+MB_MAX_RISK_PRICE = 20.0
+# COMPLEMENTARY FIX: the cap above bounds the DAMAGE if a trade fires during
+# a shock; this stops it from firing during/right after one at all. Purely
+# price-derived (no news calendar dependency) -- see
+# _mb_volatility_cooldown_active()'s docstring for the full reasoning.
+MB_VOL_SPIKE_BASELINE_PERIOD = 60   # slow ATR baseline (~5 hours on M5) -- long enough not to inflate within the first few bars of a shock, unlike the fast 14-period ATR
+MB_VOL_SPIKE_ATR_MULT = 3.0         # a single bar's true range at 3x+ the slow baseline = shock bar (FOMC print, surprise headline, flash move)
+MB_VOL_SPIKE_COOLDOWN_BARS = 6      # ~30 minutes on M5 -- sit out new MB entries for this long after the most recent shock bar
 MB_REQUIRE_TREND_ALIGNMENT = True  # soft filter: only take breaks in the direction the EMA9/21 stack already leans, to cut down false breakouts at extreme frequency
+# ADX-GATED TREND FILTER (added per your call): ranging markets are the
+# documented failure mode for every inside-bar/mother-bar breakout strategy
+# -- research consistently splits performance at ADX ~20-25 (below = skip,
+# above = the breakout has real momentum behind it), not by which direction
+# a short lagging EMA9/21 stack happens to be leaning. So:
+#   ADX <= MB_RANGING_ADX_MAX        -> ranging, HOLD regardless of direction
+#   MB_RANGING_ADX_MAX < ADX < MB_STRONG_TREND_ADX_MIN
+#                                     -> ambiguous zone, still require the
+#                                        EMA9/21 alignment as a precaution
+#   ADX >= MB_STRONG_TREND_ADX_MIN   -> strong confirmed trend; EMA9/21
+#                                        alignment is waived entirely, so a
+#                                        Mother Bar break AGAINST the local
+#                                        EMA lean is allowed -- ADX itself
+#                                        is already confirming real
+#                                        directional energy exists, which is
+#                                        the actual thing the alignment
+#                                        filter was a (lagging) proxy for.
+MB_RANGING_ADX_MAX = 20.0
+MB_STRONG_TREND_ADX_MIN = 25.0
+# SHADOW MODE (per your call): this gate has ZERO historical validation --
+# ADX was never even computed for C before this session (every historical
+# row logged adx_15m=0.0), and C's Fib-Retrace entries in particular are a
+# pullback style that the "avoid ranging markets" research was never
+# specifically tested against -- it's mostly established for breakout-style
+# continuation entries. So for now the gate does NOT block any real trade:
+# every signal fires exactly as it would with only the EMA9/21 check (the
+# pre-ADX-gate behavior). It only RECORDS what it would have decided (ADX
+# reading, zone, allow/block) into metrics/reasoning/the alert, so real
+# forward data builds up a comparison instead of guessing from literature.
+# Flip this to False once there's a few weeks of shadow data to justify it.
+MB_ADX_GATE_SHADOW_MODE = True
 
 _extreme_state = {
     "last_signal_time": None,
@@ -2103,11 +2156,26 @@ def _extreme_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
     d["tr"] = tr
     d["atr"] = tr.rolling(EXTREME_ATR_PERIOD).mean()
+    d["atr_slow"] = tr.rolling(MB_VOL_SPIKE_BASELINE_PERIOD).mean()
     d["ema9"] = d["close"].ewm(span=EXTREME_EMA_FAST, adjust=False).mean()
     d["ema21"] = d["close"].ewm(span=EXTREME_EMA_SLOW, adjust=False).mean()
     d["vwap"] = _session_vwap(d)
     d["body"] = (d["close"] - d["open"]).abs()
     d["range"] = d["high"] - d["low"]
+    # ADX (same rolling-sum DI/DX formula used for A/B's 5M ADX, period 14,
+    # so C's readings are directly comparable to A/B's on /status). Feeds
+    # the ranging-market gate in _mb_trend_aligned() below.
+    up_move = d["high"] - d["high"].shift(1)
+    down_move = d["low"].shift(1) - d["low"]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr14 = tr.rolling(14).sum()
+    plus_di = 100 * (pd.Series(plus_dm, index=d.index).rolling(14).sum() / (tr14 + 1e-10))
+    minus_di = 100 * (pd.Series(minus_dm, index=d.index).rolling(14).sum() / (tr14 + 1e-10))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
+    d["plus_di"] = plus_di
+    d["minus_di"] = minus_di
+    d["adx"] = dx.rolling(14).mean()
     return d
 
 def _extreme_roll_day(now_wib: datetime):
@@ -2119,11 +2187,58 @@ def _extreme_roll_day(now_wib: datetime):
 def _extreme_session_ok(now_wib: datetime) -> bool:
     return EXTREME_SESSION_START_HOUR <= now_wib.hour < EXTREME_SESSION_END_HOUR and is_forex_market_open(now_wib)
 
-def _mb_trend_aligned(action: str, cur) -> bool:
-    if not MB_REQUIRE_TREND_ALIGNMENT:
-        return True
+def _mb_trend_aligned(action: str, cur, metrics: dict = None) -> bool:
     ema9, ema21 = float(cur["ema9"]), float(cur["ema21"])
-    return ema9 >= ema21 if action == "BUY" else ema9 <= ema21
+    ema_aligned = ema9 >= ema21 if action == "BUY" else ema9 <= ema21
+
+    adx = float(cur["adx"]) if not pd.isna(cur["adx"]) else 0.0
+    if adx <= MB_RANGING_ADX_MAX:
+        gate_would_allow, zone = False, "ranging"
+    elif adx >= MB_STRONG_TREND_ADX_MIN:
+        gate_would_allow, zone = True, "strong"
+    else:
+        gate_would_allow = ema_aligned if MB_REQUIRE_TREND_ALIGNMENT else True
+        zone = "ambiguous"
+    if metrics is not None:
+        metrics["adx_gate_would_allow"] = gate_would_allow
+        metrics["adx_gate_zone"] = zone
+
+    if MB_ADX_GATE_SHADOW_MODE:
+        # Shadow mode: real trading still gates on plain EMA9/21 alignment
+        # only, same as before this gate existed. The tiered ADX verdict
+        # above is recorded but never blocks anything yet.
+        return ema_aligned if MB_REQUIRE_TREND_ALIGNMENT else True
+    return gate_would_allow
+
+def _mb_volatility_cooldown_active(d: pd.DataFrame, last_idx: int) -> bool:
+    """Purely price-derived 'we just had a volatility shock' cooldown -- no
+    external news calendar needed, and no dependency on a third-party feed
+    being reachable. A 'shock bar' is one whose OWN true range blew past
+    MB_VOL_SPIKE_ATR_MULT x a SLOW baseline ATR (MB_VOL_SPIKE_BASELINE_PERIOD
+    bars, ~5 hours on M5) -- deliberately a much longer window than the fast
+    14-period ATR the rest of the strategy sizes off of, so this baseline
+    doesn't itself inflate within the first few bars of the event the way
+    the fast ATR does. If any of the last MB_VOL_SPIKE_COOLDOWN_BARS bars
+    was a shock bar, new MB entries are held off entirely -- this is the
+    complementary layer to MB_MAX_RISK_PRICE: that cap bounds the damage IF
+    a trade fires during/right after a shock; this stops it from firing
+    there at all. Can't be precisely backtested against #549/550/551
+    without the raw OHLC history (only the signal log was available), so
+    the thresholds below are reasoned defaults, not curve-fit ones --
+    worth watching /analyze's data after a few real news events."""
+    if "atr_slow" not in d.columns:
+        return False
+    lookback = min(MB_VOL_SPIKE_COOLDOWN_BARS, last_idx)
+    for i in range(last_idx - lookback + 1, last_idx + 1):
+        if i < 0:
+            continue
+        baseline = d["atr_slow"].iloc[i]
+        tr_i = d["tr"].iloc[i]
+        if pd.isna(baseline) or baseline <= 0 or pd.isna(tr_i):
+            continue
+        if tr_i >= MB_VOL_SPIKE_ATR_MULT * baseline:
+            return True
+    return False
 
 def find_mother_bar_signal(d: pd.DataFrame):
     """Stateless scan of closed-bar OHLC history for an active Mother Bar
@@ -2134,6 +2249,10 @@ def find_mother_bar_signal(d: pd.DataFrame):
     if n < MB_LOOKBACK_BARS + 3:
         return "HOLD", "Insufficient history for MB scan", {}
 
+    last_idx = n - 1
+    if _mb_volatility_cooldown_active(d, last_idx):
+        return "HOLD", "Volatility-spike cooldown active (recent shock bar) -- sitting out", {}
+
     atr_arr = d["atr"].values
     high_arr = d["high"].values
     low_arr = d["low"].values
@@ -2142,7 +2261,6 @@ def find_mother_bar_signal(d: pd.DataFrame):
     body_arr = d["body"].values
     range_arr = d["range"].values
 
-    last_idx = n - 1
     search_start = max(0, last_idx - 1 - MB_LOOKBACK_BARS)
 
     # Walk backward from the bar just before the current one, looking for
@@ -2192,6 +2310,7 @@ def find_mother_bar_signal(d: pd.DataFrame):
         metrics = {
             "atr": float(atr_arr[last_idx]), "mb_high": float(mb_high), "mb_low": float(mb_low),
             "mb_range": float(mb_range), "mb_age_bars": age, "inside_bars": inside_count,
+            "adx": float(d["adx"].iloc[last_idx]) if not pd.isna(d["adx"].iloc[last_idx]) else 0.0,
         }
 
         if not broken:
@@ -2210,7 +2329,7 @@ def find_mother_bar_signal(d: pd.DataFrame):
                 action = "SELL"
             else:
                 continue  # this MB hasn't broken yet -- keep it as the active structure, nothing to do this bar
-            if not _mb_trend_aligned(action, cur):
+            if not _mb_trend_aligned(action, cur, metrics):
                 continue
             penetration_atr = (c - mb_high) / atr_now if action == "BUY" else (mb_low - c) / atr_now
             trigger = "MB Momentum Break" if penetration_atr >= MB_MOMENTUM_BREAK_ATR else "MB Close Break"
@@ -2223,7 +2342,7 @@ def find_mother_bar_signal(d: pd.DataFrame):
             if inside_count < MB_MIN_INSIDE_BARS or inside_count > MB_MAX_INSIDE_BARS:
                 continue
             cur = d.iloc[last_idx]
-            if not _mb_trend_aligned(break_action, cur):
+            if not _mb_trend_aligned(break_action, cur, metrics):
                 continue
             atr_now = float(cur["atr"])
             c = float(cur["close"])
@@ -2246,7 +2365,7 @@ def find_mother_bar_signal(d: pd.DataFrame):
             for lvl in MB_RETRACE_LEVELS:
                 zone_price = mb_high - lvl * mb_range
                 if l <= zone_price + tol and c > o and c >= zone_price - tol:
-                    if not _mb_trend_aligned("BUY", cur):
+                    if not _mb_trend_aligned("BUY", cur, metrics):
                         break
                     metrics["retrace_level"] = lvl
                     return "BUY", f"MB Fib Retrace {int(lvl*100)}%", metrics
@@ -2254,7 +2373,7 @@ def find_mother_bar_signal(d: pd.DataFrame):
             for lvl in MB_RETRACE_LEVELS:
                 zone_price = mb_low + lvl * mb_range
                 if h >= zone_price - tol and c < o and c <= zone_price + tol:
-                    if not _mb_trend_aligned("SELL", cur):
+                    if not _mb_trend_aligned("SELL", cur, metrics):
                         break
                     metrics["retrace_level"] = lvl
                     return "SELL", f"MB Fib Retrace {int(lvl*100)}%", metrics
@@ -2295,6 +2414,12 @@ def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame,
         tp1 = mb_low - MB_TP1_MULT * mb_range
         tp2 = mb_low - MB_TP2_MULT * mb_range
     risk = abs(price - sl)
+    if risk > MB_MAX_RISK_PRICE:
+        # Pull the stop in to the cap rather than accepting the MB's full
+        # (possibly news-spiked) range as risk. TP1/TP2 stay anchored to the
+        # true mb_high/mb_low -- see MB_MAX_RISK_PRICE's comment above.
+        risk = MB_MAX_RISK_PRICE
+        sl = price - risk if action == "BUY" else price + risk
     return sl, tp1, tp2, risk
 
 def _mt5_cache_fresh() -> bool:
@@ -2391,10 +2516,14 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
 
     try:
         conn = get_db_connection(); cur = conn.cursor()
+        adx_val = metrics.get('adx', 0.0)
+        gate_allow = metrics.get('adx_gate_would_allow')
+        gate_zone = metrics.get('adx_gate_zone', 'unknown')
+        gate_label = f"ADX_GATE_SHADOW={'ALLOW' if gate_allow else 'BLOCK'}_{gate_zone.upper()}" if gate_allow is not None else "ADX_GATE_SHADOW=N/A"
         reasoning = (
             f"{trigger}; MB range={metrics.get('mb_range', 0):.3f}, "
             f"inside_bars={metrics.get('inside_bars', 0)}, mb_age={metrics.get('mb_age_bars', 0)} bars, "
-            f"ATR={atr:.3f}, data={source}."
+            f"ATR={atr:.3f}, ADX={adx_val:.1f}, {gate_label}, data={source}."
         )
         cur.execute("""
             INSERT INTO signals (
@@ -2403,8 +2532,8 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
                 divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,
                 adx_15m_true,regime,strategy,execution_mode,created_at
             )
-            VALUES (%s,'EXECUTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,0,
-                    'None',%s,'PENDING','',%s,0,%s,%s,%s,NOW())
+            VALUES (%s,'EXECUTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,
+                    %s,%s,'PENDING','',%s,%s,%s,%s,%s,NOW())
             RETURNING id
         """, (
             (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
@@ -2414,8 +2543,13 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             # ("MT5" or "TWELVE_DATA_FALLBACK") so /analyze can break
             # performance down by data source. Still also embedded in
             # `reasoning`'s free text as before, for readability in /last.
+            # ADX SHADOW FIX: `adx_15m`/`adx_15m_true` used to be hardcoded 0
+            # for every C row -- now hold the real ADX reading. `divergence_type`
+            # used to be hardcoded 'None' -- now holds the ADX gate's shadow
+            # verdict (ALLOW/BLOCK + zone) so a future /analyze breakdown can
+            # compare shadow-gated vs actual outcomes without parsing `reasoning`.
             action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
-            0.90, reasoning, None, source, BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
+            0.90, adx_val, gate_label, reasoning, None, adx_val, source, BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
         ))
         row = cur.fetchone(); sid = int(row["id"]) if row else None
         conn.commit(); cur.close(); conn.close()
@@ -2433,7 +2567,9 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             f"TP1: *${tp1:.2f}* (1.0x MB range)\nTP2: *${tp2:.2f}* (1.5x MB range)\n"
             f"MB range: *{metrics.get('mb_range', 0):.3f}* | Inside bars: *{metrics.get('inside_bars', 0)}* | "
             f"MB age: *{metrics.get('mb_age_bars', 0)} bars*\n"
-            f"ATR: *{atr:.3f}*\nData source: *{source}*\n"
+            f"ATR: *{atr:.3f}* | ADX: *{metrics.get('adx', 0):.1f}* "
+            f"(gate shadow: {'✅ would allow' if gate_allow else '⛔ would block'} [{gate_zone}])\n"
+            f"Data source: *{source}*\n"
             f"Daily C signals: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n\n"
             f"⚠️ PAPER ONLY",
             BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN

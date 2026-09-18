@@ -1,10 +1,14 @@
 # A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
 # BASE: alert_bot_exhaustion_guard_v1.py
 # Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
-# EXPERIMENTAL_5_15 is currently the only MT5-live strategy; CONTROL_5_9 is PAPER only.
-# (Swapped from the original CONTROL=LIVE/EXPERIMENTAL=PAPER config -- the
-# get-latest-signal MT5 bridge follows whichever strategy has
-# execution_mode='LIVE', so this stays correct automatically if swapped again.)
+# MOTHER_BAR_MICRO (Strategy C) is now the only MT5-live strategy as of
+# 2026-09-19; CONTROL_5_9 and EXPERIMENTAL_5_15 are both PAPER only.
+# (Swapped from EXPERIMENTAL=LIVE after B's live forward-test showed a
+# real loss while C's forward-test log showed +0.38 avg R across 44 trades --
+# see the MOTHER BAR C entry-condition analysis. The get-latest-signal MT5
+# bridge follows whichever strategy has execution_mode='LIVE', so this stays
+# correct automatically if swapped again -- just flip the two
+# *_EXECUTION_MODE constants below, nothing else needs to change.)
 # 
 # CHANGES FROM V8.1:
 # 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
@@ -133,11 +137,11 @@ RANGING_REGIME_PCT_THRESHOLD = 0.30
 CONTROL_STRATEGY = "CONTROL_5_9"
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
 CONTROL_EXECUTION_MODE = "PAPER"
-EXPERIMENTAL_EXECUTION_MODE = "LIVE"
+EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # switched 2026-09-19: B moved off MT5-live (see BREAKOUT_EXECUTION_MODE)
 
 # STRATEGY C: Extreme-frequency M5 impulse/re-entry scalper
 BREAKOUT_STRATEGY = "MOTHER_BAR_MICRO"
-BREAKOUT_EXECUTION_MODE = "PAPER"
+BREAKOUT_EXECUTION_MODE = "LIVE"  # switched 2026-09-19: C is now the MT5-live strategy (was B)
 
 # A/B directional mode:
 # BUY_ONLY is the safe/default replacement for the old dynamic 1H one-direction gate.
@@ -2061,6 +2065,16 @@ MB_RETRACE_TOLERANCE_ATR = 0.08
 MB_SL_BUFFER_ATR = 0.05          # small buffer placed beyond the opposite MB extreme so SL isn't sitting exactly on the level
 MB_TP1_MULT = 1.0                # TP1 = 1x the MB's own range (source method's baseline 1:1 RR rule)
 MB_TP2_MULT = 1.5                # TP2 = 1.5x the MB's own range (source method's stated alternative RR)
+
+# Trigger-specific override (2026-09-19): both the offline backtest (5M
+# reconstruction) and the live forward-test log agree "MB Momentum Break"
+# has a fine win rate (62-73%) but its reward is too small relative to its
+# risk (avg winner roughly half the avg loser) -- a reward-sizing problem,
+# not an entry-quality problem. Widening just this trigger's targets tested
+# net positive (+$163 over 112 backtested 5M trades, WR only dropping from
+# 62.5% to 53.6%) without touching any other trigger's math.
+MB_MOMENTUM_BREAK_TP1_MULT = 1.5
+MB_MOMENTUM_BREAK_TP2_MULT = 3.0
 # BUG FIX (trade #551, FOMC night): C's SL is "opposite MB extreme" -- risk
 # is literally the Mother Bar's own candle range, with no ceiling. During
 # the FOMC spike, three consecutive Mother Bars ballooned to 5-10x their
@@ -2389,13 +2403,21 @@ def detect_extreme_m5_signal(df_5m: pd.DataFrame):
     d = _extreme_indicators(df_5m)
     return find_mother_bar_signal(d)
 
-def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame, metrics: dict):
+def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame, metrics: dict, trigger: str = ""):
     """Target/stop sizing driven by the detected Mother Bar's OWN range,
     not a fixed ATR multiple -- this is what makes target distance follow
-    the size of the actual candle structure that produced the signal."""
+    the size of the actual candle structure that produced the signal.
+
+    `trigger` lets specific entry conditions override the TP multiples --
+    see MB_MOMENTUM_BREAK_TP1_MULT/MB_MOMENTUM_BREAK_TP2_MULT above."""
     mb_high = metrics.get("mb_high")
     mb_low = metrics.get("mb_low")
     mb_range = metrics.get("mb_range")
+
+    tp1_mult, tp2_mult = MB_TP1_MULT, MB_TP2_MULT
+    if trigger == "MB Momentum Break":
+        tp1_mult, tp2_mult = MB_MOMENTUM_BREAK_TP1_MULT, MB_MOMENTUM_BREAK_TP2_MULT
+
     if mb_high is None or mb_low is None or not mb_range or mb_range <= 0:
         # Defensive fallback (should not normally trigger -- every returned
         # signal carries MB metrics) so a malformed call never crashes.
@@ -2407,12 +2429,12 @@ def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame,
     buffer = MB_SL_BUFFER_ATR * atr
     if action == "BUY":
         sl = mb_low - buffer
-        tp1 = mb_high + MB_TP1_MULT * mb_range
-        tp2 = mb_high + MB_TP2_MULT * mb_range
+        tp1 = mb_high + tp1_mult * mb_range
+        tp2 = mb_high + tp2_mult * mb_range
     else:
         sl = mb_high + buffer
-        tp1 = mb_low - MB_TP1_MULT * mb_range
-        tp2 = mb_low - MB_TP2_MULT * mb_range
+        tp1 = mb_low - tp1_mult * mb_range
+        tp2 = mb_low - tp2_mult * mb_range
     risk = abs(price - sl)
     if risk > MB_MAX_RISK_PRICE:
         # Pull the stop in to the cap rather than accepting the MB's full
@@ -2509,7 +2531,7 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     # Deterministic price-action engine -- no LLM veto, same reasoning as
     # before: an AI call per bar would become the bottleneck and defeat
     # the point of an extreme-frequency engine.
-    sl, tp1, tp2, risk = _extreme_trade_plan(action, price, atr, df, metrics)
+    sl, tp1, tp2, risk = _extreme_trade_plan(action, price, atr, df, metrics, trigger)
 
     if not DATABASE_URL:
         return
@@ -2559,19 +2581,25 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
         _extreme_state["trades_today"] += 1
 
         risk_pct_of_range = (risk / metrics.get("mb_range", risk)) if metrics.get("mb_range") else 1.0
+        mode_tag = "[PAPER]" if BREAKOUT_EXECUTION_MODE == "PAPER" else "[LIVE]"
+        mode_footer = "⚠️ PAPER ONLY" if BREAKOUT_EXECUTION_MODE == "PAPER" else "🔴 LIVE -- MT5 will execute this"
+        tp1_mult, tp2_mult = (
+            (MB_MOMENTUM_BREAK_TP1_MULT, MB_MOMENTUM_BREAK_TP2_MULT)
+            if trigger == "MB Momentum Break" else (MB_TP1_MULT, MB_TP2_MULT)
+        )
         await send_telegram_alert(
             client,
-            f"⚡ *MOTHER BAR C {BREAKOUT_STRATEGY} [PAPER] SIGNAL #{sid}*\n\n"
+            f"⚡ *MOTHER BAR C {BREAKOUT_STRATEGY} {mode_tag} SIGNAL #{sid}*\n\n"
             f"Asset: *XAU/USD*\nAction: *{action}*\nTrigger: *{trigger}*\n"
             f"Entry: *${price:.2f}*\nSL: *${sl:.2f}* (opp. MB extreme, {risk:.3f} risk)\n"
-            f"TP1: *${tp1:.2f}* (1.0x MB range)\nTP2: *${tp2:.2f}* (1.5x MB range)\n"
+            f"TP1: *${tp1:.2f}* ({tp1_mult:.1f}x MB range)\nTP2: *${tp2:.2f}* ({tp2_mult:.1f}x MB range)\n"
             f"MB range: *{metrics.get('mb_range', 0):.3f}* | Inside bars: *{metrics.get('inside_bars', 0)}* | "
             f"MB age: *{metrics.get('mb_age_bars', 0)} bars*\n"
             f"ATR: *{atr:.3f}* | ADX: *{metrics.get('adx', 0):.1f}* "
             f"(gate shadow: {'✅ would allow' if gate_allow else '⛔ would block'} [{gate_zone}])\n"
             f"Data source: *{source}*\n"
             f"Daily C signals: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n\n"
-            f"⚠️ PAPER ONLY",
+            f"{mode_footer}",
             BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN
         )
     except Exception as e:

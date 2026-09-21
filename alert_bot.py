@@ -49,7 +49,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        return "/get-latest-signal" not in record.getMessage()
+        msg = record.getMessage()
+        return "/get-latest-signal" not in msg and "/get-pending-signals" not in msg
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
@@ -2130,6 +2131,21 @@ MB_STRONG_TREND_ADX_MIN = 25.0
 # Flip this to False once there's a few weeks of shadow data to justify it.
 MB_ADX_GATE_SHADOW_MODE = True
 
+# MOMENTUM BREAK ENTRY -- DISABLED (2026-09 backtest finding): across a
+# 1,265-trade / 3-month offline backtest AND a 39-trade live paper sample,
+# "MB Momentum Break" was the one trigger that was flat-to-negative while
+# every other Mother Bar trigger (Fib Retrace 25/50/75%, Close Break) had
+# a positive edge. Re-tested by widening its TP1/TP2 multiples from
+# 1.5x/3.0x up to 4.0x/8.0x -- it never turned net positive at any width,
+# which means the problem is where this entry fires (chasing an
+# already-extended breakout), not how far its targets are set. Confirmed
+# again on the full Jan-Sep 2026 dataset (10,314 raw candidates): dropping
+# this trigger alone took the strategy from +$717 to +$1,996 over the same
+# 9 months on a $200/0.01-lot backtest, while also cutting max drawdown
+# from -87.0% to -53.1%. Set to True only after a fresh out-of-sample
+# stretch shows it's stopped being the weak link.
+MB_MOMENTUM_BREAK_ENABLED = False
+
 _extreme_state = {
     "last_signal_time": None,
     "last_entry_price": None,
@@ -2346,7 +2362,12 @@ def find_mother_bar_signal(d: pd.DataFrame):
             if not _mb_trend_aligned(action, cur, metrics):
                 continue
             penetration_atr = (c - mb_high) / atr_now if action == "BUY" else (mb_low - c) / atr_now
-            trigger = "MB Momentum Break" if penetration_atr >= MB_MOMENTUM_BREAK_ATR else "MB Close Break"
+            if penetration_atr >= MB_MOMENTUM_BREAK_ATR:
+                if not MB_MOMENTUM_BREAK_ENABLED:
+                    continue  # momentum-break entries disabled -- see MB_MOMENTUM_BREAK_ENABLED comment above
+                trigger = "MB Momentum Break"
+            else:
+                trigger = "MB Close Break"
             return action, trigger, metrics
 
         # Already broken. If the break happened on THIS bar, that's the
@@ -2361,7 +2382,12 @@ def find_mother_bar_signal(d: pd.DataFrame):
             atr_now = float(cur["atr"])
             c = float(cur["close"])
             penetration_atr = (c - mb_high) / atr_now if break_action == "BUY" else (mb_low - c) / atr_now
-            trigger = "MB Momentum Break" if penetration_atr >= MB_MOMENTUM_BREAK_ATR else "MB Close Break"
+            if penetration_atr >= MB_MOMENTUM_BREAK_ATR:
+                if not MB_MOMENTUM_BREAK_ENABLED:
+                    continue  # momentum-break entries disabled -- see MB_MOMENTUM_BREAK_ENABLED comment above
+                trigger = "MB Momentum Break"
+            else:
+                trigger = "MB Close Break"
             return break_action, trigger, metrics
 
         # Break happened earlier -- check for a Model 3 retracement entry
@@ -3387,6 +3413,59 @@ async def get_latest_signal():
     except Exception as e:
         logging.error(f"[MT5 BRIDGE ERROR] {e}")
         return {"error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
+
+
+# =====================================================================
+# MULTI-SIGNAL BRIDGE (2026-09 fix): /get-latest-signal above only ever
+# returns the single newest row ("ORDER BY id DESC LIMIT 1"), plus a
+# 12-second response cache on top of that. Strategy C can fire more than
+# one signal inside a single ~10s MT5 poll cycle (that's the whole point
+# of "extreme frequency"), and the old endpoint has no memory of what the
+# EA has already seen -- so any signal that isn't still "the latest" by
+# the time the EA polls again is silently skipped and NEVER executed.
+# This endpoint instead returns every unhandled LIVE signal since the
+# id the EA tells us it already processed, oldest first, uncached, so a
+# single poll can catch up on a whole backlog in one shot instead of
+# losing everything but the last one.
+# =====================================================================
+@app.get("/get-pending-signals")
+async def get_pending_signals(since_id: int = 0, limit: int = 20):
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
+
+    LAST_MT5_PING_TIME = datetime.now(timezone.utc) + timedelta(hours=7)
+
+    if not SYSTEM_TRADING_ENABLED:
+        return {"signals": [], "trading_enabled": False, "status": "PAUSED"}
+    if not DATABASE_URL:
+        return {"signals": [], "error": "DATABASE_URL not set", "trading_enabled": SYSTEM_TRADING_ENABLED}
+
+    limit = max(1, min(limit, 50))
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+                   COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
+            FROM signals
+            WHERE status = 'EXECUTED' AND execution_mode = 'LIVE' AND id > %s
+            ORDER BY id ASC LIMIT %s;
+        """, (since_id, limit))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        signals = [
+            {"id": int(r["id"]), "action": str(r["action"]).upper(),
+             "entry": float(r["entry_p"]), "sl": float(r["sl_p"]),
+             "tp1": float(r["tp1_p"]), "tp2": float(r["tp2_p"]),
+             "timestamp": str(r["log_time"])}
+            for r in rows
+        ]
+        return {"signals": signals, "trading_enabled": True}
+    except Exception as e:
+        logging.error(f"[MT5 BRIDGE ERROR - pending signals] {e}")
+        return {"signals": [], "error": str(e), "trading_enabled": SYSTEM_TRADING_ENABLED}
 
 
 # =====================================================================

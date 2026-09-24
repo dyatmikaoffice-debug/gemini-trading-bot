@@ -1895,6 +1895,20 @@ def bucket_adx(adx: float) -> str:
     if adx < 45: return "ADX 35-45 (Strong Trend)"
     return "ADX 45+ (Overextended)"
 
+def bucket_adx_gate_shadow(divergence_type_val: str) -> str:
+    """Buckets the ADX-gate shadow verdict logged into `divergence_type`
+    for Mother Bar signals (e.g. 'ADX_GATE_SHADOW=ALLOW_RANGING'). The gate
+    is shadow-only right now (MB_ADX_GATE_SHADOW_MODE=True) -- it never
+    actually blocks a trade -- so every signal fires regardless of the
+    verdict here. This bucket exists purely to build the comparison data
+    needed to decide whether to flip the gate live later."""
+    v = divergence_type_val or ""
+    m = re.match(r"ADX_GATE_SHADOW=(ALLOW|BLOCK)_(\w+)", v)
+    if not m:
+        return "N/A (pre-gate)"
+    decision, zone = m.group(1), m.group(2).title()
+    return f"{zone} \u2014 gate would {decision}"
+
 def bucket_extension(extension_atr) -> str:
     # Instrumentation bucket -- how far price had already moved beyond its
     # recent consolidation bracket (in ATR) at the moment a signal fired.
@@ -2187,6 +2201,7 @@ MB_CONFIG_C = {
     "tp1_mult": MB_TP1_MULT, "tp2_mult": MB_TP2_MULT,
     "momentum_tp1_mult": MB_MOMENTUM_BREAK_TP1_MULT, "momentum_tp2_mult": MB_MOMENTUM_BREAK_TP2_MULT,
     "momentum_break_enabled": MB_MOMENTUM_BREAK_ENABLED,
+    "close_break_enabled": True,                  # toggle via /c_closebreak_on, /c_closebreak_off on Bot C
     "max_risk_price": MB_MAX_RISK_PRICE,          # cap-and-shrink-stop (unchanged C behavior)
     "reject_risk_floor": None, "reject_risk_atr_mult": None,   # C does not reject on risk, only caps
     "vol_spike_baseline_period": MB_VOL_SPIKE_BASELINE_PERIOD, "vol_spike_atr_mult": MB_VOL_SPIKE_ATR_MULT,
@@ -2205,10 +2220,36 @@ MB_CONFIG_A_V2.update({
     "tp1_mult": 1.25, "tp2_mult": 8.0,
     "momentum_tp1_mult": 2.0, "momentum_tp2_mult": 15.0,
     "momentum_break_enabled": True,      # "all 5 triggers" -- re-enabled for A only, C stays disabled
+    "close_break_enabled": True,         # A always runs all 5 triggers -- independent of C's per-trigger toggles below
+    "retrace_levels": MB_RETRACE_LEVELS, # A always runs all 3 Fib levels -- independent of C's per-trigger toggles below
     "max_risk_price": None,              # A does not cap-and-shrink; it rejects instead (below)
     "reject_risk_floor": 15.0,           # reject if risk > max($15, 2.25 x ATR)
     "reject_risk_atr_mult": 2.25,
 })
+
+# --- BOT C PER-TRIGGER TOGGLES (each of C's 5 Mother Bar entry conditions
+# can be switched on/off independently via Telegram -- /c_fib25_on/off,
+# /c_fib50_on/off, /c_fib75_on/off, /c_closebreak_on/off,
+# /c_momentum_on/off). Persisted so a toggle survives restarts, same as
+# the direction-mode settings. This only ever touches MB_CONFIG_C -- A
+# always runs all 5 triggers regardless (see MB_CONFIG_A_V2 above).
+_c_trigger_state = {
+    "fib25": True, "fib50": True, "fib75": True,
+    "close_break": True, "momentum": MB_MOMENTUM_BREAK_ENABLED,
+}
+_C_FIB_LEVELS = {"fib25": 0.25, "fib50": 0.50, "fib75": 0.75}
+
+def _apply_c_trigger_state():
+    """Rebuilds MB_CONFIG_C's trigger-gating keys from _c_trigger_state.
+    Always assigns NEW tuple/bool values (never mutates a shared list/tuple
+    in place) so MB_CONFIG_A_V2 -- a separate dict that already pinned its
+    own retrace_levels/close_break_enabled/momentum_break_enabled -- is
+    never affected by a C-only toggle."""
+    MB_CONFIG_C["momentum_break_enabled"] = _c_trigger_state["momentum"]
+    MB_CONFIG_C["close_break_enabled"] = _c_trigger_state["close_break"]
+    MB_CONFIG_C["retrace_levels"] = tuple(
+        lvl for key, lvl in _C_FIB_LEVELS.items() if _c_trigger_state[key]
+    )
 
 # Free/no-payment M1 data path for Bot A: prefer bars pushed by your own MT5
 # EA (zero API cost, no rate limit -- see /mt5-market-data below); Twelve
@@ -2453,6 +2494,8 @@ def find_mother_bar_signal(d: pd.DataFrame, cfg: dict = None):
                     continue  # momentum-break entries disabled -- see cfg["momentum_break_enabled"] comment above
                 trigger = "MB Momentum Break"
             else:
+                if not cfg.get("close_break_enabled", True):
+                    continue  # close-break entries disabled -- see cfg["close_break_enabled"] comment above
                 trigger = "MB Close Break"
             return action, trigger, metrics
 
@@ -2473,6 +2516,8 @@ def find_mother_bar_signal(d: pd.DataFrame, cfg: dict = None):
                     continue  # momentum-break entries disabled -- see cfg["momentum_break_enabled"] comment above
                 trigger = "MB Momentum Break"
             else:
+                if not cfg.get("close_break_enabled", True):
+                    continue  # close-break entries disabled -- see cfg["close_break_enabled"] comment above
                 trigger = "MB Close Break"
             return break_action, trigger, metrics
 
@@ -3530,6 +3575,7 @@ async def background_scanning_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE
+    global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     init_db()
     # Restore direction-mode toggles (/oneway_on, /c_both, etc.) set before the
     # last restart -- these used to live only in memory and silently reset to
@@ -3541,6 +3587,25 @@ async def lifespan(app: FastAPI):
         f"[SETTINGS] Restored direction modes -- Control: {CONTROL_DIRECTION_MODE}, "
         f"Experimental: {EXPERIMENTAL_DIRECTION_MODE}, Extreme: {EXTREME_DIRECTION_MODE}"
     )
+    # Restore which of A/B/C is LIVE (/live_a, /live_b, /live_c) set before the
+    # last restart -- same reasoning as direction modes above. Falls back to
+    # the hardcoded defaults above (A=LIVE, B/C=PAPER) on a fresh DB, which
+    # matches the constants as written so a first deploy behaves exactly as
+    # the file says with no settings yet persisted.
+    CONTROL_EXECUTION_MODE = get_setting("control_execution_mode", CONTROL_EXECUTION_MODE)
+    EXPERIMENTAL_EXECUTION_MODE = get_setting("experimental_execution_mode", EXPERIMENTAL_EXECUTION_MODE)
+    BREAKOUT_EXECUTION_MODE = get_setting("breakout_execution_mode", BREAKOUT_EXECUTION_MODE)
+    logging.info(
+        f"[SETTINGS] Restored execution modes -- A: {CONTROL_EXECUTION_MODE}, "
+        f"B: {EXPERIMENTAL_EXECUTION_MODE}, C: {BREAKOUT_EXECUTION_MODE}"
+    )
+    # Restore Bot C's per-trigger toggles (/c_fib25_on, /c_momentum_off, etc.)
+    # set before the last restart, then rebuild MB_CONFIG_C from them. A is
+    # unaffected -- MB_CONFIG_A_V2 always runs all 5 triggers regardless.
+    for _key in _c_trigger_state:
+        _c_trigger_state[_key] = get_setting(f"c_trigger_{_key}", "on" if _c_trigger_state[_key] else "off") == "on"
+    _apply_c_trigger_state()
+    logging.info(f"[SETTINGS] Restored Bot C trigger toggles -- {_c_trigger_state}")
     if not EXPERIMENTAL_TELEGRAM_BOT_TOKEN or not EXPERIMENTAL_TELEGRAM_CHAT_ID:
         logging.warning("[A/B] Experimental Telegram credentials are not configured; experimental signals will still be logged to DB but Telegram alerts will be skipped.")
     if APP_URL:
@@ -3555,15 +3620,19 @@ async def lifespan(app: FastAPI):
                         {"command":"start","description":"Show Control bot commands"},
                         {"command":"help","description":"Show Control command menu"},
                         {"command":"status","description":"MT5/server/API status"},
-                        {"command":"stats","description":"Live Mother Bar A (M1) performance"},
+                        {"command":"stats","description":"Mother Bar A (M1) performance"},
                         {"command":"pips","description":"Pips and USD breakdown"},
-                        {"command":"logs","description":"Last 10 live trades"},
-                        {"command":"analyze","description":"Forward-test analysis"},
-                        {"command":"pause","description":"Emergency kill switch"},
+                        {"command":"logs","description":"Last 10 executed trades"},
+                        {"command":"analyze","description":"Entry condition + ADX gate analysis"},
+                        {"command":"pause","description":"Emergency kill switch (all bots)"},
                         {"command":"resume","description":"Resume auto-trading"},
                         {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
                         {"command":"oneway_off","description":"Disable dynamic mode; BUY only"},
-                        {"command":"both","description":"Allow BUY and SELL"}
+                        {"command":"both","description":"Allow BUY and SELL"},
+                        {"command":"macro","description":"Gold macro context (yields, USD, COT)"},
+                        {"command":"live_a","description":"Send A's signals to live MT5"},
+                        {"command":"live_b","description":"Send B's signals to live MT5"},
+                        {"command":"live_c","description":"Send C's signals to live MT5"}
                     ]})
                 if EXPERIMENTAL_TELEGRAM_BOT_TOKEN:
                     webhook_b = f"{APP_URL.rstrip('/')}/telegram-webhook-b"
@@ -3574,12 +3643,16 @@ async def lifespan(app: FastAPI):
                         {"command":"start","description":"Show A/B bot commands"},
                         {"command":"help","description":"Show A/B command menu"},
                         {"command":"stats","description":"A/B performance dashboard"},
-                        {"command":"compare","description":"Compare Mother Bar A (M1) vs EMA B (5M)"},
+                        {"command":"compare","description":"Compare Mother Bar A vs EMA B vs C"},
                         {"command":"status","description":"Read-only system status"},
-                        {"command":"last","description":"Last 10 paper trades"},
+                        {"command":"last","description":"Last 10 trades"},
                         {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
                         {"command":"oneway_off","description":"Disable dynamic mode; BUY only"},
-                        {"command":"both","description":"Allow BUY and SELL"}
+                        {"command":"both","description":"Allow BUY and SELL"},
+                        {"command":"macro","description":"Gold macro context (yields, USD, COT)"},
+                        {"command":"live_a","description":"Send A's signals to live MT5"},
+                        {"command":"live_b","description":"Send B's signals to live MT5"},
+                        {"command":"live_c","description":"Send C's signals to live MT5"}
                     ]})
                 if BREAKOUT_TELEGRAM_BOT_TOKEN:
                     webhook_c = f"{APP_URL.rstrip('/')}/telegram-webhook-c"
@@ -3587,13 +3660,30 @@ async def lifespan(app: FastAPI):
                     res_c = await client.post(set_c, data={"url": webhook_c})
                     logging.info(f"[BREAKOUT WEBHOOK SETUP] {res_c.text}")
                     await client.post(f"https://api.telegram.org/bot{BREAKOUT_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
-                        {"command":"start","description":"Show breakout bot commands"},
-                        {"command":"help","description":"Show extreme M5 command menu"},
-                        {"command":"status","description":"Extreme M5 status"},
-                        {"command":"stats","description":"Extreme M5 performance"},
-                        {"command":"range","description":"Current Extreme M5 setup"},
-                        {"command":"last","description":"Last Extreme M5 signals"},
-                        {"command":"cancel","description":"No active OCO"}
+                        {"command":"start","description":"Show Mother Bar C bot commands"},
+                        {"command":"help","description":"Show Mother Bar C command menu"},
+                        {"command":"status","description":"Mother Bar C status"},
+                        {"command":"stats","description":"Mother Bar C performance"},
+                        {"command":"pips","description":"Pips/earnings report (TP1/TP2/SL)"},
+                        {"command":"analyze","description":"Entry condition category breakdown"},
+                        {"command":"last","description":"Last Mother Bar signals"},
+                        {"command":"c_both","description":"Allow both BUY and SELL"},
+                        {"command":"c_buyonly","description":"Restrict C to BUY only"},
+                        {"command":"c_sellonly","description":"Restrict C to SELL only"},
+                        {"command":"c_fib25_on","description":"Enable Fib Retrace 25% entry"},
+                        {"command":"c_fib25_off","description":"Disable Fib Retrace 25% entry"},
+                        {"command":"c_fib50_on","description":"Enable Fib Retrace 50% entry"},
+                        {"command":"c_fib50_off","description":"Disable Fib Retrace 50% entry"},
+                        {"command":"c_fib75_on","description":"Enable Fib Retrace 75% entry"},
+                        {"command":"c_fib75_off","description":"Disable Fib Retrace 75% entry"},
+                        {"command":"c_closebreak_on","description":"Enable Close Break entry"},
+                        {"command":"c_closebreak_off","description":"Disable Close Break entry"},
+                        {"command":"c_momentum_on","description":"Enable Momentum Break entry"},
+                        {"command":"c_momentum_off","description":"Disable Momentum Break entry"},
+                        {"command":"macro","description":"Gold macro context (yields, USD, COT)"},
+                        {"command":"live_a","description":"Send A's signals to live MT5"},
+                        {"command":"live_b","description":"Send B's signals to live MT5"},
+                        {"command":"live_c","description":"Send C's signals to live MT5"}
                     ]})
         except Exception as e:
             logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
@@ -3803,6 +3893,7 @@ async def ab_comparison():
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 async def _handle_telegram_webhook(request: Request, bot_role: str):
     global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE
+    global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     try:
         data = await request.json()
         message = data.get("message", {})
@@ -3812,9 +3903,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
-        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro"}
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro"}
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -3825,7 +3916,20 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 await send_telegram_alert(client, text, target_chat_id=sender_chat_id, target_bot_token=active_token)
 
             if raw_text in ["/help", "/start"]:
+                live_bot_label = (
+                    "A (Mother Bar V2, M1)" if CONTROL_EXECUTION_MODE == "LIVE"
+                    else "B (EMA 5/15)" if EXPERIMENTAL_EXECUTION_MODE == "LIVE"
+                    else "C (Mother Bar Micro)" if BREAKOUT_EXECUTION_MODE == "LIVE"
+                    else "none (all PAPER)"
+                )
                 if bot_role == "breakout":
+                    trigger_status = ", ".join(
+                        f"{name}={'ON' if _c_trigger_state[key] else 'OFF'}"
+                        for key, name in (
+                            ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib75", "Fib75"),
+                            ("close_break", "CloseBreak"), ("momentum", "Momentum"),
+                        )
+                    )
                     reply = (
                         "📦 *MOTHER BAR MICRO-BREAKOUT (C) BOT COMMANDS:*\n\n"
                         "• `/status` - Mother Bar status\n"
@@ -3836,10 +3940,17 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/c_both` - Allow both BUY and SELL (default)\n"
                         "• `/c_buyonly` - Restrict to BUY only\n"
                         "• `/c_sellonly` - Restrict to SELL only\n"
+                        "• `/c_fib25_on` / `/c_fib25_off` - Toggle the Fib Retrace 25% entry\n"
+                        "• `/c_fib50_on` / `/c_fib50_off` - Toggle the Fib Retrace 50% entry\n"
+                        "• `/c_fib75_on` / `/c_fib75_off` - Toggle the Fib Retrace 75% entry\n"
+                        "• `/c_closebreak_on` / `/c_closebreak_off` - Toggle the Close Break entry\n"
+                        "• `/c_momentum_on` / `/c_momentum_off` - Toggle the Momentum Break entry\n"
+                        "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this menu\n\n"
                         "🟣 Strategy: *Mother Bar + Inside Bars (Momentum Break / Close Break / Fib Retrace)*\n"
-                        "⚠️ PAPER ONLY — Strategy C uses MT5-fed market data when available."
+                        f"🎚️ Triggers: *{trigger_status}*\n"
+                        f"{'🔴 LIVE — this bot is connected to live MT5 execution.' if BREAKOUT_EXECUTION_MODE == 'LIVE' else f'⚠️ PAPER ONLY — live MT5 execution is currently on *{live_bot_label}*.'}"
                     )
                 elif bot_role == "experimental":
                     reply = (
@@ -3851,10 +3962,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
                          "• `/oneway_off` - Dynamic direction OFF → BUY ONLY\n"
                          "• `/both` - Allow BUY + SELL\n"
+                        "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
-                        "🔴 Strategy: *EMA 5/15 — LIVE (real MT5 trades)*\n"
-                        "🚨 This bot IS connected to live MT5 execution. Use /pause on the Control bot for the emergency kill switch.\n"
+                        f"{'🔴 Strategy: *EMA 5/15 — LIVE (real MT5 trades)*' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else '⚪ Strategy: *EMA 5/15 — PAPER only*'}\n"
+                        f"{'🚨 This bot IS connected to live MT5 execution. Use /pause on the Control bot for the emergency kill switch.' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else f'ℹ️ Live MT5 execution is currently on *{live_bot_label}*, not this one.'}\n"
                     )
                 else:
                     reply = (
@@ -3864,15 +3976,16 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/pips` - Gross/net pips & USD breakdown\n"
                         "• `/logs` - Last 10 executed trades\n"
                         "• `/analyze` - Forward-test strategy analysis\n"
-                        "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live B)\n"
+                        "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live execution)\n"
                         "• `/resume` - 🟢 Re-enable auto-trading\n"
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
                          "• `/oneway_off` - Dynamic direction OFF → BUY ONLY\n"
                          "• `/both` - Allow BUY + SELL\n"
+                        "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
-                        f"🔴 Strategy: *Mother Bar V2 (M1, all 5 triggers) — LIVE (MT5)*\n"
-                        f"\u2139\ufe0f Live MT5 execution is currently on the *Experimental* bot (EMA 5/15), not this one.\n"
+                        f"{'🔴 Strategy: *Mother Bar V2 (M1, all 5 triggers) — LIVE (MT5)*' if CONTROL_EXECUTION_MODE == 'LIVE' else '⚪ Strategy: *Mother Bar V2 (M1, all 5 triggers) — PAPER only*'}\n"
+                        f"{'' if CONTROL_EXECUTION_MODE == 'LIVE' else f'ℹ️ Live MT5 execution is currently on *{live_bot_label}*, not this one.'}\n"
                     )
                 await send_reply(reply)
 
@@ -3901,6 +4014,58 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     f"Mode: *{new_mode}*\n"
                     f"{mode_text}\n\n"
                     f"Applies to *{label}* — A and B now have independent direction switches."
+                )
+
+            elif raw_text in ("/live_a", "/live_b", "/live_c"):
+                # Exactly one of A/B/C is ever LIVE at a time -- the MT5 EA's
+                # /get-latest-signal + /get-pending-signals bridge only ever
+                # serves rows with execution_mode='LIVE', so making one bot
+                # live means making the other two PAPER in the same call.
+                CONTROL_EXECUTION_MODE = "LIVE" if raw_text == "/live_a" else "PAPER"
+                EXPERIMENTAL_EXECUTION_MODE = "LIVE" if raw_text == "/live_b" else "PAPER"
+                BREAKOUT_EXECUTION_MODE = "LIVE" if raw_text == "/live_c" else "PAPER"
+                set_setting("control_execution_mode", CONTROL_EXECUTION_MODE)
+                set_setting("experimental_execution_mode", EXPERIMENTAL_EXECUTION_MODE)
+                set_setting("breakout_execution_mode", BREAKOUT_EXECUTION_MODE)
+                live_label = {"/live_a": "A (Mother Bar V2, M1)", "/live_b": "B (EMA 5/15)", "/live_c": "C (Mother Bar Micro)"}[raw_text]
+                logging.info(
+                    f"[LIVE TOGGLE] Now live: {live_label} -- "
+                    f"A={CONTROL_EXECUTION_MODE}, B={EXPERIMENTAL_EXECUTION_MODE}, C={BREAKOUT_EXECUTION_MODE}"
+                )
+                await send_reply(
+                    f"🔴 *LIVE MT5 EXECUTION SWITCHED*\n\n"
+                    f"Now live: *Strategy {live_label}*\n\n"
+                    f"• A: *{CONTROL_EXECUTION_MODE}*\n"
+                    f"• B: *{EXPERIMENTAL_EXECUTION_MODE}*\n"
+                    f"• C: *{BREAKOUT_EXECUTION_MODE}*\n\n"
+                    f"Only signals from the LIVE strategy reach the MT5 EA (/get-latest-signal, "
+                    f"/get-pending-signals). The other two keep running and logging as PAPER."
+                )
+
+            elif raw_text in (
+                "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off",
+                "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off",
+                "/c_momentum_on", "/c_momentum_off",
+            ) and bot_role == "breakout":
+                key, turn_on = {
+                    "/c_fib25_on": ("fib25", True), "/c_fib25_off": ("fib25", False),
+                    "/c_fib50_on": ("fib50", True), "/c_fib50_off": ("fib50", False),
+                    "/c_fib75_on": ("fib75", True), "/c_fib75_off": ("fib75", False),
+                    "/c_closebreak_on": ("close_break", True), "/c_closebreak_off": ("close_break", False),
+                    "/c_momentum_on": ("momentum", True), "/c_momentum_off": ("momentum", False),
+                }[raw_text]
+                _c_trigger_state[key] = turn_on
+                set_setting(f"c_trigger_{key}", "on" if turn_on else "off")
+                _apply_c_trigger_state()
+                trigger_names = {
+                    "fib25": "MB Fib Retrace 25%", "fib50": "MB Fib Retrace 50%",
+                    "fib75": "MB Fib Retrace 75%", "close_break": "MB Close Break",
+                    "momentum": "MB Momentum Break",
+                }
+                active = [trigger_names[k] for k, v in _c_trigger_state.items() if v]
+                await send_reply(
+                    f"⚡ *{trigger_names[key]}* is now *{'ON' if turn_on else 'OFF'}* for Strategy C.\n\n"
+                    f"Active triggers: {', '.join(active) if active else '_none -- C will never fire until at least one is on_'}"
                 )
 
             elif raw_text == "/status":
@@ -3954,7 +4119,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 A Execution (M1): *Mother Bar V2 -- Close/Fib TP1 1.25x/TP2 8x, Momentum TP1 2x/TP2 15x, reject risk > max($15, 2.25x ATR)*\n"
                         f"\u2022 B Execution (5M): *EMA {EXPERIMENTAL_EMA_FAST}/{EXPERIMENTAL_EMA_SLOW}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
-                        f"\u2022 Strategy C: *Mother Bar Micro-Breakout (MBMB)* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n\n"
+                        f"\u2022 Strategy C: *Mother Bar Micro-Breakout (MBMB)* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n"
+                        f"\u2022 Live MT5 Execution: *{'A' if CONTROL_EXECUTION_MODE == 'LIVE' else ('B' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else ('C' if BREAKOUT_EXECUTION_MODE == 'LIVE' else 'none'))}* (toggle with /live_a, /live_b, /live_c)\n\n"
                         f"{get_macro_status_line()}"
                     )
                 else:
@@ -3991,11 +4157,19 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         cur.close(); conn.close()
                     except Exception:
                         pass
+                trigger_status = ", ".join(
+                    f"{name}={'ON' if _c_trigger_state[key] else 'OFF'}"
+                    for key, name in (
+                        ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib75", "Fib75"),
+                        ("close_break", "CloseBreak"), ("momentum", "Momentum"),
+                    )
+                )
                 reply = (
                     "⚡ *MOTHER BAR MICRO-BREAKOUT (STRATEGY C) STATUS*\n\n"
                     f"Engine: *MB structure + inside-bar breakout, target sized off MB range*\n"
                     f"Data source: *{mt5_src}*\n"
                     f"Direction mode: *{EXTREME_DIRECTION_MODE}*\n"
+                    f"Triggers: *{trigger_status}*\n"
                     f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n"
                     f"Today's R: *{daily_r_today:+.2f}R*\n"
                     f"Daily loss breaker: *\U0001f7e2 OFF (removed)*\n"
@@ -4524,9 +4698,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         SELECT action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p,
                                COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
                                COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
-                               COALESCE(outcome, 'PENDING') AS outcome_val, adx_15m,
+                               COALESCE(outcome, 'PENDING') AS outcome_val,
                                COALESCE(timestamp, created_at::text, '') AS log_time,
-                               trend_15m, entry_extension_atr, regime
+                               regime, reasoning, divergence_type
                         FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
                     """, (CONTROL_STRATEGY,))
                     rows = cur.fetchall()
@@ -4534,50 +4708,77 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
                     if not rows:
                         reply = (
-                            "\U0001f4d0 *STRATEGY FORWARD-TEST ANALYSIS*\n\n"
+                            "\U0001f4d0 *MOTHER BAR A-V2 -- ENTRY CONDITION ANALYSIS*\n\n"
                             "_Not enough closed trades yet to analyze. Check back after more signals complete._"
                         )
                     else:
-                        segments = {"Strategy": {}, "5M ADX Regime": {}, "V10 Regime": {}, "Entry Extension": {}, "Session": {}, "15m Confluence": {}}
-                        overall_r = []
+                        # Entry condition category = trigger_type as returned by
+                        # find_mother_bar_signal: "MB Momentum Break", "MB Close
+                        # Break", or "MB Fib Retrace NN%" (one bucket per level).
+                        # Same shape as bot C's /analyze -- A runs the same MB
+                        # engine on M1 with a V2 tune (wider TPs, hard risk-reject
+                        # instead of cap-and-shrink, no daily loss breaker).
+                        categories, data_sources, gate_shadow, sessions = {}, {}, {}, {}
+                        overall_r, overall_pips, overall_usd = [], [], []
+                        tp1_be_count = tp2_count = sl_count = 0
+
                         for r in rows:
                             r_mult = compute_r_multiple(
                                 r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
                                 float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"]
                             )
-                            overall_r.append(r_mult)
-                            adx_val = float(r["adx_15m"]) if r["adx_15m"] is not None else 0.0
-                            segments["Strategy"].setdefault(bucket_strategy(r["trigger_type"]), []).append(r_mult)
-                            segments["5M ADX Regime"].setdefault(bucket_adx(adx_val), []).append(r_mult)
-                            segments["V10 Regime"].setdefault(r["regime"] or "Pre-V10 (unlabeled)", []).append(r_mult)
-                            segments["Entry Extension"].setdefault(bucket_extension(r["entry_extension_atr"]), []).append(r_mult)
-                            segments["Session"].setdefault(bucket_session(r["log_time"]), []).append(r_mult)
-                            segments["15m Confluence"].setdefault(bucket_confluence(r["action"], r["trend_15m"]), []).append(r_mult)
+                            pips, usd = compute_trade_pips({
+                                "action": r["action"], "entry_price": r["entry_p"], "sl_price": r["sl_p"],
+                                "tp1_price": r["tp1_p"], "tp2_price": r["tp2_p"], "exit_price": r["exit_price"],
+                                "outcome": r["outcome_val"]
+                            })
+                            overall_r.append(r_mult); overall_pips.append(pips); overall_usd.append(usd)
+                            cat = r["trigger_type"] or "Unknown"
+                            categories.setdefault(cat, []).append((r_mult, pips, usd))
+                            src = extract_mb_data_source(r["regime"], r["reasoning"])
+                            data_sources.setdefault(src, []).append((r_mult, pips, usd))
+                            gate_shadow.setdefault(bucket_adx_gate_shadow(r["divergence_type"]), []).append((r_mult, pips, usd))
+                            sessions.setdefault(bucket_session(r["log_time"]), []).append((r_mult, pips, usd))
+
+                            ov = r["outcome_val"]
+                            if ov == "CLOSED (TP1 HIT / SL BE)": tp1_be_count += 1
+                            elif ov in ("WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"): tp2_count += 1
+                            elif "LOSS" in ov: sl_count += 1
 
                         n_total = len(overall_r)
                         overall_wr = (sum(1 for x in overall_r if x > 0) / n_total * 100) if n_total else 0.0
                         overall_avg_r = (sum(overall_r) / n_total) if n_total else 0.0
+                        total_pips = sum(overall_pips)
+                        total_usd = sum(overall_usd)
 
                         reply_parts = [
-                            "\U0001f4d0 *EMA STRATEGY FORWARD-TEST ANALYSIS*",
+                            "\U0001f4d0 *MOTHER BAR A-V2 -- ENTRY CONDITION ANALYSIS*",
                             "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
                             f"Sample: *{n_total} closed trades*",
                             f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
+                            f"Total Pips: *{total_pips:+.1f}* | Total $ (0.01 lot): *${total_usd:+.2f}*",
+                            f"TP1\u2192BE: *{tp1_be_count}* | TP2 (full runner): *{tp2_count}* | SL/Reject-through: *{sl_count}*",
                             "",
+                            "\U0001f9ee *Entry Condition Category Counter:*",
+                            format_entry_condition_segment(categories),
+                            "",
+                            "\u2696\ufe0f *ADX Gate (shadow mode -- not yet blocking any trade):*",
+                            format_entry_condition_segment(gate_shadow),
+                            "",
+                            "\U0001f4e1 *By Data Source (MT5 M1 push vs Twelve Data 1min fallback):*",
+                            format_entry_condition_segment(data_sources),
+                            "",
+                            "\U0001f550 *By Session:*",
+                            format_entry_condition_segment(sessions),
+                            "",
+                            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+                            "\U0001f4a1 Categories need n\u22655 to be flagged \u26a0\ufe0f/\u2705 (smaller samples shown but noisy). "
+                            "\"MB Fib Retrace NN%\" buckets separately per level. The ADX Gate breakdown is pure "
+                            "instrumentation right now (MB_ADX_GATE_SHADOW_MODE=True) -- once a zone shows a clear "
+                            "edge either way with enough trades, that's the signal to flip the gate live.\n"
+                            "No daily loss breaker on A (removed 2026-09-24) and no daily trade cap -- every valid "
+                            "M1 setup fires regardless of how the day's gone."
                         ]
-                        for dim in ["Strategy", "5M ADX Regime", "V10 Regime", "Entry Extension", "Session", "15m Confluence"]:
-                            reply_parts.append(format_performance_segment(dim, segments[dim]))
-                            reply_parts.append("")
-
-                        reply_parts.append("\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015")
-                        reply_parts.append(
-                            "\U0001f4a1 Segments need n\u22658 to be flagged \u26a0\ufe0f/\u2705 (smaller samples are shown "
-                            "but noisy). Check the Strategy breakdown for \"Range Fade (Consolidation)\" vs the "
-                            "EMA buckets to see which regime is actually working.\n\n"
-                            f"\u2696\ufe0f Mode is auto-selected by 5M ADX (\u2265{RANGE_MODE_ADX_MAX:.0f} trend, "
-                            f"<{RANGE_MODE_ADX_MAX:.0f} range) -- not a veto, both regimes are live.\n"
-                            f"\u23f1\ufe0f Loss cooldown ({LOSS_COOLDOWN_MINUTES} min, any direction) is also active."
-                        )
                         reply = "\n".join(reply_parts)
                     await send_reply(reply)
                 except Exception as e:

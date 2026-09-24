@@ -135,21 +135,23 @@ ONE_H_BIAS_FLIP_BUFFER_PCT = 0.18
 RANGING_REGIME_PCT_THRESHOLD = 0.30
 
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
-CONTROL_STRATEGY = "CONTROL_5_9"
+CONTROL_STRATEGY = "CONTROL_MB_V2"  # renamed 2026-09-23: A is now Mother Bar V2 (M1), not EMA 5/9 -- new name keeps its DB rows from mixing with the old harmonic/EMA-5-9 history
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
-CONTROL_EXECUTION_MODE = "PAPER"
-EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # switched 2026-09-19: B moved off MT5-live (see BREAKOUT_EXECUTION_MODE)
+CONTROL_EXECUTION_MODE = "LIVE"  # switched 2026-09-23: A is now the sole MT5-live strategy
+EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # stays PAPER -- B's V3 patch needs more forward-test time before going live
 
 # STRATEGY C: Extreme-frequency M5 impulse/re-entry scalper
 BREAKOUT_STRATEGY = "MOTHER_BAR_MICRO"
-BREAKOUT_EXECUTION_MODE = "LIVE"  # switched 2026-09-19: C is now the MT5-live strategy (was B)
+BREAKOUT_EXECUTION_MODE = "PAPER"  # switched 2026-09-23: back to PAPER now that A holds MT5-live
 
 # A/B directional mode:
 # BUY_ONLY is the safe/default replacement for the old dynamic 1H one-direction gate.
 # /oneway_on  -> DYNAMIC (1H EMA200 decides which side is allowed)
 # /oneway_off -> BUY_ONLY
 # /both       -> BOTH (no one-direction gate)
-CONTROL_DIRECTION_MODE = "BUY_ONLY"       # A's own switch -- independent of B
+CONTROL_DIRECTION_MODE = "BUY_ONLY"       # A's own switch -- independent of B. NOTE: left at its prior default;
+                                           # your S3/V2 mother-bar backtest numbers weren't confirmed as BUY_ONLY vs BOTH,
+                                           # toggle via the existing /a-direction command if you ran them as BOTH.
 EXPERIMENTAL_DIRECTION_MODE = "BUY_ONLY"  # B's own switch -- independent of A
 ONE_DIRECTION_MODES = {"BUY_ONLY", "DYNAMIC", "BOTH"}
 
@@ -217,6 +219,7 @@ HARMONIC_PATTERNS = {
 MT5_DATA_SECRET = os.getenv("MT5_DATA_SECRET", "").strip()
 MT5_DATA_CACHE_TTL_SECONDS = 20
 mt5_market_cache = {"df": None, "updated_at": None, "source": None}
+mt5_market_cache_m1 = {"df": None, "updated_at": None, "source": None}  # Bot A's free M1 feed, pushed by the MT5 EA
 
 EMA_TREND_FAST = 5
 EMA_TREND_SLOW = 9
@@ -258,7 +261,7 @@ RANGE_MODE_MAX_15M_ADX = 25.0      # skip the fade if the 15M chart itself shows
 # path length) -- so real chop gets faded even when ADX disagrees. Control A
 # is left untouched so it still serves as the unmodified baseline.
 EXPERIMENTAL_EFFICIENCY_LOOKBACK = 12   # ~60 min on 5M
-EXPERIMENTAL_EFFICIENCY_MAX = 0.35      # below this ratio = choppy enough to fade, regardless of ADX
+EXPERIMENTAL_EFFICIENCY_MAX = 0.50  # V3: only trade materially directional 5M structure      # B trend gate: below this = too much back-and-forth
 
 # --- EXPERIMENTAL-ONLY (Bot B): TREND MODE RISK/TARGET OVERRIDE ---
 # Your MT5 EA already opens two 0.01-lot positions per signal: lot 1 closes
@@ -270,7 +273,7 @@ EXPERIMENTAL_EFFICIENCY_MAX = 0.35      # below this ratio = choppy enough to fa
 # SL is widened slightly (1.0 -> 1.15x ATR) so ordinary noise survives.
 EXPERIMENTAL_RISK_ATR_MULT = 1.15       # was 1.0 (shared with Control A)
 EXPERIMENTAL_TP1_R = 1.2                # was 1.5 (shared)
-EXPERIMENTAL_TP2_R = 3.5                # was 2.5 (shared) -- runner leg, already risk-free at BE
+EXPERIMENTAL_TP2_R = 3.0  # V3: backtest showed 3.0R captures more of the runner edge                # was 2.5 (shared) -- runner leg, already risk-free at BE
 # BUG FIX (B's R-vs-$ mismatch): your MT5 EA always opens two FIXED 0.01-lot
 # positions per signal -- lot size never scales with stop distance. That
 # means the real $ risked on a loss is directly proportional to how wide the
@@ -287,6 +290,13 @@ EXPERIMENTAL_TP2_R = 3.5                # was 2.5 (shared) -- runner leg, alread
 # clamps the top ~7% widest-stop trades historically -- the routine ones are
 # untouched.
 EXPERIMENTAL_MAX_RISK_PRICE = 9.0
+# B V2 trend-quality gates. These are intentionally separate from the shared
+# EMA trigger so A is unaffected.
+EXPERIMENTAL_MIN_ADX = 35.0  # V3: ADX 20-35 was a persistent low-quality bucket in the CSV
+EXPERIMENTAL_MIN_EMA_SPREAD_ATR = 0.60
+EXPERIMENTAL_MIN_EMA_SLOPE_ATR = 0.00
+EXPERIMENTAL_MAX_ENTRY_EXTENSION_ATR = 1.00
+EXPERIMENTAL_TOUCH_ONLY = True
 
 # --- EXPERIMENTAL-ONLY (Bot B): STRUCTURAL S/R BRACKET STRATEGY ---
 # Real support/resistance from swing pivots over a wider lookback, not just
@@ -369,7 +379,7 @@ TWELVE_DATA_SAFETY_MARGIN = 40
 
 _twelve_data_call_count = 0
 _twelve_data_budget_date = None  
-_twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0}
+_twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0, "1min": 0}
 
 
 def _reset_budget_if_new_day(now_wib: datetime):
@@ -380,7 +390,7 @@ def _reset_budget_if_new_day(now_wib: datetime):
             logging.info(f"[TWELVE DATA BUDGET] New WIB day. Resetting counter.")
         _twelve_data_budget_date = today
         _twelve_data_call_count = 0
-        _twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0}
+        _twelve_data_calls_by_tf = {"5min": 0, "15min": 0, "1h": 0, "1min": 0}
 
 
 def twelve_data_budget_ok(now_wib: datetime) -> bool:
@@ -2154,6 +2164,71 @@ _extreme_state = {
     "trade_day": None,
 }
 
+# =====================================================================
+# MOTHER BAR CONFIG OBJECTS (2026-09 A/C split)
+#
+# The detection/trade-plan functions below now take a `cfg` dict instead of
+# reading the MB_* globals directly, so the exact same engine can run twice
+# concurrently with different parameters: C keeps every current default
+# (nothing above this comment changed), A runs a separate "V2" tune on M1.
+# =====================================================================
+MB_CONFIG_C = {
+    "min_body_atr": MB_MIN_BODY_ATR, "min_range_atr": MB_MIN_RANGE_ATR, "min_range_abs": MB_MIN_RANGE_ABS,
+    "max_age_bars": MB_MAX_AGE_BARS, "min_inside_bars": MB_MIN_INSIDE_BARS, "max_inside_bars": MB_MAX_INSIDE_BARS,
+    "inside_tolerance_atr": MB_INSIDE_TOLERANCE_ATR, "break_confirm_atr": MB_BREAK_CONFIRM_ATR,
+    "momentum_break_atr": MB_MOMENTUM_BREAK_ATR, "retrace_levels": MB_RETRACE_LEVELS,
+    "retrace_tolerance_atr": MB_RETRACE_TOLERANCE_ATR, "sl_buffer_atr": MB_SL_BUFFER_ATR,
+    "tp1_mult": MB_TP1_MULT, "tp2_mult": MB_TP2_MULT,
+    "momentum_tp1_mult": MB_MOMENTUM_BREAK_TP1_MULT, "momentum_tp2_mult": MB_MOMENTUM_BREAK_TP2_MULT,
+    "momentum_break_enabled": MB_MOMENTUM_BREAK_ENABLED,
+    "max_risk_price": MB_MAX_RISK_PRICE,          # cap-and-shrink-stop (unchanged C behavior)
+    "reject_risk_floor": None, "reject_risk_atr_mult": None,   # C does not reject on risk, only caps
+    "vol_spike_baseline_period": MB_VOL_SPIKE_BASELINE_PERIOD, "vol_spike_atr_mult": MB_VOL_SPIKE_ATR_MULT,
+    "vol_spike_cooldown_bars": MB_VOL_SPIKE_COOLDOWN_BARS, "require_trend_alignment": MB_REQUIRE_TREND_ALIGNMENT,
+    "ranging_adx_max": MB_RANGING_ADX_MAX, "strong_trend_adx_min": MB_STRONG_TREND_ADX_MIN,
+    "adx_gate_shadow_mode": MB_ADX_GATE_SHADOW_MODE,
+    "atr_period": EXTREME_ATR_PERIOD, "ema_fast": EXTREME_EMA_FAST, "ema_slow": EXTREME_EMA_SLOW,
+}
+
+# Bot A "V2" Mother Bar tune, per your spec: same pattern-detection rules
+# (all 5 triggers, same MB qualification/inside-bar/retrace geometry, same
+# 0.20 ATR re-entry spacing, same -6R daily breaker) but on M1, wider TP2s,
+# and a hard risk REJECT instead of C's cap-and-shrink.
+MB_CONFIG_A_V2 = dict(MB_CONFIG_C)
+MB_CONFIG_A_V2.update({
+    "tp1_mult": 1.25, "tp2_mult": 8.0,
+    "momentum_tp1_mult": 2.0, "momentum_tp2_mult": 15.0,
+    "momentum_break_enabled": True,      # "all 5 triggers" -- re-enabled for A only, C stays disabled
+    "max_risk_price": None,              # A does not cap-and-shrink; it rejects instead (below)
+    "reject_risk_floor": 15.0,           # reject if risk > max($15, 2.25 x ATR)
+    "reject_risk_atr_mult": 2.25,
+})
+
+# Free/no-payment M1 data path for Bot A: prefer bars pushed by your own MT5
+# EA (zero API cost, no rate limit -- see /mt5-market-data below); Twelve
+# Data 1min is only a fallback, and is capped separately from the shared
+# 800/day budget so a stalled MT5 push can't starve A/B/C's core 5-minute
+# cycle of credits.
+TD_1MIN_FALLBACK_DAILY_CAP = 200
+TD_1MIN_FALLBACK_MIN_INTERVAL_SECONDS = 55
+_td_1min_fallback_state = {"date": None, "count": 0, "last_call": None}
+
+def _td_1min_fallback_ok(now_wib: datetime) -> bool:
+    today = now_wib.date()
+    if _td_1min_fallback_state["date"] != today:
+        _td_1min_fallback_state["date"] = today
+        _td_1min_fallback_state["count"] = 0
+    if _td_1min_fallback_state["count"] >= TD_1MIN_FALLBACK_DAILY_CAP:
+        return False
+    last = _td_1min_fallback_state["last_call"]
+    if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < TD_1MIN_FALLBACK_MIN_INTERVAL_SECONDS:
+        return False
+    return True
+
+def _note_td_1min_fallback_call():
+    _td_1min_fallback_state["count"] += 1
+    _td_1min_fallback_state["last_call"] = datetime.now(timezone.utc)
+
 def _typical_price(df: pd.DataFrame) -> pd.Series:
     return (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
 
@@ -2175,7 +2250,8 @@ def _session_vwap(df: pd.DataFrame) -> pd.Series:
         return pv.groupby(day).cumsum() / vol.groupby(day).cumsum().replace(0, np.nan)
     return (tp * vol).cumsum() / vol.cumsum().replace(0, np.nan)
 
-def _extreme_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def _extreme_indicators(df: pd.DataFrame, cfg: dict = None) -> pd.DataFrame:
+    cfg = cfg or MB_CONFIG_C
     d = df.copy()
     for c in ("open", "high", "low", "close"):
         d[c] = pd.to_numeric(d[c], errors="coerce")
@@ -2185,10 +2261,10 @@ def _extreme_indicators(df: pd.DataFrame) -> pd.DataFrame:
         np.maximum((d["high"] - prev_close).abs(), (d["low"] - prev_close).abs())
     )
     d["tr"] = tr
-    d["atr"] = tr.rolling(EXTREME_ATR_PERIOD).mean()
-    d["atr_slow"] = tr.rolling(MB_VOL_SPIKE_BASELINE_PERIOD).mean()
-    d["ema9"] = d["close"].ewm(span=EXTREME_EMA_FAST, adjust=False).mean()
-    d["ema21"] = d["close"].ewm(span=EXTREME_EMA_SLOW, adjust=False).mean()
+    d["atr"] = tr.rolling(cfg["atr_period"]).mean()
+    d["atr_slow"] = tr.rolling(cfg["vol_spike_baseline_period"]).mean()
+    d["ema9"] = d["close"].ewm(span=cfg["ema_fast"], adjust=False).mean()
+    d["ema21"] = d["close"].ewm(span=cfg["ema_slow"], adjust=False).mean()
     d["vwap"] = _session_vwap(d)
     d["body"] = (d["close"] - d["open"]).abs()
     d["range"] = d["high"] - d["low"]
@@ -2208,39 +2284,42 @@ def _extreme_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d["adx"] = dx.rolling(14).mean()
     return d
 
-def _extreme_roll_day(now_wib: datetime):
+def _extreme_roll_day(now_wib: datetime, state: dict = None):
+    state = state if state is not None else _extreme_state
     day = now_wib.date()
-    if _extreme_state["trade_day"] != day:
-        _extreme_state["trade_day"] = day
-        _extreme_state["trades_today"] = 0
+    if state["trade_day"] != day:
+        state["trade_day"] = day
+        state["trades_today"] = 0
 
 def _extreme_session_ok(now_wib: datetime) -> bool:
     return EXTREME_SESSION_START_HOUR <= now_wib.hour < EXTREME_SESSION_END_HOUR and is_forex_market_open(now_wib)
 
-def _mb_trend_aligned(action: str, cur, metrics: dict = None) -> bool:
+def _mb_trend_aligned(action: str, cur, metrics: dict = None, cfg: dict = None) -> bool:
+    cfg = cfg or MB_CONFIG_C
     ema9, ema21 = float(cur["ema9"]), float(cur["ema21"])
     ema_aligned = ema9 >= ema21 if action == "BUY" else ema9 <= ema21
 
     adx = float(cur["adx"]) if not pd.isna(cur["adx"]) else 0.0
-    if adx <= MB_RANGING_ADX_MAX:
+    if adx <= cfg["ranging_adx_max"]:
         gate_would_allow, zone = False, "ranging"
-    elif adx >= MB_STRONG_TREND_ADX_MIN:
+    elif adx >= cfg["strong_trend_adx_min"]:
         gate_would_allow, zone = True, "strong"
     else:
-        gate_would_allow = ema_aligned if MB_REQUIRE_TREND_ALIGNMENT else True
+        gate_would_allow = ema_aligned if cfg["require_trend_alignment"] else True
         zone = "ambiguous"
     if metrics is not None:
         metrics["adx_gate_would_allow"] = gate_would_allow
         metrics["adx_gate_zone"] = zone
 
-    if MB_ADX_GATE_SHADOW_MODE:
+    if cfg["adx_gate_shadow_mode"]:
         # Shadow mode: real trading still gates on plain EMA9/21 alignment
         # only, same as before this gate existed. The tiered ADX verdict
         # above is recorded but never blocks anything yet.
-        return ema_aligned if MB_REQUIRE_TREND_ALIGNMENT else True
+        return ema_aligned if cfg["require_trend_alignment"] else True
     return gate_would_allow
 
-def _mb_volatility_cooldown_active(d: pd.DataFrame, last_idx: int) -> bool:
+def _mb_volatility_cooldown_active(d: pd.DataFrame, last_idx: int, cfg: dict = None) -> bool:
+    cfg = cfg or MB_CONFIG_C
     """Purely price-derived 'we just had a volatility shock' cooldown -- no
     external news calendar needed, and no dependency on a third-party feed
     being reachable. A 'shock bar' is one whose OWN true range blew past
@@ -2258,7 +2337,7 @@ def _mb_volatility_cooldown_active(d: pd.DataFrame, last_idx: int) -> bool:
     worth watching /analyze's data after a few real news events."""
     if "atr_slow" not in d.columns:
         return False
-    lookback = min(MB_VOL_SPIKE_COOLDOWN_BARS, last_idx)
+    lookback = min(cfg["vol_spike_cooldown_bars"], last_idx)
     for i in range(last_idx - lookback + 1, last_idx + 1):
         if i < 0:
             continue
@@ -2266,21 +2345,22 @@ def _mb_volatility_cooldown_active(d: pd.DataFrame, last_idx: int) -> bool:
         tr_i = d["tr"].iloc[i]
         if pd.isna(baseline) or baseline <= 0 or pd.isna(tr_i):
             continue
-        if tr_i >= MB_VOL_SPIKE_ATR_MULT * baseline:
+        if tr_i >= cfg["vol_spike_atr_mult"] * baseline:
             return True
     return False
 
-def find_mother_bar_signal(d: pd.DataFrame):
+def find_mother_bar_signal(d: pd.DataFrame, cfg: dict = None):
     """Stateless scan of closed-bar OHLC history for an active Mother Bar
     structure, returning a trade signal if the LAST bar is either a fresh
     valid breakout (Model 1/2) or a valid Fib retracement entry into an
     already-broken MB (Model 3). Returns (action, trigger, metrics)."""
+    cfg = cfg or MB_CONFIG_C
     n = len(d)
     if n < MB_LOOKBACK_BARS + 3:
         return "HOLD", "Insufficient history for MB scan", {}
 
     last_idx = n - 1
-    if _mb_volatility_cooldown_active(d, last_idx):
+    if _mb_volatility_cooldown_active(d, last_idx, cfg):
         return "HOLD", "Volatility-spike cooldown active (recent shock bar) -- sitting out", {}
 
     atr_arr = d["atr"].values
@@ -2302,14 +2382,14 @@ def find_mother_bar_signal(d: pd.DataFrame):
         body_atr = body_arr[mb_idx] / atr_mb
         rng_atr = range_arr[mb_idx] / atr_mb
         rng_abs = range_arr[mb_idx]
-        if body_atr < MB_MIN_BODY_ATR or rng_atr < MB_MIN_RANGE_ATR or rng_abs < MB_MIN_RANGE_ABS:
+        if body_atr < cfg["min_body_atr"] or rng_atr < cfg["min_range_atr"] or rng_abs < cfg["min_range_abs"]:
             continue
 
         mb_high = high_arr[mb_idx]
         mb_low = low_arr[mb_idx]
         mb_range = mb_high - mb_low
         age = last_idx - mb_idx
-        if age > MB_MAX_AGE_BARS:
+        if age > cfg["max_age_bars"]:
             # Nothing useful further back than this either -- structures
             # only get staler as we keep walking backward.
             break
@@ -2326,11 +2406,11 @@ def find_mother_bar_signal(d: pd.DataFrame):
                 continue
             c, o, h, l = close_arr[j], open_arr[j], high_arr[j], low_arr[j]
             if not broken:
-                if c > mb_high + MB_BREAK_CONFIRM_ATR * atr_j and c > o:
+                if c > mb_high + cfg["break_confirm_atr"] * atr_j and c > o:
                     broken, break_idx, break_action = True, j, "BUY"
-                elif c < mb_low - MB_BREAK_CONFIRM_ATR * atr_j and c < o:
+                elif c < mb_low - cfg["break_confirm_atr"] * atr_j and c < o:
                     broken, break_idx, break_action = True, j, "SELL"
-                elif h <= mb_high + MB_INSIDE_TOLERANCE_ATR * atr_j and l >= mb_low - MB_INSIDE_TOLERANCE_ATR * atr_j:
+                elif h <= mb_high + cfg["inside_tolerance_atr"] * atr_j and l >= mb_low - cfg["inside_tolerance_atr"] * atr_j:
                     inside_count += 1
                 # else: a wick poked outside without a valid close-break --
                 # per the source method this is NOT a valid break, so the
@@ -2346,25 +2426,25 @@ def find_mother_bar_signal(d: pd.DataFrame):
         if not broken:
             # Still coiling. Only actionable if inside-bar count already
             # qualifies AND the break is happening right now, on the last bar.
-            if inside_count < MB_MIN_INSIDE_BARS or inside_count > MB_MAX_INSIDE_BARS:
+            if inside_count < cfg["min_inside_bars"] or inside_count > cfg["max_inside_bars"]:
                 continue
             cur = d.iloc[last_idx]
             c, o = float(cur["close"]), float(cur["open"])
             atr_now = float(cur["atr"])
             if atr_now <= 0 or np.isnan(atr_now):
                 continue
-            if c > mb_high + MB_BREAK_CONFIRM_ATR * atr_now and c > o:
+            if c > mb_high + cfg["break_confirm_atr"] * atr_now and c > o:
                 action = "BUY"
-            elif c < mb_low - MB_BREAK_CONFIRM_ATR * atr_now and c < o:
+            elif c < mb_low - cfg["break_confirm_atr"] * atr_now and c < o:
                 action = "SELL"
             else:
                 continue  # this MB hasn't broken yet -- keep it as the active structure, nothing to do this bar
-            if not _mb_trend_aligned(action, cur, metrics):
+            if not _mb_trend_aligned(action, cur, metrics, cfg):
                 continue
             penetration_atr = (c - mb_high) / atr_now if action == "BUY" else (mb_low - c) / atr_now
-            if penetration_atr >= MB_MOMENTUM_BREAK_ATR:
-                if not MB_MOMENTUM_BREAK_ENABLED:
-                    continue  # momentum-break entries disabled -- see MB_MOMENTUM_BREAK_ENABLED comment above
+            if penetration_atr >= cfg["momentum_break_atr"]:
+                if not cfg["momentum_break_enabled"]:
+                    continue  # momentum-break entries disabled -- see cfg["momentum_break_enabled"] comment above
                 trigger = "MB Momentum Break"
             else:
                 trigger = "MB Close Break"
@@ -2374,17 +2454,17 @@ def find_mother_bar_signal(d: pd.DataFrame):
         # same fresh-breakout case as above, just found via the "broken"
         # branch because the loop already recorded it.
         if break_idx == last_idx:
-            if inside_count < MB_MIN_INSIDE_BARS or inside_count > MB_MAX_INSIDE_BARS:
+            if inside_count < cfg["min_inside_bars"] or inside_count > cfg["max_inside_bars"]:
                 continue
             cur = d.iloc[last_idx]
-            if not _mb_trend_aligned(break_action, cur, metrics):
+            if not _mb_trend_aligned(break_action, cur, metrics, cfg):
                 continue
             atr_now = float(cur["atr"])
             c = float(cur["close"])
             penetration_atr = (c - mb_high) / atr_now if break_action == "BUY" else (mb_low - c) / atr_now
-            if penetration_atr >= MB_MOMENTUM_BREAK_ATR:
-                if not MB_MOMENTUM_BREAK_ENABLED:
-                    continue  # momentum-break entries disabled -- see MB_MOMENTUM_BREAK_ENABLED comment above
+            if penetration_atr >= cfg["momentum_break_atr"]:
+                if not cfg["momentum_break_enabled"]:
+                    continue  # momentum-break entries disabled -- see cfg["momentum_break_enabled"] comment above
                 trigger = "MB Momentum Break"
             else:
                 trigger = "MB Close Break"
@@ -2393,27 +2473,27 @@ def find_mother_bar_signal(d: pd.DataFrame):
         # Break happened earlier -- check for a Model 3 retracement entry
         # on the current bar, as long as the structure isn't stale yet.
         bars_since_break = last_idx - break_idx
-        if bars_since_break > MB_MAX_AGE_BARS or inside_count < MB_MIN_INSIDE_BARS or inside_count > MB_MAX_INSIDE_BARS:
+        if bars_since_break > cfg["max_age_bars"] or inside_count < cfg["min_inside_bars"] or inside_count > cfg["max_inside_bars"]:
             continue
         cur = d.iloc[last_idx]
         atr_now = float(cur["atr"])
         if atr_now <= 0 or np.isnan(atr_now):
             continue
         c, o, h, l = float(cur["close"]), float(cur["open"]), float(cur["high"]), float(cur["low"])
-        tol = MB_RETRACE_TOLERANCE_ATR * atr_now
+        tol = cfg["retrace_tolerance_atr"] * atr_now
         if break_action == "BUY":
-            for lvl in MB_RETRACE_LEVELS:
+            for lvl in cfg["retrace_levels"]:
                 zone_price = mb_high - lvl * mb_range
                 if l <= zone_price + tol and c > o and c >= zone_price - tol:
-                    if not _mb_trend_aligned("BUY", cur, metrics):
+                    if not _mb_trend_aligned("BUY", cur, metrics, cfg):
                         break
                     metrics["retrace_level"] = lvl
                     return "BUY", f"MB Fib Retrace {int(lvl*100)}%", metrics
         else:
-            for lvl in MB_RETRACE_LEVELS:
+            for lvl in cfg["retrace_levels"]:
                 zone_price = mb_low + lvl * mb_range
                 if h >= zone_price - tol and c < o and c <= zone_price + tol:
-                    if not _mb_trend_aligned("SELL", cur, metrics):
+                    if not _mb_trend_aligned("SELL", cur, metrics, cfg):
                         break
                     metrics["retrace_level"] = lvl
                     return "SELL", f"MB Fib Retrace {int(lvl*100)}%", metrics
@@ -2421,28 +2501,34 @@ def find_mother_bar_signal(d: pd.DataFrame):
 
     return "HOLD", "No active Mother Bar setup", {}
 
-def detect_extreme_m5_signal(df_5m: pd.DataFrame):
+def detect_extreme_m5_signal(df_5m: pd.DataFrame, cfg: dict = None):
     """Entry point kept for compatibility with the rest of the file.
     Runs Mother Bar detection and returns (action, trigger, metrics)."""
+    cfg = cfg or MB_CONFIG_C
     if df_5m is None or len(df_5m) < max(EXTREME_ATR_PERIOD + 3, MB_LOOKBACK_BARS + 3):
         return "HOLD", "Insufficient M5 history", {}
-    d = _extreme_indicators(df_5m)
-    return find_mother_bar_signal(d)
+    d = _extreme_indicators(df_5m, cfg)
+    return find_mother_bar_signal(d, cfg)
 
-def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame, metrics: dict, trigger: str = ""):
+def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame, metrics: dict, trigger: str = "", cfg: dict = None):
     """Target/stop sizing driven by the detected Mother Bar's OWN range,
     not a fixed ATR multiple -- this is what makes target distance follow
     the size of the actual candle structure that produced the signal.
 
     `trigger` lets specific entry conditions override the TP multiples --
-    see MB_MOMENTUM_BREAK_TP1_MULT/MB_MOMENTUM_BREAK_TP2_MULT above."""
+    see cfg["momentum_tp1_mult"]/cfg["momentum_tp2_mult"] above.
+
+    Returns (sl, tp1, tp2, risk), or (None, None, None, None) if cfg uses a
+    hard risk-reject (Bot A) and this trade's risk is too large -- caller
+    must treat that as HOLD, not open a position."""
+    cfg = cfg or MB_CONFIG_C
     mb_high = metrics.get("mb_high")
     mb_low = metrics.get("mb_low")
     mb_range = metrics.get("mb_range")
 
-    tp1_mult, tp2_mult = MB_TP1_MULT, MB_TP2_MULT
+    tp1_mult, tp2_mult = cfg["tp1_mult"], cfg["tp2_mult"]
     if trigger == "MB Momentum Break":
-        tp1_mult, tp2_mult = MB_MOMENTUM_BREAK_TP1_MULT, MB_MOMENTUM_BREAK_TP2_MULT
+        tp1_mult, tp2_mult = cfg["momentum_tp1_mult"], cfg["momentum_tp2_mult"]
 
     if mb_high is None or mb_low is None or not mb_range or mb_range <= 0:
         # Defensive fallback (should not normally trigger -- every returned
@@ -2452,7 +2538,7 @@ def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame,
             return price - risk, price + risk * 1.0, price + risk * 1.5, risk
         return price + risk, price - risk * 1.0, price - risk * 1.5, risk
 
-    buffer = MB_SL_BUFFER_ATR * atr
+    buffer = cfg["sl_buffer_atr"] * atr
     if action == "BUY":
         sl = mb_low - buffer
         tp1 = mb_high + tp1_mult * mb_range
@@ -2462,21 +2548,29 @@ def _extreme_trade_plan(action: str, price: float, atr: float, df: pd.DataFrame,
         tp1 = mb_low - tp1_mult * mb_range
         tp2 = mb_low - tp2_mult * mb_range
     risk = abs(price - sl)
-    if risk > MB_MAX_RISK_PRICE:
-        # Pull the stop in to the cap rather than accepting the MB's full
-        # (possibly news-spiked) range as risk. TP1/TP2 stay anchored to the
-        # true mb_high/mb_low -- see MB_MAX_RISK_PRICE's comment above.
-        risk = MB_MAX_RISK_PRICE
+
+    if cfg.get("reject_risk_floor") is not None:
+        # Bot A: hard reject instead of capping -- max($15, 2.25x ATR)
+        reject_ceiling = max(cfg["reject_risk_floor"], cfg["reject_risk_atr_mult"] * atr)
+        if risk > reject_ceiling:
+            return None, None, None, None
+    elif cfg.get("max_risk_price") is not None and risk > cfg["max_risk_price"]:
+        # Bot C (unchanged): pull the stop in to the cap rather than
+        # accepting the MB's full (possibly news-spiked) range as risk.
+        # TP1/TP2 stay anchored to the true mb_high/mb_low.
+        risk = cfg["max_risk_price"]
         sl = price - risk if action == "BUY" else price + risk
+
     return sl, tp1, tp2, risk
 
-def _mt5_cache_fresh() -> bool:
-    ts = mt5_market_cache.get("updated_at")
-    if mt5_market_cache.get("df") is None or ts is None:
+def _mt5_cache_fresh(cache: dict = None) -> bool:
+    cache = cache if cache is not None else mt5_market_cache
+    ts = cache.get("updated_at")
+    if cache.get("df") is None or ts is None:
         return False
     return (datetime.now(timezone.utc) - ts).total_seconds() <= MT5_DATA_CACHE_TTL_SECONDS
 
-def _df_from_mt5_payload(payload: dict):
+def _df_from_mt5_payload(payload: dict, max_bars: int = 150):
     """Accept either {'bars':[...]} or {'candles':[...]} with OHLC and time."""
     rows = payload.get("bars") or payload.get("candles") or []
     if not isinstance(rows, list) or not rows:
@@ -2497,7 +2591,7 @@ def _df_from_mt5_payload(payload: dict):
     if "tick_volume" in out.columns and "volume" not in out.columns:
         out["volume"] = pd.to_numeric(out["tick_volume"], errors="coerce")
     out = out.dropna(subset=["datetime", "open", "high", "low", "close"])
-    return out.sort_values("datetime").drop_duplicates("datetime").tail(150).reset_index(drop=True)
+    return out.sort_values("datetime").drop_duplicates("datetime").tail(max_bars).reset_index(drop=True)
 
 async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.DataFrame, now_wib: datetime):
     """Strategy C paper engine: Mother Bar micro-breakout. Prefers fresh
@@ -2630,6 +2724,157 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
         )
     except Exception as e:
         logging.error(f"[MB C DB ERROR] {e}")
+
+# =====================================================================
+# BOT A -- MOTHER BAR V2 (M1), now the sole MT5-live strategy
+# =====================================================================
+_control_mb_state = {
+    "last_signal_time": None,
+    "last_entry_price": None,
+    "last_action": None,
+    "trades_today": 0,
+    "trade_day": None,
+}
+
+async def get_m1_dataframe(client: httpx.AsyncClient, now_wib: datetime):
+    """Free, no-payment M1 source for Bot A: prefer the MT5 EA push
+    (mt5_market_cache_m1 -- zero API cost, no rate limit); only fall back to
+    a throttled Twelve Data 1min pull, capped well under the shared 800/day
+    budget so a stalled MT5 feed can't starve A/B/C's core 5-minute cycle.
+    Returns (df, source_label) or (None, reason)."""
+    if _mt5_cache_fresh(mt5_market_cache_m1):
+        return mt5_market_cache_m1["df"], "MT5"
+    if _td_1min_fallback_ok(now_wib):
+        df = await fetch_timeframe_data(client, "1min", outputsize=300, now_wib=now_wib)
+        if df is not None and len(df) >= MB_LOOKBACK_BARS + 3:
+            _note_td_1min_fallback_call()
+            return df, "TWELVE_DATA_FALLBACK"
+        _note_td_1min_fallback_call()  # still counts against the cap even on a bad/empty response
+    return None, "NO_DATA"
+
+async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datetime, df: pd.DataFrame = None, source: str = None):
+    """Strategy A live engine: Mother Bar V2, M1, all 5 triggers, hard
+    risk-reject, no daily trade cap, -6R daily breaker. This replaces the
+    old harmonic-pattern A entirely. `df`/`source` may be passed in by the
+    caller (the M1 loop branch, which also needs the same bar for
+    update_open_trades) to avoid fetching twice."""
+    _extreme_roll_day(now_wib, _control_mb_state)
+    # No session gate by spec ("no 60/day limit" implies always-on like C);
+    # still respects the actual forex market being open.
+    if not is_forex_market_open(now_wib):
+        return
+
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(SUM(result_r), 0) AS daily_r FROM signals "
+                "WHERE strategy = %s AND outcome_timestamp LIKE %s",
+                (CONTROL_STRATEGY, now_wib.strftime("%Y-%m-%d") + "%")
+            )
+            daily_r = float(cur.fetchone()["daily_r"] or 0.0)
+            cur.close(); conn.close()
+            if daily_r <= EXTREME_DAILY_LOSS_LIMIT_R:
+                logging.info(f"[MB A] [DAILY LOSS BREAKER] Halted for today: daily_r={daily_r:.2f}R <= {EXTREME_DAILY_LOSS_LIMIT_R}R")
+                return
+        except Exception as e:
+            logging.warning(f"[MB A] [DAILY LOSS BREAKER] Check failed, continuing without it: {e}")
+
+    df, source = (df, source) if df is not None else await get_m1_dataframe(client, now_wib)
+    if df is None:
+        logging.warning("[MB A] No M1 data available (MT5 push stale, TD fallback exhausted/cooling) -- holding.")
+        return
+
+    cfg = MB_CONFIG_A_V2
+    action, trigger, metrics = detect_extreme_m5_signal(df, cfg)  # name kept generic; works on any timeframe fed in
+    if action == "HOLD":
+        return
+    if CONTROL_DIRECTION_MODE == "BUY_ONLY" and action == "SELL":
+        return
+    if CONTROL_DIRECTION_MODE == "SELL_ONLY" and action == "BUY":
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    last_ts = _control_mb_state.get("last_signal_time")
+    if last_ts and (now_utc - last_ts).total_seconds() < EXTREME_COOLDOWN_SECONDS:
+        return
+
+    price = float(df["close"].iloc[-1])
+    atr = float(metrics.get("atr") or 0.0)
+    if atr <= 0:
+        return
+
+    last_price = _control_mb_state.get("last_entry_price")
+    if last_price is not None and abs(price - float(last_price)) < EXTREME_MIN_REENTRY_DISTANCE_ATR * atr:
+        return
+
+    sl, tp1, tp2, risk = _extreme_trade_plan(action, price, atr, df, metrics, trigger, cfg)
+    if sl is None:
+        # Hard risk-reject: risk > max($15, 2.25x ATR) -- skip this trade
+        # entirely rather than shrinking the stop (that's C's behavior, not A's).
+        reject_ceiling = max(cfg["reject_risk_floor"], cfg["reject_risk_atr_mult"] * atr)
+        logging.info(f"[MB A] [RISK REJECT] {trigger} risk too large vs ceiling ${reject_ceiling:.2f} -- skipped.")
+        return
+
+    if not DATABASE_URL:
+        return
+
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        adx_val = metrics.get('adx', 0.0)
+        gate_allow = metrics.get('adx_gate_would_allow')
+        gate_zone = metrics.get('adx_gate_zone', 'unknown')
+        gate_label = f"ADX_GATE_SHADOW={'ALLOW' if gate_allow else 'BLOCK'}_{gate_zone.upper()}" if gate_allow is not None else "ADX_GATE_SHADOW=N/A"
+        reasoning = (
+            f"{trigger}; MB range={metrics.get('mb_range', 0):.3f}, "
+            f"inside_bars={metrics.get('inside_bars', 0)}, mb_age={metrics.get('mb_age_bars', 0)} bars, "
+            f"ATR={atr:.3f}, ADX={adx_val:.1f}, {gate_label}, data={source}, risk=${risk:.2f}."
+        )
+        cur.execute("""
+            INSERT INTO signals (
+                timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,
+                tp1,tp1_price,tp2,tp2_price,confidence,adx_15m,stoch_rsi_15m,
+                divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,
+                adx_15m_true,regime,strategy,execution_mode,created_at
+            )
+            VALUES (%s,'EXECUTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,
+                    %s,%s,'PENDING','',%s,%s,%s,%s,%s,NOW())
+            RETURNING id
+        """, (
+            (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
+            0.90, adx_val, gate_label, reasoning, None, adx_val, source, CONTROL_STRATEGY, CONTROL_EXECUTION_MODE
+        ))
+        row = cur.fetchone(); sid = int(row["id"]) if row else None
+        conn.commit(); cur.close(); conn.close()
+        _control_mb_state["last_signal_time"] = now_utc
+        _control_mb_state["last_entry_price"] = price
+        _control_mb_state["last_action"] = action
+        _control_mb_state["trades_today"] += 1
+
+        mode_tag = "[PAPER]" if CONTROL_EXECUTION_MODE == "PAPER" else "[LIVE]"
+        mode_footer = "⚠️ PAPER ONLY" if CONTROL_EXECUTION_MODE == "PAPER" else "🔴 LIVE -- MT5 will execute this"
+        tp1_mult, tp2_mult = (
+            (cfg["momentum_tp1_mult"], cfg["momentum_tp2_mult"])
+            if trigger == "MB Momentum Break" else (cfg["tp1_mult"], cfg["tp2_mult"])
+        )
+        await send_telegram_alert(
+            client,
+            f"🅰️ *MOTHER BAR A-V2 {CONTROL_STRATEGY} {mode_tag} SIGNAL #{sid}*\n\n"
+            f"Asset: *XAU/USD* (M1)\nAction: *{action}*\nTrigger: *{trigger}*\n"
+            f"Entry: *${price:.2f}*\nSL: *${sl:.2f}* (risk ${risk:.2f})\n"
+            f"TP1: *${tp1:.2f}* ({tp1_mult:.2f}x MB range)\nTP2: *${tp2:.2f}* ({tp2_mult:.2f}x MB range)\n"
+            f"MB range: *{metrics.get('mb_range', 0):.3f}* | Inside bars: *{metrics.get('inside_bars', 0)}* | "
+            f"MB age: *{metrics.get('mb_age_bars', 0)} bars*\n"
+            f"ATR: *{atr:.3f}* | ADX: *{metrics.get('adx', 0):.1f}*\n"
+            f"Data source: *{source}*\n"
+            f"Signals today: *{_control_mb_state['trades_today']}* (no daily cap)\n\n"
+            f"{mode_footer}",
+            TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
+        )
+    except Exception as e:
+        logging.error(f"[MB A DB ERROR] {e}")
 
 # Backward-compatible alias so any old internal status/command text can still
 # refer to Strategy C without resurrecting the old OCO engine.
@@ -2789,28 +3034,54 @@ async def evaluate_strategy_cycle(
         strategy_mode = "RANGE"
         proposed_action, trigger_type, range_high, range_low = detect_range_reversal(df_5m, adx_15m_true)
 
-    # B-only: ADX said TREND, but check if it's actually just efficient chop
-    # wearing a high-ADX costume. If so, fade real S/R structure instead of
-    # forcing a trend entry into a market that isn't trending. Control A is
-    # untouched.
+    # B V2: use a clean trend-only entry regime. The range engine and
+    # aggressive EMA impulse/crossover triggers are intentionally not mixed
+    # into this experiment. The backtest showed the useful B edge is the
+    # confirmed EMA5 pullback/touch, not every EMA event.
+    if strategy == EXPERIMENTAL_STRATEGY:
+        if adx_5m < EXPERIMENTAL_MIN_ADX:
+            strategy_mode = "CHOP"
+            proposed_action = "HOLD"
+            trigger_type = f"B V3 Trend-Quality Block (ADX {adx_5m:.1f} < {EXPERIMENTAL_MIN_ADX:.0f})"
+        elif proposed_action == "BUY":
+            spread_atr = abs(curr_ema_fast - curr_ema_slow) / max(float(df_5m["atr"].iloc[-1]), 1e-9)
+            slope_atr = (curr_ema_fast - float(df_5m["ema_fast"].iloc[-3])) / max(float(df_5m["atr"].iloc[-1]), 1e-9) if len(df_5m) >= 3 else 0.0
+            extension_atr = (curr_price - curr_ema_fast) / max(float(df_5m["atr"].iloc[-1]), 1e-9)
+            regime_metrics.update({"ema_spread_atr": round(spread_atr, 4), "ema_slope_atr": round(slope_atr, 4), "entry_extension_atr": round(extension_atr, 4)})
+            if EXPERIMENTAL_TOUCH_ONLY and "Line Touch" not in trigger_type:
+                proposed_action = "HOLD"
+                trigger_type = "B V3 Trigger Quality Block"
+            elif spread_atr < EXPERIMENTAL_MIN_EMA_SPREAD_ATR or slope_atr <= EXPERIMENTAL_MIN_EMA_SLOPE_ATR or extension_atr > EXPERIMENTAL_MAX_ENTRY_EXTENSION_ATR:
+                proposed_action = "HOLD"
+                trigger_type = "B V3 Trend Quality Block"
+            elif float(df_5m["close"].iloc[-2]) <= float(df_5m["ema_fast"].iloc[-2]):
+                proposed_action = "HOLD"
+                trigger_type = "B V3 Pullback-Structure Block"
+
+    # B-only regime fix:
+    # Efficiency is a HARD veto, not a request to find an alternative S/R trade.
+    # The previous code detected high-ADX chop but then allowed S/R RANGE/TREND
+    # signals to replace the EMA setup, which made B progressively less like a
+    # clean EMA 5/15 experiment and could add trades exactly when efficiency
+    # said the market was choppy.
+    #
+    # For this controlled patch we intentionally disable both S/R fallbacks.
+    # This isolates the effect of the regime fix. S/R can be re-tested later as
+    # a separate experiment rather than being mixed into the same result.
     if strategy == EXPERIMENTAL_STRATEGY and strategy_mode == "TREND":
         efficiency = compute_efficiency_ratio(df_5m)
+        regime_metrics["efficiency"] = round(float(efficiency), 4)
         if efficiency < EXPERIMENTAL_EFFICIENCY_MAX:
-            sr_action, sr_trigger, sr_high, sr_low = detect_sr_bracket_signal(df_5m, "RANGE", trend_15m)
-            if sr_action in ("BUY", "SELL"):
-                strategy_mode = "RANGE"
-                proposed_action, trigger_type = sr_action, f"{sr_trigger} (Efficiency {efficiency:.2f})"
-                range_high, range_low = sr_high, sr_low
-
-    # B-only: still in TREND and the EMA trigger found nothing this cycle --
-    # give the S/R break-and-retest continuation a chance before moving on.
-    # Same 15M trend-agreement requirement as the EMA trigger, just a
-    # structural entry instead of an indicator-based one.
-    if strategy == EXPERIMENTAL_STRATEGY and strategy_mode == "TREND" and proposed_action == "HOLD":
-        sr_action, sr_trigger, sr_high, sr_low = detect_sr_bracket_signal(df_5m, "TREND", trend_15m)
-        if sr_action in ("BUY", "SELL"):
-            proposed_action, trigger_type = sr_action, sr_trigger
-            range_high, range_low = sr_high, sr_low
+            strategy_mode = "CHOP"
+            proposed_action = "HOLD"
+            trigger_type = f"Efficiency Chop Block ({efficiency:.2f})"
+            log_scan_event(
+                "EFFICIENCY_CHOP_BLOCK", stage="REGIME", action="HOLD",
+                price=curr_price, adx_5m=adx_5m, adx_15m=adx_15m_true,
+                trend_15m=trend_15m, decision="HOLD",
+                reason=f"{strategy}: 5M efficiency {efficiency:.2f} < {EXPERIMENTAL_EFFICIENCY_MAX:.2f}",
+                details={"efficiency": round(float(efficiency), 4)}
+            )
 
     # Dead for A as of the harmonic-pattern replacement: CONTROL_STRATEGY now
     # always runs strategy_mode == "HARMONIC" (set above), never "TREND", so
@@ -3118,6 +3389,7 @@ async def background_scanning_loop():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         last_processed_candle_time = None
         last_claimed_bucket = None
+        last_claimed_minute_bucket_a = None
 
         while True:
             try:
@@ -3142,6 +3414,31 @@ async def background_scanning_loop():
                         logging.info("[SLEEP STATUS] Market closed (weekend, WIB). Waiting for reopen...")
                     await asyncio.sleep(120)
                     continue
+
+                # Bot A runs on its own M1 cadence, independent of B/C's
+                # shared 5-minute block below -- it's the only MT5-live
+                # strategy now, so it needs to see every 1-minute close.
+                #
+                # RECEIVER-SIDE FIX: update_open_trades() used to only run
+                # once per 5 minutes (below, off the M5 candle), which is
+                # fine for B/C but was silently going to smear every A
+                # trade's TP1/TP2/SL detection out to 5-minute resolution
+                # even though A now opens on M1 closes. It's called here too,
+                # off the same M1 bar A itself is trading, so A's own
+                # signals get checked every minute like everything else does
+                # on its native timeframe. It's harmless to call twice in the
+                # same wall-clock minute since it only acts on genuinely new
+                # outcome transitions.
+                current_minute_bucket = now_wib.strftime("%Y-%m-%d %H:%M")
+                if current_minute_bucket != last_claimed_minute_bucket_a and now_wib.second < 20:
+                    last_claimed_minute_bucket_a = current_minute_bucket
+                    try:
+                        df_m1, source_m1 = await get_m1_dataframe(client, now_wib)
+                        if df_m1 is not None:
+                            update_open_trades(float(df_m1["high"].iloc[-1]), float(df_m1["low"].iloc[-1]))
+                            await evaluate_control_mb_strategy(client, now_wib, df_m1, source_m1)
+                    except Exception as e:
+                        logging.error(f"[MB A LOOP ERROR] {e}")
 
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
                     await asyncio.sleep(2)
@@ -3215,14 +3512,11 @@ async def background_scanning_loop():
                             cached_1h["fetched_at"] = datetime.now(timezone.utc)
                     directional_bias, bias_sep = compute_1h_directional_bias(cached_1h["df"])
 
-                # CONTROL A: existing Exhaustion Guard v1, EMA 5/9, PAPER.
-                await evaluate_strategy_cycle(
-                    client, df_5m, trend_15m, adx_15m_true, now_wib,
-                    CONTROL_STRATEGY, 5, 9, CONTROL_EXECUTION_MODE,
-                    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, directional_bias
-                )
+                # CONTROL A now runs on its own M1 cadence above
+                # (evaluate_control_mb_strategy) -- Mother Bar V2, no
+                # longer the shared-5M harmonic engine, no longer PAPER.
 
-                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, LIVE.
+                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, PAPER.
                 # It receives the exact same candles and 15M confluence snapshot.
                 await evaluate_strategy_cycle(
                     client, df_5m, trend_15m, adx_15m_true, now_wib,
@@ -3275,7 +3569,7 @@ async def lifespan(app: FastAPI):
                         {"command":"start","description":"Show Control bot commands"},
                         {"command":"help","description":"Show Control command menu"},
                         {"command":"status","description":"MT5/server/API status"},
-                        {"command":"stats","description":"Live EMA 5/9 performance"},
+                        {"command":"stats","description":"Live Mother Bar A (M1) performance"},
                         {"command":"pips","description":"Pips and USD breakdown"},
                         {"command":"logs","description":"Last 10 live trades"},
                         {"command":"analyze","description":"Forward-test analysis"},
@@ -3294,7 +3588,7 @@ async def lifespan(app: FastAPI):
                         {"command":"start","description":"Show A/B bot commands"},
                         {"command":"help","description":"Show A/B command menu"},
                         {"command":"stats","description":"A/B performance dashboard"},
-                        {"command":"compare","description":"Compare EMA 5/9 vs 5/15"},
+                        {"command":"compare","description":"Compare Mother Bar A (M1) vs EMA B (5M)"},
                         {"command":"status","description":"Read-only system status"},
                         {"command":"last","description":"Last 10 paper trades"},
                         {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
@@ -3328,25 +3622,34 @@ app = FastAPI(lifespan=lifespan)
 # Real-MT5 market-data ingress. The EA should POST a small rolling M5 history.
 @app.post("/mt5-market-data")
 async def mt5_market_data(request: Request):
-    global mt5_market_cache
+    """MT5 EA pushes free, no-rate-limit bars here. Include a "timeframe"
+    field ("M1" or "M5") in the JSON body to route to the right cache --
+    defaults to "M5" for backward compatibility with EAs that don't send it.
+    Bot A (M1, live) needs its own EA timer object pushing M1 bars every
+    close; Bot C keeps using the M5 push exactly as before."""
+    global mt5_market_cache, mt5_market_cache_m1
     try:
         if MT5_DATA_SECRET:
             supplied = request.headers.get("X-MT5-SECRET", "")
             if supplied != MT5_DATA_SECRET:
                 return {"ok": False, "error": "unauthorized"}
         payload = await request.json()
-        df = _df_from_mt5_payload(payload)
-        if df is None or len(df) < EXTREME_ATR_PERIOD + 3:
-            return {"ok": False, "error": "invalid_or_insufficient_m5_bars"}
-        mt5_market_cache["df"] = df
-        mt5_market_cache["updated_at"] = datetime.now(timezone.utc)
-        mt5_market_cache["source"] = "MT5_EA"
+        timeframe = str(payload.get("timeframe", "M5")).upper()
+        df = _df_from_mt5_payload(payload, max_bars=300 if timeframe == "M1" else 150)
+        min_bars = MB_LOOKBACK_BARS + 3 if timeframe == "M1" else EXTREME_ATR_PERIOD + 3
+        if df is None or len(df) < min_bars:
+            return {"ok": False, "error": f"invalid_or_insufficient_{timeframe.lower()}_bars"}
+        cache = mt5_market_cache_m1 if timeframe == "M1" else mt5_market_cache
+        cache["df"] = df
+        cache["updated_at"] = datetime.now(timezone.utc)
+        cache["source"] = "MT5_EA"
         return {
             "ok": True,
             "source": "MT5_EA",
+            "timeframe": timeframe,
             "bars": len(df),
             "last_bar": str(df["datetime"].iloc[-1]),
-            "updated_at": mt5_market_cache["updated_at"].isoformat(),
+            "updated_at": cache["updated_at"].isoformat(),
         }
     except Exception as e:
         logging.error(f"[MT5 DATA INGEST ERROR] {e}")
@@ -3354,7 +3657,7 @@ async def mt5_market_data(request: Request):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "A/B/C scanner active: A=EMA 5/9 PAPER + B=EMA 5/15 LIVE + C=Mother Bar Micro-Breakout PAPER.", "comparison": "/ab-comparison"}
+    return {"status": "ok", "message": "A/B/C scanner active: A=Mother Bar V2 (M1) LIVE + B=EMA 5/15 PAPER + C=Mother Bar Micro-Breakout PAPER.", "comparison": "/ab-comparison"}
 
 
 # =====================================================================
@@ -3569,7 +3872,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                 else:
                     reply = (
-                        f"🤖 *CONTROL EMA 5/9 BOT COMMANDS:*\n\n"
+                        f"🤖 *CONTROL MOTHER BAR A (M1) BOT COMMANDS:*\n\n"
                         "• `/status` - Real-time MT5, server & API status\n"
                         "• `/stats` - Control performance dashboard (PAPER)\n"
                         "• `/pips` - Gross/net pips & USD breakdown\n"
@@ -3582,7 +3885,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                          "• `/both` - Allow BUY + SELL\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
-                        f"🟡 Strategy: *Harmonic Pattern (XABCD) — PAPER ONLY* | Patterns: *Gartley/Bat/Butterfly/Crab*\n"
+                        f"🔴 Strategy: *Mother Bar V2 (M1, all 5 triggers) — LIVE (MT5)*\n"
                         f"\u2139\ufe0f Live MT5 execution is currently on the *Experimental* bot (EMA 5/15), not this one.\n"
                     )
                 await send_reply(reply)
@@ -3658,11 +3961,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\u2022 {ranging_note} ({ranging_sep_val:.3f}% from EMA)\n\n"
                         f"{budget_icon} *TWELVEDATA API BUDGET:*\n"
                         f"\u2022 Used Today: *{_twelve_data_call_count}/{TWELVE_DATA_DAILY_LIMIT}* ({budget_pct:.0f}%) | Remaining: *{remaining}*\n"
-                        f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']} | 1H: {_twelve_data_calls_by_tf['1h']}\n\n"
+                        f"  \u2514\u2500 5M: {_twelve_data_calls_by_tf['5min']} | 15M: {_twelve_data_calls_by_tf['15min']} | 1H: {_twelve_data_calls_by_tf['1h']} | 1M(fallback): {_twelve_data_calls_by_tf['1min']}\n\n"
                          f"⚡ *C DATA SOURCE:* {'MT5 EA (fresh)' if _mt5_cache_fresh() else 'Twelve Data M5 fallback'}\n\n"
                         f"\U0001f4c8 *STRATEGY:*\n"
                         f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
-                        f"\u2022 A Execution (5M): *Harmonic Pattern (XABCD: Gartley/Bat/Butterfly/Crab)*\n"
+                        f"\u2022 A Execution (M1): *Mother Bar V2 -- Close/Fib TP1 1.25x/TP2 8x, Momentum TP1 2x/TP2 15x, reject risk > max($15, 2.25x ATR)*\n"
                         f"\u2022 B Execution (5M): *EMA {EXPERIMENTAL_EMA_FAST}/{EXPERIMENTAL_EMA_SLOW}*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
                         f"\u2022 Strategy C: *Mother Bar Micro-Breakout (MBMB)* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n\n"
@@ -4079,7 +4382,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     leader = "Not enough data"
                     if a.get("executed", 0) or b.get("executed", 0) or c.get("executed", 0):
                         candidates = [
-                            ("🟢 EMA 5/9 (CONTROL)", a.get("total_r", 0)),
+                            ("🔴 Mother Bar A (M1, LIVE)", a.get("total_r", 0)),
                             ("🔵 EMA 5/15 (EXPERIMENT)", b.get("total_r", 0)),
                             ("🟠 Range Breakout (C)", c.get("total_r", 0)),
                         ]
@@ -4106,7 +4409,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "🔬 *A/B/C STRATEGY DASHBOARD*\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         "XAU/USD • Same market snapshot • Same risk framework\n\n"
-                        f"🟢 *A — CONTROL (EMA 5/9)*\n{block('', a)}\n\n"
+                        f"🔴 *A — CONTROL (Mother Bar V2, M1, LIVE)*\n{block('', a)}\n\n"
                         f"🔵 *B — EXPERIMENT (EMA 5/15)*\n{block('', b)}\n\n"
                         f"⚡ *C — MOTHER BAR MICRO-BREAKOUT*\n{block('', c)}\n\n"
                         f"🏆 *CURRENT LEADER:* {leader}\n"

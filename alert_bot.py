@@ -217,7 +217,13 @@ HARMONIC_PATTERNS = {
 # Optional real-MT5 market-data ingress for Strategy C.
 # The MT5 EA can POST fresh M5 bars/ticks to /mt5-market-data. C prefers this cache.
 MT5_DATA_SECRET = os.getenv("MT5_DATA_SECRET", "").strip()
-MT5_DATA_CACHE_TTL_SECONDS = 20
+MT5_DATA_CACHE_TTL_SECONDS = 90  # widened 2026-09-24: was 20s, too tight for the M1 feed --
+                                  # the EA only detects+posts a new M1 bar once per
+                                  # InpPollInterval (10s default) after it closes, and the
+                                  # server's A-loop checks within the first 20s of each new
+                                  # minute, so a 20s TTL could force a fallback on nothing
+                                  # more than ordinary latency. 90s still means "this data is
+                                  # at most 1 closed bar old", which is fine for M1 execution.
 mt5_market_cache = {"df": None, "updated_at": None, "source": None}
 mt5_market_cache_m1 = {"df": None, "updated_at": None, "source": None}  # Bot A's free M1 feed, pushed by the MT5 EA
 

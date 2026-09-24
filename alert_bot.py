@@ -2056,7 +2056,7 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 EXTREME_EMA_FAST = 9
 EXTREME_EMA_SLOW = 21
 EXTREME_ATR_PERIOD = 14
-EXTREME_DAILY_LOSS_LIMIT_R = -6.0   # circuit breaker unchanged: stop new C signals for the rest of the WIB day past this
+EXTREME_DAILY_LOSS_LIMIT_R = -6.0   # UNUSED as of 2026-09-24: C's daily loss breaker was removed (your request), same as A's earlier. Value kept here only as a reference/reintroduction point.
 EXTREME_MAX_TRADES_PER_DAY = 60     # raised vs the old 40 -- MB structures on a fast timeframe are smaller/quicker, so more clean setups/day are expected
 EXTREME_COOLDOWN_SECONDS = 10
 EXTREME_DIRECTION_MODE = "BOTH"     # BOTH | BUY_ONLY | SELL_ONLY -- toggle via /c_both, /c_buyonly, /c_sellonly on Bot C
@@ -2610,22 +2610,10 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     if EXTREME_MAX_TRADES_PER_DAY is not None and _extreme_state["trades_today"] >= EXTREME_MAX_TRADES_PER_DAY:
         return
 
-    if DATABASE_URL:
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COALESCE(SUM(result_r), 0) AS daily_r FROM signals "
-                "WHERE strategy = %s AND outcome_timestamp LIKE %s",
-                (BREAKOUT_STRATEGY, now_wib.strftime("%Y-%m-%d") + "%")
-            )
-            daily_r = float(cur.fetchone()["daily_r"] or 0.0)
-            cur.close(); conn.close()
-            if daily_r <= EXTREME_DAILY_LOSS_LIMIT_R:
-                logging.info(f"[MB C] [DAILY LOSS BREAKER] Halted for today: daily_r={daily_r:.2f}R <= {EXTREME_DAILY_LOSS_LIMIT_R}R")
-                return
-        except Exception as e:
-            logging.warning(f"[MB C] [DAILY LOSS BREAKER] Check failed, continuing without it: {e}")
+    # Daily -6R breaker REMOVED for C (2026-09-24, your request) -- C now
+    # trades every valid Mother Bar micro setup all session long regardless
+    # of how the day's gone so far, same as A. No other execution/risk rule
+    # changed (trade cap, cooldown, re-entry spacing all unchanged).
 
     source = "MT5"
     df = mt5_market_cache["df"] if _mt5_cache_fresh() else market_df_5m
@@ -2770,22 +2758,14 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
     if not is_forex_market_open(now_wib):
         return
 
-    if DATABASE_URL:
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COALESCE(SUM(result_r), 0) AS daily_r FROM signals "
-                "WHERE strategy = %s AND outcome_timestamp LIKE %s",
-                (CONTROL_STRATEGY, now_wib.strftime("%Y-%m-%d") + "%")
-            )
-            daily_r = float(cur.fetchone()["daily_r"] or 0.0)
-            cur.close(); conn.close()
-            if daily_r <= EXTREME_DAILY_LOSS_LIMIT_R:
-                logging.info(f"[MB A] [DAILY LOSS BREAKER] Halted for today: daily_r={daily_r:.2f}R <= {EXTREME_DAILY_LOSS_LIMIT_R}R")
-                return
-        except Exception as e:
-            logging.warning(f"[MB A] [DAILY LOSS BREAKER] Check failed, continuing without it: {e}")
+    # Daily -6R breaker REMOVED for A (2026-09-24, your request) -- A now
+    # trades every valid Mother Bar V2 setup all session long regardless of
+    # how the day's gone so far. No other execution/risk rule changed: the
+    # per-trade reject-risk cap (max($15, 2.25x ATR)), 0.20 ATR re-entry
+    # spacing, and no-daily-trade-cap are all still exactly as before.
+    # C's -6R breaker was also REMOVED (2026-09-24, your request) -- see
+    # evaluate_extreme_strategy(). Both A and C now trade every valid setup
+    # all session long regardless of the day's running R.
 
     df, source = (df, source) if df is not None else await get_m1_dataframe(client, now_wib)
     if df is None:
@@ -4000,7 +3980,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 _extreme_roll_day(now_wib_c)
                 mt5_src = "MT5 EA" if _mt5_cache_fresh() else "Twelve Data fallback"
                 daily_r_today = 0.0
-                breaker_tripped = False
                 if DATABASE_URL:
                     try:
                         conn = get_db_connection(); cur = conn.cursor()
@@ -4010,18 +3989,16 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         )
                         daily_r_today = float(cur.fetchone()["daily_r"] or 0.0)
                         cur.close(); conn.close()
-                        breaker_tripped = daily_r_today <= EXTREME_DAILY_LOSS_LIMIT_R
                     except Exception:
                         pass
-                breaker_label = "\U0001f534 TRIPPED -- no new signals until tomorrow" if breaker_tripped else "\U0001f7e2 OK"
                 reply = (
                     "⚡ *MOTHER BAR MICRO-BREAKOUT (STRATEGY C) STATUS*\n\n"
                     f"Engine: *MB structure + inside-bar breakout, target sized off MB range*\n"
                     f"Data source: *{mt5_src}*\n"
                     f"Direction mode: *{EXTREME_DIRECTION_MODE}*\n"
                     f"Signals today: *{_extreme_state['trades_today']}/{EXTREME_MAX_TRADES_PER_DAY_LABEL}*\n"
-                    f"Today's R: *{daily_r_today:+.2f}R* (breaker at {EXTREME_DAILY_LOSS_LIMIT_R}R)\n"
-                    f"Daily loss breaker: *{breaker_label}*\n"
+                    f"Today's R: *{daily_r_today:+.2f}R*\n"
+                    f"Daily loss breaker: *\U0001f7e2 OFF (removed)*\n"
                     f"Execution: *{BREAKOUT_EXECUTION_MODE}*\n"
                     f"MT5 feed cache: *{'FRESH' if _mt5_cache_fresh() else 'NOT FRESH'}*\n\n"
                     f"{get_macro_status_line()}"

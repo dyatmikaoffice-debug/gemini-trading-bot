@@ -2048,7 +2048,7 @@ def set_execution_ema_columns(df_5m: pd.DataFrame, fast: int, slow: int) -> pd.D
 #                   penetration through the level (a more committed,
 #                   higher-conviction breakout candle).
 #        Model 3 - Fib Retracement: after a confirmed break, wait for
-#                   price to pull back to the 25/50/75% level of the MB
+#                   price to pull back to the 25/50/61.8/75% level of the MB
 #                   range and re-confirm direction -- cheaper entry,
 #                   same target, so a better realized R:R.
 #   5. Stop-loss sits at the opposite extreme of the MB. Targets are
@@ -2091,7 +2091,7 @@ MB_MAX_INSIDE_BARS = 12          # beyond this the "squeeze" has gone stale / tu
 MB_INSIDE_TOLERANCE_ATR = 0.05   # small wick allowance so one bar's minor wick poke doesn't wrongly disqualify it as "inside"
 MB_BREAK_CONFIRM_ATR = 0.05      # Model 1: minimum close-through distance beyond MB High/Low to count as a valid (non-wick) break
 MB_MOMENTUM_BREAK_ATR = 0.20     # Model 2: bigger penetration required to tag a break as a stronger "momentum" break vs a bare Model 1 close-break
-MB_RETRACE_LEVELS = (0.25, 0.50, 0.75)  # Model 3 Fibonacci retracement zones measured back into the MB range from the broken level
+MB_RETRACE_LEVELS = (0.25, 0.50, 0.618, 0.75)  # Model 3 Fibonacci retracement zones measured back into the MB range from the broken level. 0.618 (golden ratio) added 2026-09-25 -- applies to both A (always all levels) and C (toggleable, see /c_fib618_on/off)
 MB_RETRACE_TOLERANCE_ATR = 0.08
 MB_SL_BUFFER_ATR = 0.05          # small buffer placed beyond the opposite MB extreme so SL isn't sitting exactly on the level
 MB_TP1_MULT = 1.0                # TP1 = 1x the MB's own range (source method's baseline 1:1 RR rule)
@@ -2212,16 +2212,16 @@ MB_CONFIG_C = {
 }
 
 # Bot A "V2" Mother Bar tune, per your spec: same pattern-detection rules
-# (all 5 triggers, same MB qualification/inside-bar/retrace geometry, same
+# (all 6 triggers, same MB qualification/inside-bar/retrace geometry, same
 # 0.20 ATR re-entry spacing, same -6R daily breaker) but on M1, wider TP2s,
 # and a hard risk REJECT instead of C's cap-and-shrink.
 MB_CONFIG_A_V2 = dict(MB_CONFIG_C)
 MB_CONFIG_A_V2.update({
     "tp1_mult": 1.25, "tp2_mult": 8.0,
     "momentum_tp1_mult": 2.0, "momentum_tp2_mult": 15.0,
-    "momentum_break_enabled": True,      # "all 5 triggers" -- re-enabled for A only, C stays disabled
-    "close_break_enabled": True,         # A always runs all 5 triggers -- independent of C's per-trigger toggles below
-    "retrace_levels": MB_RETRACE_LEVELS, # A always runs all 3 Fib levels -- independent of C's per-trigger toggles below
+    "momentum_break_enabled": True,      # "all 6 triggers" -- re-enabled for A only, C stays disabled
+    "close_break_enabled": True,         # A always runs all 6 triggers -- independent of C's per-trigger toggles below
+    "retrace_levels": MB_RETRACE_LEVELS, # A always runs all 4 Fib levels (25/50/61.8/75%) -- independent of C's per-trigger toggles below
     "max_risk_price": None,              # A does not cap-and-shrink; it rejects instead (below)
     "reject_risk_floor": 15.0,           # reject if risk > max($15, 2.25 x ATR)
     "reject_risk_atr_mult": 2.25,
@@ -2229,15 +2229,15 @@ MB_CONFIG_A_V2.update({
 
 # --- BOT C PER-TRIGGER TOGGLES (each of C's 5 Mother Bar entry conditions
 # can be switched on/off independently via Telegram -- /c_fib25_on/off,
-# /c_fib50_on/off, /c_fib75_on/off, /c_closebreak_on/off,
+# /c_fib50_on/off, /c_fib618_on/off, /c_fib75_on/off, /c_closebreak_on/off,
 # /c_momentum_on/off). Persisted so a toggle survives restarts, same as
 # the direction-mode settings. This only ever touches MB_CONFIG_C -- A
-# always runs all 5 triggers regardless (see MB_CONFIG_A_V2 above).
+# always runs all 6 triggers regardless (see MB_CONFIG_A_V2 above).
 _c_trigger_state = {
-    "fib25": True, "fib50": True, "fib75": True,
+    "fib25": True, "fib50": True, "fib618": True, "fib75": True,
     "close_break": True, "momentum": MB_MOMENTUM_BREAK_ENABLED,
 }
-_C_FIB_LEVELS = {"fib25": 0.25, "fib50": 0.50, "fib75": 0.75}
+_C_FIB_LEVELS = {"fib25": 0.25, "fib50": 0.50, "fib618": 0.618, "fib75": 0.75}
 
 def _apply_c_trigger_state():
     """Rebuilds MB_CONFIG_C's trigger-gating keys from _c_trigger_state.
@@ -2539,7 +2539,7 @@ def find_mother_bar_signal(d: pd.DataFrame, cfg: dict = None):
                     if not _mb_trend_aligned("BUY", cur, metrics, cfg):
                         break
                     metrics["retrace_level"] = lvl
-                    return "BUY", f"MB Fib Retrace {int(lvl*100)}%", metrics
+                    return "BUY", f"MB Fib Retrace {round(lvl*100)}%", metrics
         else:
             for lvl in cfg["retrace_levels"]:
                 zone_price = mb_low + lvl * mb_range
@@ -2547,7 +2547,7 @@ def find_mother_bar_signal(d: pd.DataFrame, cfg: dict = None):
                     if not _mb_trend_aligned("SELL", cur, metrics, cfg):
                         break
                     metrics["retrace_level"] = lvl
-                    return "SELL", f"MB Fib Retrace {int(lvl*100)}%", metrics
+                    return "SELL", f"MB Fib Retrace {round(lvl*100)}%", metrics
         continue  # this MB gave no clean entry on this bar; keep walking back for an older/other candidate
 
     return "HOLD", "No active Mother Bar setup", {}
@@ -2792,7 +2792,7 @@ async def get_m1_dataframe(client: httpx.AsyncClient, now_wib: datetime):
     return None, "NO_DATA"
 
 async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datetime, df: pd.DataFrame = None, source: str = None):
-    """Strategy A live engine: Mother Bar V2, M1, all 5 triggers, hard
+    """Strategy A live engine: Mother Bar V2, M1, all 6 triggers, hard
     risk-reject, no daily trade cap, -6R daily breaker. This replaces the
     old harmonic-pattern A entirely. `df`/`source` may be passed in by the
     caller (the M1 loop branch, which also needs the same bar for
@@ -3601,7 +3601,7 @@ async def lifespan(app: FastAPI):
     )
     # Restore Bot C's per-trigger toggles (/c_fib25_on, /c_momentum_off, etc.)
     # set before the last restart, then rebuild MB_CONFIG_C from them. A is
-    # unaffected -- MB_CONFIG_A_V2 always runs all 5 triggers regardless.
+    # unaffected -- MB_CONFIG_A_V2 always runs all 6 triggers regardless.
     for _key in _c_trigger_state:
         _c_trigger_state[_key] = get_setting(f"c_trigger_{_key}", "on" if _c_trigger_state[_key] else "off") == "on"
     _apply_c_trigger_state()
@@ -3674,6 +3674,8 @@ async def lifespan(app: FastAPI):
                         {"command":"c_fib25_off","description":"Disable Fib Retrace 25% entry"},
                         {"command":"c_fib50_on","description":"Enable Fib Retrace 50% entry"},
                         {"command":"c_fib50_off","description":"Disable Fib Retrace 50% entry"},
+                        {"command":"c_fib618_on","description":"Enable Fib Retrace 62% (golden ratio) entry"},
+                        {"command":"c_fib618_off","description":"Disable Fib Retrace 62% (golden ratio) entry"},
                         {"command":"c_fib75_on","description":"Enable Fib Retrace 75% entry"},
                         {"command":"c_fib75_off","description":"Disable Fib Retrace 75% entry"},
                         {"command":"c_closebreak_on","description":"Enable Close Break entry"},
@@ -3905,7 +3907,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off"}
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -3926,7 +3928,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     trigger_status = ", ".join(
                         f"{name}={'ON' if _c_trigger_state[key] else 'OFF'}"
                         for key, name in (
-                            ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib75", "Fib75"),
+                            ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib618", "Fib62"), ("fib75", "Fib75"),
                             ("close_break", "CloseBreak"), ("momentum", "Momentum"),
                         )
                     )
@@ -3942,6 +3944,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/c_sellonly` - Restrict to SELL only\n"
                         "• `/c_fib25_on` / `/c_fib25_off` - Toggle the Fib Retrace 25% entry\n"
                         "• `/c_fib50_on` / `/c_fib50_off` - Toggle the Fib Retrace 50% entry\n"
+                        "• `/c_fib618_on` / `/c_fib618_off` - Toggle the Fib Retrace 62% (golden ratio) entry\n"
                         "• `/c_fib75_on` / `/c_fib75_off` - Toggle the Fib Retrace 75% entry\n"
                         "• `/c_closebreak_on` / `/c_closebreak_off` - Toggle the Close Break entry\n"
                         "• `/c_momentum_on` / `/c_momentum_off` - Toggle the Momentum Break entry\n"
@@ -3984,7 +3987,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this command menu\n\n"
-                        f"{'🔴 Strategy: *Mother Bar V2 (M1, all 5 triggers) — LIVE (MT5)*' if CONTROL_EXECUTION_MODE == 'LIVE' else '⚪ Strategy: *Mother Bar V2 (M1, all 5 triggers) — PAPER only*'}\n"
+                        f"{'🔴 Strategy: *Mother Bar V2 (M1, all 6 triggers) — LIVE (MT5)*' if CONTROL_EXECUTION_MODE == 'LIVE' else '⚪ Strategy: *Mother Bar V2 (M1, all 6 triggers) — PAPER only*'}\n"
                         f"{'' if CONTROL_EXECUTION_MODE == 'LIVE' else f'ℹ️ Live MT5 execution is currently on *{live_bot_label}*, not this one.'}\n"
                     )
                 await send_reply(reply)
@@ -4044,12 +4047,14 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
             elif raw_text in (
                 "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off",
-                "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off",
+                "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off",
+                "/c_closebreak_on", "/c_closebreak_off",
                 "/c_momentum_on", "/c_momentum_off",
             ) and bot_role == "breakout":
                 key, turn_on = {
                     "/c_fib25_on": ("fib25", True), "/c_fib25_off": ("fib25", False),
                     "/c_fib50_on": ("fib50", True), "/c_fib50_off": ("fib50", False),
+                    "/c_fib618_on": ("fib618", True), "/c_fib618_off": ("fib618", False),
                     "/c_fib75_on": ("fib75", True), "/c_fib75_off": ("fib75", False),
                     "/c_closebreak_on": ("close_break", True), "/c_closebreak_off": ("close_break", False),
                     "/c_momentum_on": ("momentum", True), "/c_momentum_off": ("momentum", False),
@@ -4059,8 +4064,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 _apply_c_trigger_state()
                 trigger_names = {
                     "fib25": "MB Fib Retrace 25%", "fib50": "MB Fib Retrace 50%",
-                    "fib75": "MB Fib Retrace 75%", "close_break": "MB Close Break",
-                    "momentum": "MB Momentum Break",
+                    "fib618": "MB Fib Retrace 62%", "fib75": "MB Fib Retrace 75%",
+                    "close_break": "MB Close Break", "momentum": "MB Momentum Break",
                 }
                 active = [trigger_names[k] for k, v in _c_trigger_state.items() if v]
                 await send_reply(
@@ -4160,7 +4165,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 trigger_status = ", ".join(
                     f"{name}={'ON' if _c_trigger_state[key] else 'OFF'}"
                     for key, name in (
-                        ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib75", "Fib75"),
+                        ("fib25", "Fib25"), ("fib50", "Fib50"), ("fib618", "Fib62"), ("fib75", "Fib75"),
                         ("close_break", "CloseBreak"), ("momentum", "Momentum"),
                     )
                 )

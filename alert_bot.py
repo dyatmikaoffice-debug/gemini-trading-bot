@@ -1,14 +1,15 @@
 # A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
 # BASE: alert_bot_exhaustion_guard_v1.py
 # Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
-# MOTHER_BAR_MICRO (Strategy C) is now the only MT5-live strategy as of
-# 2026-09-19; CONTROL_5_9 and EXPERIMENTAL_5_15 are both PAPER only.
-# (Swapped from EXPERIMENTAL=LIVE after B's live forward-test showed a
-# real loss while C's forward-test log showed +0.38 avg R across 44 trades --
-# see the MOTHER BAR C entry-condition analysis. The get-latest-signal MT5
-# bridge follows whichever strategy has execution_mode='LIVE', so this stays
-# correct automatically if swapped again -- just flip the two
-# *_EXECUTION_MODE constants below, nothing else needs to change.)
+# As of 2026-10-01, Strategy C (MOTHER_BAR_MICRO) is the sole MT5-live
+# strategy again; A and B are both PAPER only. Live execution can be
+# switched between A/B/C two ways: (1) in Telegram, /live_a, /live_b, or
+# /live_c on any of the three bots -- persisted, takes effect immediately,
+# no redeploy needed; (2) by editing the *_EXECUTION_MODE constants below,
+# which only set the STARTING default (a persisted Telegram toggle always
+# wins on restart). The get-latest-signal/get-pending-signals MT5 bridge
+# follows whichever strategy currently has execution_mode='LIVE', so either
+# path stays correct automatically -- nothing else needs to change.
 # 
 # CHANGES FROM V8.1:
 # 1. Sped up EMAs from 9/15 to 5/9 for earlier entries on sudden momentum shifts.
@@ -137,12 +138,12 @@ RANGING_REGIME_PCT_THRESHOLD = 0.30
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
 CONTROL_STRATEGY = "CONTROL_MB_V2"  # renamed 2026-09-23: A is now Mother Bar V2 (M1), not EMA 5/9 -- new name keeps its DB rows from mixing with the old harmonic/EMA-5-9 history
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
-CONTROL_EXECUTION_MODE = "LIVE"  # switched 2026-09-23: A is now the sole MT5-live strategy
+CONTROL_EXECUTION_MODE = "PAPER"  # switched 2026-10-01 (your request): C now holds MT5-live, A back to PAPER
 EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # stays PAPER -- B's V3 patch needs more forward-test time before going live
 
 # STRATEGY C: Extreme-frequency M5 impulse/re-entry scalper
 BREAKOUT_STRATEGY = "MOTHER_BAR_MICRO"
-BREAKOUT_EXECUTION_MODE = "PAPER"  # switched 2026-09-23: back to PAPER now that A holds MT5-live
+BREAKOUT_EXECUTION_MODE = "LIVE"  # switched 2026-10-01 (your request): C is now the sole MT5-live strategy
 
 # A/B directional mode:
 # BUY_ONLY is the safe/default replacement for the old dynamic 1H one-direction gate.
@@ -788,6 +789,35 @@ def log_trade_signal(
         logging.error(f"[DATABASE ERROR] Failed to log signal: {e}")
         return None
 
+
+def _strategy_has_open_live_trade(strategy: str) -> bool:
+    """True if `strategy` already has an unresolved LIVE position on the
+    books -- outcome still 'PENDING' or 'WIN (TP1 HIT)' (runner leg still
+    open). Added 2026-10-01 after the live bot opened ~9 XAUUSD positions
+    in under 5 minutes (re-detecting a valid setup on every new candle with
+    no awareness that a prior position hadn't closed) -- more positions
+    than the account could margin/absorb spread+commission on at once.
+    Only ever matters for whichever ONE strategy currently has
+    execution_mode='LIVE'; PAPER strategies are intentionally left free to
+    log overlapping trades for forward-test stats.
+    Relies on update_open_trades() being called every scan cycle to keep
+    'outcome' current -- if the DB is unreachable, fails OPEN (returns
+    False) so a transient DB hiccup doesn't silently halt live trading."""
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM signals
+            WHERE strategy = %s AND execution_mode = 'LIVE' AND status = 'EXECUTED'
+              AND outcome IN ('PENDING', 'WIN (TP1 HIT)')
+        """, (strategy,))
+        n = cur.fetchone()["n"]
+        cur.close(); conn.close()
+        return n > 0
+    except Exception as e:
+        logging.warning(f"[OPEN TRADE GUARD] Check failed, allowing signal through: {e}")
+        return False
 
 def update_open_trades(current_high: float, current_low: float):
     if not DATABASE_URL:
@@ -2687,6 +2717,10 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     if last_price is not None and abs(price - float(last_price)) < EXTREME_MIN_REENTRY_DISTANCE_ATR * atr:
         return
 
+    if BREAKOUT_EXECUTION_MODE == "LIVE" and _strategy_has_open_live_trade(BREAKOUT_STRATEGY):
+        logging.info(f"[MB C] [OPEN TRADE GUARD] Skipping new {trigger} signal -- a live C position is still open.")
+        return
+
     # Deterministic price-action engine -- no LLM veto, same reasoning as
     # before: an AI call per bar would become the bottleneck and defeat
     # the point of an extreme-frequency engine.
@@ -2838,6 +2872,10 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
 
     last_price = _control_mb_state.get("last_entry_price")
     if last_price is not None and abs(price - float(last_price)) < EXTREME_MIN_REENTRY_DISTANCE_ATR * atr:
+        return
+
+    if CONTROL_EXECUTION_MODE == "LIVE" and _strategy_has_open_live_trade(CONTROL_STRATEGY):
+        logging.info(f"[MB A] [OPEN TRADE GUARD] Skipping new {trigger} signal -- a live A position is still open.")
         return
 
     sl, tp1, tp2, risk = _extreme_trade_plan(action, price, atr, df, metrics, trigger, cfg)
@@ -3735,7 +3773,7 @@ async def mt5_market_data(request: Request):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "A/B/C scanner active: A=Mother Bar V2 (M1) LIVE + B=EMA 5/15 PAPER + C=Mother Bar Micro-Breakout PAPER.", "comparison": "/ab-comparison"}
+    return {"status": "ok", "message": f"A/B/C scanner active: A=Mother Bar V2 (M1) {CONTROL_EXECUTION_MODE} + B=EMA 5/15 {EXPERIMENTAL_EXECUTION_MODE} + C=Mother Bar Micro-Breakout {BREAKOUT_EXECUTION_MODE}.", "comparison": "/ab-comparison"}
 
 
 # =====================================================================

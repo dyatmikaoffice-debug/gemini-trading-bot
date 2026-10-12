@@ -1,4 +1,19 @@
 # A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
+# =====================================================================
+# 2026-10-12 REVISION (flip + live A):
+#   * Bot A (Mother Bar V2, M1) is now the LIVE strategy (C -> PAPER).
+#     NOTE: a persisted /live_x choice in bot_settings beats these constants on
+#     restart -- send /live_a once after deploying to be sure.
+#   * SIGNAL FLIP: per entry type, A and C can trade the MIRROR of the signal:
+#     BUY<->SELL, original SL -> new TP1, original TP1 -> new SL, new TP2 =
+#     1.5x the new TP1 distance. See flip_trade_plan(). Flipped rows are logged
+#     with trigger_type "<entry> [FLIP]" so /analyze and /compare keep them
+#     separate from un-flipped history.
+#   * A now has per-entry ON/OFF (/a_<entry>_on|off) like C, plus per-entry
+#     FLIP ON/OFF (/a_flip_<entry>_on|off). C gets /c_flip_<entry>_on|off.
+#   * /compare rewritten (was grouping by strategy+mode and overwriting).
+#   * update_open_trades() no longer checks A's M1 trades against 5-minute bars.
+# =====================================================================
 # BASE: alert_bot_exhaustion_guard_v1.py
 # Shared market data, shared DB, isolated strategy state/results, separate Telegram alerts.
 # As of 2026-10-01, Strategy C (MOTHER_BAR_MICRO) is the sole MT5-live
@@ -138,12 +153,12 @@ RANGING_REGIME_PCT_THRESHOLD = 0.30
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
 CONTROL_STRATEGY = "CONTROL_MB_V2"  # renamed 2026-09-23: A is now Mother Bar V2 (M1), not EMA 5/9 -- new name keeps its DB rows from mixing with the old harmonic/EMA-5-9 history
 EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
-CONTROL_EXECUTION_MODE = "PAPER"  # switched 2026-10-01 (your request): C now holds MT5-live, A back to PAPER
+CONTROL_EXECUTION_MODE = "LIVE"  # switched 2026-10-12 (your request): A (Mother Bar V2) is the live-account bot again
 EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # stays PAPER -- B's V3 patch needs more forward-test time before going live
 
 # STRATEGY C: Extreme-frequency M5 impulse/re-entry scalper
 BREAKOUT_STRATEGY = "MOTHER_BAR_MICRO"
-BREAKOUT_EXECUTION_MODE = "LIVE"  # switched 2026-10-01 (your request): C is now the sole MT5-live strategy
+BREAKOUT_EXECUTION_MODE = "PAPER"  # switched 2026-10-12 (your request): C back to PAPER, A is live
 
 # A/B directional mode:
 # BUY_ONLY is the safe/default replacement for the old dynamic 1H one-direction gate.
@@ -819,16 +834,27 @@ def _strategy_has_open_live_trade(strategy: str) -> bool:
         logging.warning(f"[OPEN TRADE GUARD] Check failed, allowing signal through: {e}")
         return False
 
-def update_open_trades(current_high: float, current_low: float):
+def update_open_trades(current_high: float, current_low: float, only_strategies=None, exclude_strategies=None):
+    """only_strategies / exclude_strategies (added 2026-10-12): A's trades open on M1 closes
+    but this function used to be called every 5 minutes with the *M5* bar's high/low for ALL
+    open trades -- that bar includes minutes BEFORE A's entry, so it could stop out (or TP1)
+    an A trade on price action that happened before the trade existed (SL is tested first,
+    so the bias is toward losses). Now the M1 loop only settles A, the M5 loop settles the rest."""
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
+        _q = """
             SELECT * FROM signals
             WHERE status = 'EXECUTED' AND (outcome = 'PENDING' OR outcome = 'WIN (TP1 HIT)')
-        """)
+        """
+        _p = []
+        if only_strategies:
+            _q += " AND strategy = ANY(%s)"; _p.append(list(only_strategies))
+        if exclude_strategies:
+            _q += " AND COALESCE(strategy, '') <> ALL(%s)"; _p.append(list(exclude_strategies))
+        cursor.execute(_q, _p)
         open_trades = cursor.fetchall()
 
         if not open_trades:
@@ -2281,6 +2307,108 @@ def _apply_c_trigger_state():
         lvl for key, lvl in _C_FIB_LEVELS.items() if _c_trigger_state[key]
     )
 
+# =====================================================================
+# SIGNAL FLIP (2026-10-12)
+# Mirror trade at the SAME entry price:
+#   action        BUY <-> SELL
+#   new SL        = original TP1 level (FLIP_SL_SOURCE="TP1"; "TP2" is supported but puts the stop very far away)
+#   new TP1       = original SL level  (same distance from entry as the original risk)
+#   new TP2       = FLIP_TP2_MULT_OF_TP1 x new TP1 distance from entry (1.5x)
+# Everything downstream (MT5 bridge, update_open_trades, /analyze) just sees a normal
+# signal row, so no other code needs to know about flipping.
+# =====================================================================
+FLIP_TP2_MULT_OF_TP1 = 1.5
+FLIP_SL_SOURCE = "TP1"       # "TP1" (default) or "TP2"
+FLIP_MIN_SL_DIST = 0.30      # skip a flip whose new stop would sit inside normal XAUUSD spread/noise (price units)
+FLIP_TAG = " [FLIP]"
+
+_FLIP_ENTRY_KEYS = ("fib25", "fib50", "fib618", "fib75", "close_break", "momentum")
+_FLIP_LABELS = {"fib25": "Fib 25%", "fib50": "Fib 50%", "fib618": "Fib 62%", "fib75": "Fib 75%",
+                "close_break": "Close Break", "momentum": "Momentum Break"}
+# Defaults follow the forward-test sample: flip everything that is net-negative, leave the one
+# profitable entry (Fib 25% on A; Fib 25% + Close Break on C) alone.
+_a_flip_state = {"fib25": False, "fib50": True, "fib618": True, "fib75": True, "close_break": True, "momentum": True}
+_c_flip_state = {"fib25": False, "fib50": True, "fib618": True, "fib75": True, "close_break": False, "momentum": True}
+_a_trigger_state = {k: True for k in _FLIP_ENTRY_KEYS}   # A per-entry ON/OFF (C has _c_trigger_state)
+
+def _apply_a_trigger_state():
+    """Same idea as _apply_c_trigger_state, for MB_CONFIG_A_V2 (A used to always run all 6)."""
+    MB_CONFIG_A_V2["momentum_break_enabled"] = _a_trigger_state["momentum"]
+    MB_CONFIG_A_V2["close_break_enabled"] = _a_trigger_state["close_break"]
+    MB_CONFIG_A_V2["retrace_levels"] = tuple(
+        lvl for key, lvl in _C_FIB_LEVELS.items() if _a_trigger_state[key]
+    )
+
+def _trigger_key(trigger: str):
+    t = str(trigger or "")
+    if t.startswith("MB Momentum"): return "momentum"
+    if t.startswith("MB Close"): return "close_break"
+    m = re.match(r"MB Fib Retrace (\d+)%", t)
+    if m:
+        return {"25": "fib25", "50": "fib50", "62": "fib618", "75": "fib75"}.get(m.group(1))
+    return None
+
+def _opposite(action: str) -> str:
+    return "SELL" if str(action).upper() == "BUY" else "BUY"
+
+def flip_trade_plan(action: str, entry: float, sl: float, tp1: float, tp2: float, max_risk: float = None):
+    """Returns (new_action, new_sl, new_tp1, new_tp2, new_risk) or None if the flip is not tradeable
+    (degenerate geometry, new stop tighter than FLIP_MIN_SL_DIST, or wider than max_risk)."""
+    orig_risk = abs(entry - sl)
+    if orig_risk <= 0:
+        return None
+    new_action = _opposite(action)
+    new_sl = float(tp2 if FLIP_SL_SOURCE == "TP2" else tp1)
+    new_risk = abs(new_sl - entry)
+    if new_risk < FLIP_MIN_SL_DIST:
+        return None
+    if max_risk is not None and new_risk > max_risk:
+        return None
+    if new_action == "SELL":
+        if new_sl <= entry: return None
+        new_tp1 = entry - orig_risk
+        new_tp2 = entry - FLIP_TP2_MULT_OF_TP1 * orig_risk
+    else:
+        if new_sl >= entry: return None
+        new_tp1 = entry + orig_risk
+        new_tp2 = entry + FLIP_TP2_MULT_OF_TP1 * orig_risk
+    return new_action, new_sl, new_tp1, new_tp2, new_risk
+
+# Telegram command surface for the toggles (names match C's existing /c_closebreak_* style)
+_FLIP_CMD_KEYS = ("fib25", "fib50", "fib618", "fib75", "closebreak", "momentum")
+A_ENTRY_COMMANDS = {f"/a_{k}_{s}" for k in _FLIP_CMD_KEYS for s in ("on", "off")}
+A_FLIP_COMMANDS = {f"/a_flip_{k}_{s}" for k in _FLIP_CMD_KEYS for s in ("on", "off")} | {"/a_flip_status"}
+C_FLIP_COMMANDS = {f"/c_flip_{k}_{s}" for k in _FLIP_CMD_KEYS for s in ("on", "off")} | {"/c_flip_status"}
+
+def _flip_menu(bot: str) -> list:
+    """Entries for Telegram's setMyCommands menu ('a' or 'c')."""
+    names = {"fib25": "Fib 25%", "fib50": "Fib 50%", "fib618": "Fib 62%", "fib75": "Fib 75%",
+             "closebreak": "Close Break", "momentum": "Momentum Break"}
+    out = [{"command": f"{bot}_flip_status", "description": f"{bot.upper()}: entry + flip ON/OFF status"},
+           {"command": "compare", "description": "Compare Mother Bar A vs EMA B vs C"}]
+    for k in _FLIP_CMD_KEYS:
+        for sfx in ("on", "off"):
+            out.append({"command": f"{bot}_flip_{k}_{sfx}", "description": f"{bot.upper()}: flip {names[k]} {sfx.upper()}"})
+    if bot == "a":
+        for k in _FLIP_CMD_KEYS:
+            for sfx in ("on", "off"):
+                out.append({"command": f"a_{k}_{sfx}", "description": f"A: {names[k]} entry {sfx.upper()}"})
+    return out
+
+def entry_flip_status_text(bot: str, header_note: str = "") -> str:
+    entry = _a_trigger_state if bot == "a" else _c_trigger_state
+    flip = _a_flip_state if bot == "a" else _c_flip_state
+    lines = [f"\U0001f504 *BOT {bot.upper()} -- ENTRY & FLIP STATUS*"]
+    if header_note:
+        lines.append(header_note)
+    lines.append("")
+    for k in _FLIP_ENTRY_KEYS:
+        lines.append(f"\u2022 {_FLIP_LABELS[k]}: entry *{'ON' if entry[k] else 'OFF'}* | flip *{'ON' if flip[k] else 'OFF'}*")
+    lines.append("")
+    lines.append(f"Flip = BUY\u2194SELL, SL = original {FLIP_SL_SOURCE}, TP1 = original SL, TP2 = {FLIP_TP2_MULT_OF_TP1:.1f}x TP1 distance. "
+                 f"Flips with a new stop under ${FLIP_MIN_SL_DIST:.2f} are skipped.")
+    return "\n".join(lines)
+
 # Free/no-payment M1 data path for Bot A: prefer bars pushed by your own MT5
 # EA (zero API cost, no rate limit -- see /mt5-market-data below); Twelve
 # Data 1min is only a fallback, and is capped separately from the shared
@@ -2698,9 +2826,11 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     action, trigger, metrics = detect_extreme_m5_signal(df)
     if action == "HOLD":
         return
-    if EXTREME_DIRECTION_MODE == "BUY_ONLY" and action == "SELL":
+    c_flip_on = _c_flip_state.get(_trigger_key(trigger), False)
+    c_final_dir = _opposite(action) if c_flip_on else action
+    if EXTREME_DIRECTION_MODE == "BUY_ONLY" and c_final_dir == "SELL":
         return
-    if EXTREME_DIRECTION_MODE == "SELL_ONLY" and action == "BUY":
+    if EXTREME_DIRECTION_MODE == "SELL_ONLY" and c_final_dir == "BUY":
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -2726,6 +2856,17 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
     # the point of an extreme-frequency engine.
     sl, tp1, tp2, risk = _extreme_trade_plan(action, price, atr, df, metrics, trigger)
 
+    orig_action, orig_sl, orig_tp1, orig_tp2 = action, sl, tp1, tp2
+    flipped = False
+    if c_flip_on:
+        fp = flip_trade_plan(action, price, sl, tp1, tp2, max_risk=MB_MAX_RISK_PRICE)
+        if fp is None:
+            logging.info(f"[MB C] [FLIP SKIP] {trigger}: flipped stop outside [{FLIP_MIN_SL_DIST:.2f}, {MB_MAX_RISK_PRICE:.2f}] -- skipped.")
+            return
+        action, sl, tp1, tp2, risk = fp
+        flipped = True
+    trigger_db = trigger + FLIP_TAG if flipped else trigger
+
     if not DATABASE_URL:
         return
 
@@ -2740,6 +2881,8 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             f"inside_bars={metrics.get('inside_bars', 0)}, mb_age={metrics.get('mb_age_bars', 0)} bars, "
             f"ATR={atr:.3f}, ADX={adx_val:.1f}, {gate_label}, data={source}."
         )
+        if flipped:
+            reasoning = (f"FLIPPED from {orig_action} (orig SL {orig_sl:.2f} / TP1 {orig_tp1:.2f} / TP2 {orig_tp2:.2f}); ") + reasoning
         cur.execute("""
             INSERT INTO signals (
                 timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,
@@ -2763,7 +2906,7 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             # used to be hardcoded 'None' -- now holds the ADX gate's shadow
             # verdict (ALLOW/BLOCK + zone) so a future /analyze breakdown can
             # compare shadow-gated vs actual outcomes without parsing `reasoning`.
-            action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
+            action, trigger_db, price, price, sl, sl, tp1, tp1, tp2, tp2,
             0.90, adx_val, gate_label, reasoning, None, adx_val, source, BREAKOUT_STRATEGY, BREAKOUT_EXECUTION_MODE
         ))
         row = cur.fetchone(); sid = int(row["id"]) if row else None
@@ -2780,12 +2923,16 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             (MB_MOMENTUM_BREAK_TP1_MULT, MB_MOMENTUM_BREAK_TP2_MULT)
             if trigger == "MB Momentum Break" else (MB_TP1_MULT, MB_TP2_MULT)
         )
+        c_sl_note = "= original TP1" if flipped else "opp. MB extreme"
+        c_tp1_note = "= original SL" if flipped else f"{tp1_mult:.1f}x MB range"
+        c_tp2_note = f"{FLIP_TP2_MULT_OF_TP1:.1f}x TP1" if flipped else f"{tp2_mult:.1f}x MB range"
+        c_flip_line = f"\U0001f504 FLIPPED from {orig_action}\n" if flipped else ""
         await send_telegram_alert(
             client,
             f"⚡ *MOTHER BAR C {BREAKOUT_STRATEGY} {mode_tag} SIGNAL #{sid}*\n\n"
-            f"Asset: *XAU/USD*\nAction: *{action}*\nTrigger: *{trigger}*\n"
-            f"Entry: *${price:.2f}*\nSL: *${sl:.2f}* (opp. MB extreme, {risk:.3f} risk)\n"
-            f"TP1: *${tp1:.2f}* ({tp1_mult:.1f}x MB range)\nTP2: *${tp2:.2f}* ({tp2_mult:.1f}x MB range)\n"
+            f"Asset: *XAU/USD*\nAction: *{action}*\nTrigger: *{trigger_db}*\n{c_flip_line}"
+            f"Entry: *${price:.2f}*\nSL: *${sl:.2f}* ({c_sl_note}, {risk:.3f} risk)\n"
+            f"TP1: *${tp1:.2f}* ({c_tp1_note})\nTP2: *${tp2:.2f}* ({c_tp2_note})\n"
             f"MB range: *{metrics.get('mb_range', 0):.3f}* | Inside bars: *{metrics.get('inside_bars', 0)}* | "
             f"MB age: *{metrics.get('mb_age_bars', 0)} bars*\n"
             f"ATR: *{atr:.3f}* | ADX: *{metrics.get('adx', 0):.1f}* "
@@ -2855,9 +3002,12 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
     action, trigger, metrics = detect_extreme_m5_signal(df, cfg)  # name kept generic; works on any timeframe fed in
     if action == "HOLD":
         return
-    if CONTROL_DIRECTION_MODE == "BUY_ONLY" and action == "SELL":
+    # Direction mode applies to the direction that will actually be TRADED (after any flip).
+    flip_on = _a_flip_state.get(_trigger_key(trigger), False)
+    final_dir = _opposite(action) if flip_on else action
+    if CONTROL_DIRECTION_MODE == "BUY_ONLY" and final_dir == "SELL":
         return
-    if CONTROL_DIRECTION_MODE == "SELL_ONLY" and action == "BUY":
+    if CONTROL_DIRECTION_MODE == "SELL_ONLY" and final_dir == "BUY":
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -2886,6 +3036,19 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
         logging.info(f"[MB A] [RISK REJECT] {trigger} risk too large vs ceiling ${reject_ceiling:.2f} -- skipped.")
         return
 
+    orig_action, orig_sl, orig_tp1, orig_tp2 = action, sl, tp1, tp2
+    flipped = False
+    if flip_on:
+        # Flipped stop (= original TP1 distance) must pass the same ceiling A applies to every stop.
+        flip_ceiling = max(cfg["reject_risk_floor"], cfg["reject_risk_atr_mult"] * atr)
+        fp = flip_trade_plan(action, price, sl, tp1, tp2, max_risk=flip_ceiling)
+        if fp is None:
+            logging.info(f"[MB A] [FLIP SKIP] {trigger}: flipped stop outside [{FLIP_MIN_SL_DIST:.2f}, {flip_ceiling:.2f}] -- skipped.")
+            return
+        action, sl, tp1, tp2, risk = fp
+        flipped = True
+    trigger_db = trigger + FLIP_TAG if flipped else trigger
+
     if not DATABASE_URL:
         return
 
@@ -2900,6 +3063,8 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             f"inside_bars={metrics.get('inside_bars', 0)}, mb_age={metrics.get('mb_age_bars', 0)} bars, "
             f"ATR={atr:.3f}, ADX={adx_val:.1f}, {gate_label}, data={source}, risk=${risk:.2f}."
         )
+        if flipped:
+            reasoning = (f"FLIPPED from {orig_action} (orig SL {orig_sl:.2f} / TP1 {orig_tp1:.2f} / TP2 {orig_tp2:.2f}); ") + reasoning
         cur.execute("""
             INSERT INTO signals (
                 timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,
@@ -2912,7 +3077,7 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             RETURNING id
         """, (
             (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
-            action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
+            action, trigger_db, price, price, sl, sl, tp1, tp1, tp2, tp2,
             0.90, adx_val, gate_label, reasoning, None, adx_val, source, CONTROL_STRATEGY, CONTROL_EXECUTION_MODE
         ))
         row = cur.fetchone(); sid = int(row["id"]) if row else None
@@ -2928,12 +3093,15 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             (cfg["momentum_tp1_mult"], cfg["momentum_tp2_mult"])
             if trigger == "MB Momentum Break" else (cfg["tp1_mult"], cfg["tp2_mult"])
         )
+        tp1_note = "= original SL" if flipped else f"{tp1_mult:.2f}x MB range"
+        tp2_note = f"{FLIP_TP2_MULT_OF_TP1:.1f}x TP1" if flipped else f"{tp2_mult:.2f}x MB range"
+        flip_line = f"\U0001f504 FLIPPED from {orig_action} (orig SL {orig_sl:.2f} / TP1 {orig_tp1:.2f})\n" if flipped else ""
         await send_telegram_alert(
             client,
             f"🅰️ *MOTHER BAR A-V2 {CONTROL_STRATEGY} {mode_tag} SIGNAL #{sid}*\n\n"
-            f"Asset: *XAU/USD* (M1)\nAction: *{action}*\nTrigger: *{trigger}*\n"
+            f"Asset: *XAU/USD* (M1)\nAction: *{action}*\nTrigger: *{trigger_db}*\n{flip_line}"
             f"Entry: *${price:.2f}*\nSL: *${sl:.2f}* (risk ${risk:.2f})\n"
-            f"TP1: *${tp1:.2f}* ({tp1_mult:.2f}x MB range)\nTP2: *${tp2:.2f}* ({tp2_mult:.2f}x MB range)\n"
+            f"TP1: *${tp1:.2f}* ({tp1_note})\nTP2: *${tp2:.2f}* ({tp2_note})\n"
             f"MB range: *{metrics.get('mb_range', 0):.3f}* | Inside bars: *{metrics.get('inside_bars', 0)}* | "
             f"MB age: *{metrics.get('mb_age_bars', 0)} bars*\n"
             f"ATR: *{atr:.3f}* | ADX: *{metrics.get('adx', 0):.1f}*\n"
@@ -3504,7 +3672,7 @@ async def background_scanning_loop():
                     try:
                         df_m1, source_m1 = await get_m1_dataframe(client, now_wib)
                         if df_m1 is not None:
-                            update_open_trades(float(df_m1["high"].iloc[-1]), float(df_m1["low"].iloc[-1]))
+                            update_open_trades(float(df_m1["high"].iloc[-1]), float(df_m1["low"].iloc[-1]), only_strategies=(CONTROL_STRATEGY,))
                             await evaluate_control_mb_strategy(client, now_wib, df_m1, source_m1)
                     except Exception as e:
                         logging.error(f"[MB A LOOP ERROR] {e}")
@@ -3542,7 +3710,7 @@ async def background_scanning_loop():
 
                 curr_high = float(df_5m["high"].iloc[-1])
                 curr_low = float(df_5m["low"].iloc[-1])
-                update_open_trades(curr_high, curr_low)
+                update_open_trades(curr_high, curr_low, exclude_strategies=(CONTROL_STRATEGY,))
 
                 # Build the 15M confluence frame LOCALLY from the shared 5M
                 # snapshot. This removes a second Twelve Data feed entirely.
@@ -3644,6 +3812,12 @@ async def lifespan(app: FastAPI):
         _c_trigger_state[_key] = get_setting(f"c_trigger_{_key}", "on" if _c_trigger_state[_key] else "off") == "on"
     _apply_c_trigger_state()
     logging.info(f"[SETTINGS] Restored Bot C trigger toggles -- {_c_trigger_state}")
+    for _key in _FLIP_ENTRY_KEYS:
+        _a_trigger_state[_key] = get_setting(f"a_entry_{_key}", "on" if _a_trigger_state[_key] else "off") == "on"
+        _a_flip_state[_key] = get_setting(f"a_flip_{_key}", "on" if _a_flip_state[_key] else "off") == "on"
+        _c_flip_state[_key] = get_setting(f"c_flip_{_key}", "on" if _c_flip_state[_key] else "off") == "on"
+    _apply_a_trigger_state()
+    logging.info(f"[SETTINGS] Restored A entries {_a_trigger_state} | A flips {_a_flip_state} | C flips {_c_flip_state}")
     if not EXPERIMENTAL_TELEGRAM_BOT_TOKEN or not EXPERIMENTAL_TELEGRAM_CHAT_ID:
         logging.warning("[A/B] Experimental Telegram credentials are not configured; experimental signals will still be logged to DB but Telegram alerts will be skipped.")
     if APP_URL:
@@ -3671,7 +3845,7 @@ async def lifespan(app: FastAPI):
                         {"command":"live_a","description":"Send A's signals to live MT5"},
                         {"command":"live_b","description":"Send B's signals to live MT5"},
                         {"command":"live_c","description":"Send C's signals to live MT5"}
-                    ]})
+                    ] + _flip_menu("a")})
                 if EXPERIMENTAL_TELEGRAM_BOT_TOKEN:
                     webhook_b = f"{APP_URL.rstrip('/')}/telegram-webhook-b"
                     set_b = f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setWebhook"
@@ -3724,7 +3898,7 @@ async def lifespan(app: FastAPI):
                         {"command":"live_a","description":"Send A's signals to live MT5"},
                         {"command":"live_b","description":"Send B's signals to live MT5"},
                         {"command":"live_c","description":"Send C's signals to live MT5"}
-                    ]})
+                    ] + _flip_menu("c")})
         except Exception as e:
             logging.error(f"[AUTO WEBHOOK SETUP ERROR] Failed: {e}")
 
@@ -3890,41 +4064,136 @@ async def get_pending_signals(since_id: int = 0, limit: int = 20):
 # =====================================================================
 # A/B COMPARISON ENDPOINT (READ-ONLY)
 # =====================================================================
+def compute_strategy_comparison() -> dict:
+    """Shared by /compare (Telegram) and /ab-comparison (HTTP). FIXED 2026-10-12:
+      * the old query did GROUP BY strategy, execution_mode and then stored results in a dict
+        keyed by strategy alone -- so a strategy that ran both PAPER and LIVE (A, B and C all
+        did) showed only whichever mode group came last, while its profit-factor and streak
+        figures (separate queries) covered ALL rows. Every block mixed two different samples.
+      * win rate divided by ALL executed rows including still-open trades, understating it.
+      * 'WIN (TP1 HIT)' (runner still open) was counted as a finished win.
+      * the streak counter treated open trades as wins, silently resetting loss streaks.
+    Now: one aggregate per strategy over CLOSED trades only (LOSS / WIN (TP2...) / CLOSED...),
+    with the LIVE/PAPER and flipped/normal splits shown separately."""
+    strategies = (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY)
+    closed = "(outcome LIKE 'LOSS%%' OR outcome LIKE 'WIN (TP2%%' OR outcome LIKE 'CLOSED%%')"
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute(f"""
+        SELECT strategy,
+               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
+               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
+               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome IN ('PENDING','WIN (TP1 HIT)')) AS open_n,
+               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
+               COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN (TP2%%' OR outcome LIKE 'CLOSED%%')) AS wins,
+               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND {closed}),0) AS net_pips,
+               COALESCE(SUM(result_usd)  FILTER (WHERE status='EXECUTED' AND {closed}),0) AS net_usd,
+               COALESCE(SUM(result_r)    FILTER (WHERE status='EXECUTED' AND {closed}),0) AS total_r,
+               COALESCE(AVG(result_r)    FILTER (WHERE status='EXECUTED' AND {closed}),0) AS avg_r,
+               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND {closed} AND result_pips > 0),0) AS gross_win,
+               COALESCE(SUM(-result_pips) FILTER (WHERE status='EXECUTED' AND {closed} AND result_pips < 0),0) AS gross_loss
+        FROM signals WHERE strategy IN %s GROUP BY strategy
+    """, (strategies,))
+    rows = cur.fetchall()
+    out = {}
+    for r in rows:
+        wins = int(r["wins"] or 0); losses = int(r["losses"] or 0); n_closed = wins + losses
+        gw = float(r["gross_win"] or 0); gl = float(r["gross_loss"] or 0)
+        out[str(r["strategy"])] = {
+            "executed": int(r["executed"] or 0), "vetoed": int(r["vetoed"] or 0), "open": int(r["open_n"] or 0),
+            "closed": n_closed, "wins": wins, "losses": losses,
+            "wr": (wins / n_closed * 100) if n_closed else 0.0,
+            "pips": float(r["net_pips"] or 0), "usd": float(r["net_usd"] or 0),
+            "total_r": float(r["total_r"] or 0), "avg_r": float(r["avg_r"] or 0),
+            "pf": (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0),
+            "split": {}, "max_loss_streak": 0, "cur_loss_streak": 0,
+        }
+    cur.execute(f"""
+        SELECT strategy, execution_mode,
+               (RIGHT(COALESCE(trigger_type,''), 6) = '[FLIP]') AS is_flip,
+               COUNT(*) AS n, COALESCE(SUM(result_usd),0) AS usd
+        FROM signals WHERE status='EXECUTED' AND {closed} AND strategy IN %s
+        GROUP BY 1,2,3
+    """, (strategies,))
+    for r in cur.fetchall():
+        d = out.get(str(r["strategy"]))
+        if d is None: continue
+        d["split"][(str(r["execution_mode"]), bool(r["is_flip"]))] = (int(r["n"]), float(r["usd"] or 0))
+    for strat in strategies:
+        d = out.get(strat)
+        if d is None: continue
+        cur.execute(f"SELECT outcome FROM signals WHERE status='EXECUTED' AND strategy=%s AND {closed} ORDER BY id ASC", (strat,))
+        streak = best = 0
+        for rr in cur.fetchall():
+            if str(rr["outcome"]).startswith("LOSS"):
+                streak += 1; best = max(best, streak)
+            else:
+                streak = 0
+        d["max_loss_streak"], d["cur_loss_streak"] = best, streak
+    cur.close(); conn.close()
+    return out
+
+def format_compare_reply(stats: dict) -> str:
+    a = stats.get(CONTROL_STRATEGY, {}); b = stats.get(EXPERIMENTAL_STRATEGY, {}); c = stats.get(BREAKOUT_STRATEGY, {})
+    mode_now = {CONTROL_STRATEGY: CONTROL_EXECUTION_MODE, EXPERIMENTAL_STRATEGY: EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_STRATEGY: BREAKOUT_EXECUTION_MODE}
+
+    def block(strat, d):
+        if not d or not d.get("executed"):
+            return "No data yet."
+        pf = d["pf"]; pf_txt = "inf" if pf == float("inf") else f"{pf:.2f}"
+        mode_lines = []
+        for mode in ("LIVE", "PAPER"):
+            n = sum(v[0] for k, v in d["split"].items() if k[0] == mode)
+            u = sum(v[1] for k, v in d["split"].items() if k[0] == mode)
+            if n: mode_lines.append(f"{mode} n={n} ${u:+.2f}")
+        fl_n = sum(v[0] for k, v in d["split"].items() if k[1]); fl_u = sum(v[1] for k, v in d["split"].items() if k[1])
+        nm_n = sum(v[0] for k, v in d["split"].items() if not k[1]); nm_u = sum(v[1] for k, v in d["split"].items() if not k[1])
+        lines = [
+            f"\u2022 Closed: *{d['closed']}* (W {d['wins']} / L {d['losses']}) | Open: *{d['open']}* | Vetoed: *{d['vetoed']}*",
+            f"\u2022 Win Rate (closed only): *{d['wr']:.1f}%*",
+            f"\u2022 Net Pips: *{d['pips']:+.1f}* | Net USD: *${d['usd']:+.2f}*",
+            f"\u2022 Total R: *{d['total_r']:+.2f}R* | Avg R: *{d['avg_r']:+.3f}R*",
+            f"\u2022 Profit Factor: *{pf_txt}*",
+            f"\u2022 Loss streak: max *{d['max_loss_streak']}* | current *{d['cur_loss_streak']}*",
+        ]
+        if mode_lines: lines.append("\u2022 By mode: " + " | ".join(mode_lines))
+        if fl_n: lines.append(f"\u2022 Flipped: n={fl_n} ${fl_u:+.2f} | Normal: n={nm_n} ${nm_u:+.2f}")
+        return "\n".join(lines)
+
+    candidates = [(lbl, d.get("usd", 0.0)) for lbl, d in (
+        ("\U0001f534 Mother Bar A (M1)", a), ("\U0001f535 EMA 5/15 (B)", b), ("\u26a1 Mother Bar Micro (C)", c)) if d.get("closed")]
+    if candidates:
+        best_label, best_usd = max(candidates, key=lambda x: x[1])
+        leader = best_label if sum(1 for _, v in candidates if v == best_usd) == 1 else "\U0001f91d Tied"
+    else:
+        leader = "Not enough data"
+    return (
+        "\U0001f52c *A/B/C STRATEGY DASHBOARD*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "XAU/USD \u2022 all-time, CLOSED trades only \u2022 2x0.01-lot accounting for all three\n\n"
+        f"\U0001f534 *A \u2014 MOTHER BAR V2 (M1)* \u2014 now *{mode_now[CONTROL_STRATEGY]}*\n{block(CONTROL_STRATEGY, a)}\n\n"
+        f"\U0001f535 *B \u2014 EMA 5/15* \u2014 now *{mode_now[EXPERIMENTAL_STRATEGY]}*\n{block(EXPERIMENTAL_STRATEGY, b)}\n\n"
+        f"\u26a1 *C \u2014 MOTHER BAR MICRO* \u2014 now *{mode_now[BREAKOUT_STRATEGY]}*\n{block(BREAKOUT_STRATEGY, c)}\n\n"
+        f"\U0001f3c6 *LEADER (net USD):* {leader}\n"
+        "\n_Samples differ in size and period; leader is by net USD, not total R._"
+    )
+
 @app.get("/ab-comparison")
 async def ab_comparison():
     if not DATABASE_URL:
         return {"error": "DATABASE_URL not set"}
     try:
-        conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("""
-            SELECT strategy, execution_mode,
-                   COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
-                   COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
-                   COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
-                   COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
-                   COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
-                   COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
-            FROM signals
-            WHERE strategy IN (%s, %s, %s)
-            GROUP BY strategy, execution_mode
-            ORDER BY strategy;
-        """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
-        rows=cur.fetchall(); cur.close(); conn.close()
-        result={}
-        for r in rows:
-            executed=int(r["executed"] or 0); wins=int(r["wins"] or 0)
-            result[str(r["strategy"])] = {
-                "execution_mode": r["execution_mode"], "executed": executed,
-                "vetoed": int(r["vetoed"] or 0), "wins": wins,
-                "losses": int(r["losses"] or 0), "pending": int(r["pending"] or 0),
-                "win_rate_pct": round((wins/executed*100) if executed else 0, 2),
-                "net_pips": round(float(r["net_pips"] or 0), 2),
-                "net_usd": round(float(r["net_usd"] or 0), 2),
-                "avg_r": round(float(r["avg_r"] or 0), 3),
+        stats = compute_strategy_comparison()
+        def clean(d):
+            if not d: return {}
+            return {
+                "execution_mode_now": None, "executed": d["executed"], "closed": d["closed"], "open": d["open"], "vetoed": d["vetoed"],
+                "wins": d["wins"], "losses": d["losses"], "win_rate_pct": round(d["wr"], 2),
+                "net_pips": round(d["pips"], 2), "net_usd": round(d["usd"], 2), "avg_r": round(d["avg_r"], 3),
+                "profit_factor": None if d["pf"] == float("inf") else round(d["pf"], 3),
+                "max_loss_streak": d["max_loss_streak"],
+                "split": {f"{m}{'_FLIP' if f else ''}": {"n": v[0], "usd": round(v[1], 2)} for (m, f), v in d["split"].items()},
             }
-        return {"control": result.get(CONTROL_STRATEGY, {}), "experimental": result.get(EXPERIMENTAL_STRATEGY, {}), "breakout": result.get(BREAKOUT_STRATEGY, {})}
+        return {"control": clean(stats.get(CONTROL_STRATEGY)), "experimental": clean(stats.get(EXPERIMENTAL_STRATEGY)), "breakout": clean(stats.get(BREAKOUT_STRATEGY))}
     except Exception as e:
         logging.error(f"[A/B COMPARISON ERROR] {e}")
         return {"error": str(e)}
@@ -3943,9 +4212,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
-        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
         EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare"} | C_FLIP_COMMANDS
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -3986,6 +4255,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/c_fib75_on` / `/c_fib75_off` - Toggle the Fib Retrace 75% entry\n"
                         "• `/c_closebreak_on` / `/c_closebreak_off` - Toggle the Close Break entry\n"
                         "• `/c_momentum_on` / `/c_momentum_off` - Toggle the Momentum Break entry\n"
+                        "• `/c_flip_status` - Per-entry ON/OFF + FLIP status\n"
+                        "• `/c_flip_<entry>_on` / `_off` - Flip an entry (fib25, fib50, fib618, fib75, closebreak, momentum)\n"
+                        "• `/compare` - A vs B vs C dashboard\n"
                         "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
                         "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
                         "• `/help` - Display this menu\n\n"
@@ -4017,6 +4289,10 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/pips` - Gross/net pips & USD breakdown\n"
                         "• `/logs` - Last 10 executed trades\n"
                         "• `/analyze` - Forward-test strategy analysis\n"
+                        "• `/compare` - A vs B vs C dashboard (closed trades only)\n"
+                        "• `/a_flip_status` - Per-entry ON/OFF + FLIP status\n"
+                        "• `/a_<entry>_on` / `_off` - Entry ON/OFF (fib25, fib50, fib618, fib75, closebreak, momentum)\n"
+                        "• `/a_flip_<entry>_on` / `_off` - Flip that entry (BUY\u2194SELL, SL\u2194TP1, TP2 = 1.5x TP1)\n"
                         "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live execution)\n"
                         "• `/resume` - 🟢 Re-enable auto-trading\n"
                          "• `/oneway_on` - Dynamic 1H direction ON\n"
@@ -4110,6 +4386,31 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     f"⚡ *{trigger_names[key]}* is now *{'ON' if turn_on else 'OFF'}* for Strategy C.\n\n"
                     f"Active triggers: {', '.join(active) if active else '_none -- C will never fire until at least one is on_'}"
                 )
+
+            elif raw_text in ("/a_flip_status", "/c_flip_status") and bot_role == ("control" if raw_text.startswith("/a") else "breakout"):
+                await send_reply(entry_flip_status_text("a" if raw_text.startswith("/a") else "c"))
+
+            elif (_tm := re.fullmatch(r"/(a|c)_(flip_)?(fib25|fib50|fib618|fib75|closebreak|momentum)_(on|off)", raw_text)) and (
+                (_tm.group(1) == "a" and bot_role == "control") or (_tm.group(1) == "c" and _tm.group(2) and bot_role == "breakout")
+            ):
+                _bot, _is_flip, _ckey, _on = _tm.group(1), bool(_tm.group(2)), _tm.group(3), _tm.group(4) == "on"
+                _key = "close_break" if _ckey == "closebreak" else _ckey
+                if _bot == "a":
+                    if _is_flip:
+                        _a_flip_state[_key] = _on
+                        set_setting(f"a_flip_{_key}", "on" if _on else "off")
+                    else:
+                        _a_trigger_state[_key] = _on
+                        set_setting(f"a_entry_{_key}", "on" if _on else "off")
+                        _apply_a_trigger_state()
+                else:
+                    _c_flip_state[_key] = _on
+                    set_setting(f"c_flip_{_key}", "on" if _on else "off")
+                _what = "FLIP" if _is_flip else "ENTRY"
+                _note = f"\u2699\ufe0f *{_FLIP_LABELS[_key]}* {_what} is now *{'ON' if _on else 'OFF'}* for Strategy {_bot.upper()}."
+                if _bot == "c" and _is_flip and _key == "momentum" and _on and not _c_trigger_state["momentum"]:
+                    _note += "\n\u26a0\ufe0f C's Momentum Break ENTRY is OFF, so nothing will fire or flip until you send /c_momentum_on."
+                await send_reply(entry_flip_status_text(_bot, _note))
 
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:
@@ -4520,104 +4821,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
 
-            elif bot_role == "experimental" and raw_text == "/compare":
+            elif raw_text == "/compare":
                 try:
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("""
-                        SELECT strategy, execution_mode,
-                               COUNT(*) FILTER (WHERE status='EXECUTED') AS executed,
-                               COUNT(*) FILTER (WHERE status='VETOED') AS vetoed,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND (outcome LIKE 'WIN%%' OR outcome LIKE 'CLOSED%%')) AS wins,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome LIKE 'LOSS%%') AS losses,
-                               COUNT(*) FILTER (WHERE status='EXECUTED' AND outcome='PENDING') AS pending,
-                               COALESCE(SUM(result_pips) FILTER (WHERE status='EXECUTED' AND result_pips IS NOT NULL),0) AS net_pips,
-                               COALESCE(SUM(result_usd) FILTER (WHERE status='EXECUTED' AND result_usd IS NOT NULL),0) AS net_usd,
-                               COALESCE(SUM(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS total_r,
-                               COALESCE(AVG(result_r) FILTER (WHERE status='EXECUTED' AND result_r IS NOT NULL),0) AS avg_r
-                        FROM signals
-                        WHERE strategy IN (%s, %s, %s)
-                        GROUP BY strategy, execution_mode
-                        ORDER BY strategy;
-                    """, (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY))
-                    rows = cur.fetchall()
-                    stats = {}
-                    for r in rows:
-                        executed = int(r["executed"] or 0); wins = int(r["wins"] or 0); losses = int(r["losses"] or 0)
-                        net_pips = float(r["net_pips"] or 0); net_usd = float(r["net_usd"] or 0)
-                        total_r = float(r["total_r"] or 0); avg_r = float(r["avg_r"] or 0)
-                        # Profit factor from stored result_pips, falling back to R when needed.
-                        cur.execute("""
-                            SELECT COALESCE(SUM(result_pips) FILTER (WHERE result_pips > 0),0) AS gross_win,
-                                   COALESCE(SUM(ABS(result_pips)) FILTER (WHERE result_pips < 0),0) AS gross_loss
-                            FROM signals WHERE status='EXECUTED' AND strategy=%s AND result_pips IS NOT NULL
-                        """, (r["strategy"],))
-                        pfrow = cur.fetchone(); gross_win = float(pfrow["gross_win"] or 0); gross_loss = float(pfrow["gross_loss"] or 0)
-                        pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
-                        stats[str(r["strategy"])] = {
-                            "mode": str(r["execution_mode"]), "executed": executed, "vetoed": int(r["vetoed"] or 0),
-                            "wins": wins, "losses": losses, "pending": int(r["pending"] or 0),
-                            "wr": (wins / executed * 100) if executed else 0.0, "pips": net_pips,
-                            "usd": net_usd, "total_r": total_r, "avg_r": avg_r, "pf": pf
-                        }
-
-                    # Calculate current maximum consecutive SL streak per strategy.
-                    for strategy in (CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY, BREAKOUT_STRATEGY):
-                        cur.execute("""
-                            SELECT outcome FROM signals
-                            WHERE status='EXECUTED' AND strategy=%s AND outcome IS NOT NULL
-                            ORDER BY id ASC
-                        """, (strategy,))
-                        streak = best = 0
-                        for rr in cur.fetchall():
-                            if str(rr["outcome"]).startswith("LOSS"):
-                                streak += 1; best = max(best, streak)
-                            else:
-                                streak = 0
-                        stats.setdefault(strategy, {})["max_loss_streak"] = best
-
-                    cur.close(); conn.close()
-                    a = stats.get(CONTROL_STRATEGY, {})
-                    b = stats.get(EXPERIMENTAL_STRATEGY, {})
-                    c = stats.get(BREAKOUT_STRATEGY, {})
-                    leader = "Not enough data"
-                    if a.get("executed", 0) or b.get("executed", 0) or c.get("executed", 0):
-                        candidates = [
-                            ("🔴 Mother Bar A (M1, LIVE)", a.get("total_r", 0)),
-                            ("🔵 EMA 5/15 (EXPERIMENT)", b.get("total_r", 0)),
-                            ("🟠 Range Breakout (C)", c.get("total_r", 0)),
-                        ]
-                        best_label, best_r = max(candidates, key=lambda x: x[1])
-                        tied = [lbl for lbl, val in candidates if val == best_r]
-                        leader = best_label if len(tied) == 1 else "🤝 Tied"
-
-                    def block(label, d):
-                        if not d:
-                            return f"{label}\nNo data yet."
-                        return (
-                            f"{label} — *{d.get('mode','UNKNOWN')}*\n"
-                            f"• Executed: *{d.get('executed',0)}* | Vetoed: *{d.get('vetoed',0)}*\n"
-                            f"• Wins/Losses: *{d.get('wins',0)}/{d.get('losses',0)}* | Pending: *{d.get('pending',0)}*\n"
-                            f"• Win Rate: *{d.get('wr',0):.1f}%*\n"
-                            f"• Net Pips: *{d.get('pips',0):+.1f}*\n"
-                            f"• Net USD: *${d.get('usd',0):+.2f}*\n"
-                            f"• Total R: *{d.get('total_r',0):+.2f}R* | Avg R: *{d.get('avg_r',0):+.3f}R*\n"
-                            f"• Profit Factor: *{d.get('pf',0):.2f}*\n"
-                            f"• Max SL Streak: *{d.get('max_loss_streak',0)}*"
-                        )
-
-                    reply = (
-                        "🔬 *A/B/C STRATEGY DASHBOARD*\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        "XAU/USD • Same market snapshot • Same risk framework\n\n"
-                        f"🔴 *A — CONTROL (Mother Bar V2, M1, LIVE)*\n{block('', a)}\n\n"
-                        f"🔵 *B — EXPERIMENT (EMA 5/15)*\n{block('', b)}\n\n"
-                        f"⚡ *C — MOTHER BAR MICRO-BREAKOUT*\n{block('', c)}\n\n"
-                        f"🏆 *CURRENT LEADER:* {leader}\n"
-                        "\n_Compare again after more trades; early samples are not statistically meaningful._"
-                    )
-                    await send_reply(reply)
+                    await send_reply(format_compare_reply(compute_strategy_comparison()))
                 except Exception as e:
-                    await send_reply(f"⚠️ Error querying A/B/C dashboard: {e}")
+                    await send_reply(f"\u26a0\ufe0f Error querying A/B/C dashboard: {e}")
 
             elif bot_role == "control" and raw_text == "/pips":
                 try:
@@ -4799,7 +5007,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                             "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
                             f"Sample: *{n_total} closed trades*",
                             f"Overall Win Rate: *{overall_wr:.1f}%* | Avg R: *{overall_avg_r:+.2f}*",
-                            f"Total Pips: *{total_pips:+.1f}* | Total $ (0.01 lot): *${total_usd:+.2f}*",
+                            f"Total Pips: *{total_pips:+.1f}* | Total $ (2x0.01 lot): *${total_usd:+.2f}*",
                             f"TP1\u2192BE: *{tp1_be_count}* | TP2 (full runner): *{tp2_count}* | SL/Reject-through: *{sl_count}*",
                             "",
                             "\U0001f9ee *Entry Condition Category Counter:*",

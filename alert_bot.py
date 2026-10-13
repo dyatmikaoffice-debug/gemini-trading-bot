@@ -2389,11 +2389,14 @@ def _flip_menu(bot: str) -> list:
     for k in _FLIP_CMD_KEYS:
         for sfx in ("on", "off"):
             out.append({"command": f"{bot}_flip_{k}_{sfx}", "description": f"{bot.upper()}: flip {names[k]} {sfx.upper()}"})
-    if bot == "a":
-        for k in _FLIP_CMD_KEYS:
-            for sfx in ("on", "off"):
-                out.append({"command": f"a_{k}_{sfx}", "description": f"A: {names[k]} entry {sfx.upper()}"})
     return out
+
+def _a_entry_menu() -> list:
+    """A's per-entry toggles, laid out exactly like C's menu (fib25, fib50, fib618, fib75, close break, momentum;
+    each with its own on/off line and a 'Toggle ...' label)."""
+    labels = (("fib25", "Fib Retrace 25%"), ("fib50", "Fib Retrace 50%"), ("fib618", "Fib Retrace 62%"),
+              ("fib75", "Fib Retrace 75%"), ("closebreak", "Close Break"), ("momentum", "Momentum Break"))
+    return [{"command": f"a_{k}_{sfx}", "description": f"Toggle {name}"} for k, name in labels for sfx in ("on", "off")]
 
 def entry_flip_status_text(bot: str, header_note: str = "") -> str:
     entry = _a_trigger_state if bot == "a" else _c_trigger_state
@@ -2405,7 +2408,8 @@ def entry_flip_status_text(bot: str, header_note: str = "") -> str:
     for k in _FLIP_ENTRY_KEYS:
         lines.append(f"\u2022 {_FLIP_LABELS[k]}: entry *{'ON' if entry[k] else 'OFF'}* | flip *{'ON' if flip[k] else 'OFF'}*")
     lines.append("")
-    lines.append(f"Flip = BUY\u2194SELL, SL = original {FLIP_SL_SOURCE}, TP1 = original SL, TP2 = {FLIP_TP2_MULT_OF_TP1:.1f}x TP1 distance. "
+    _tp2_txt = "TP2 = TP1 (unflipped Fib 25% keeps its 8x MB-range TP2)" if bot == "a" else f"TP2 = {FLIP_TP2_MULT_OF_TP1:.1f}x TP1 distance"
+    lines.append(f"Flip = BUY\u2194SELL, SL = original {FLIP_SL_SOURCE}, TP1 = original SL, {_tp2_txt}. "
                  f"Flips with a new stop under ${FLIP_MIN_SL_DIST:.2f} are skipped.")
     return "\n".join(lines)
 
@@ -3036,6 +3040,12 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
         logging.info(f"[MB A] [RISK REJECT] {trigger} risk too large vs ceiling ${reject_ceiling:.2f} -- skipped.")
         return
 
+    # BOT A ONLY: TP2 sits exactly on TP1 (both lots exit at the same price) -- EXCEPT an
+    # UNFLIPPED Fib 25% entry, which keeps A's original 1.25x / 8x MB-range targets.
+    keep_orig_tp2 = (_trigger_key(trigger) == "fib25" and not flip_on)
+    if not keep_orig_tp2:
+        tp2 = tp1
+
     orig_action, orig_sl, orig_tp1, orig_tp2 = action, sl, tp1, tp2
     flipped = False
     if flip_on:
@@ -3046,6 +3056,7 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             logging.info(f"[MB A] [FLIP SKIP] {trigger}: flipped stop outside [{FLIP_MIN_SL_DIST:.2f}, {flip_ceiling:.2f}] -- skipped.")
             return
         action, sl, tp1, tp2, risk = fp
+        tp2 = tp1   # BOT A ONLY: TP2 = TP1 on flipped trades too (C keeps its 1.5x)
         flipped = True
     trigger_db = trigger + FLIP_TAG if flipped else trigger
 
@@ -3094,7 +3105,7 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             if trigger == "MB Momentum Break" else (cfg["tp1_mult"], cfg["tp2_mult"])
         )
         tp1_note = "= original SL" if flipped else f"{tp1_mult:.2f}x MB range"
-        tp2_note = f"{FLIP_TP2_MULT_OF_TP1:.1f}x TP1" if flipped else f"{tp2_mult:.2f}x MB range"
+        tp2_note = f"{tp2_mult:.2f}x MB range" if keep_orig_tp2 else "= TP1"
         flip_line = f"\U0001f504 FLIPPED from {orig_action} (orig SL {orig_sl:.2f} / TP1 {orig_tp1:.2f})\n" if flipped else ""
         await send_telegram_alert(
             client,
@@ -3840,7 +3851,8 @@ async def lifespan(app: FastAPI):
                         {"command":"resume","description":"Resume auto-trading"},
                         {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
                         {"command":"oneway_off","description":"Disable dynamic mode; BUY only"},
-                        {"command":"both","description":"Allow BUY and SELL"},
+                        {"command":"both","description":"Allow BUY and SELL"}
+                    ] + _a_entry_menu() + [
                         {"command":"macro","description":"Gold macro context (yields, USD, COT)"},
                         {"command":"live_a","description":"Send A's signals to live MT5"},
                         {"command":"live_b","description":"Send B's signals to live MT5"},
@@ -4292,7 +4304,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/compare` - A vs B vs C dashboard (closed trades only)\n"
                         "• `/a_flip_status` - Per-entry ON/OFF + FLIP status\n"
                         "• `/a_<entry>_on` / `_off` - Entry ON/OFF (fib25, fib50, fib618, fib75, closebreak, momentum)\n"
-                        "• `/a_flip_<entry>_on` / `_off` - Flip that entry (BUY\u2194SELL, SL\u2194TP1, TP2 = 1.5x TP1)\n"
+                        "• `/a_flip_<entry>_on` / `_off` - Flip that entry (BUY\u2194SELL, SL\u2194TP1; A: TP2 = TP1)\n"
                         "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live execution)\n"
                         "• `/resume` - 🟢 Re-enable auto-trading\n"
                          "• `/oneway_on` - Dynamic 1H direction ON\n"

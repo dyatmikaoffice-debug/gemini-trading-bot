@@ -1,4 +1,11 @@
-# A/B FORWARD-TEST BOT: EMA 5/9 CONTROL vs EMA 5/15 EXPERIMENTAL
+# A/B FORWARD-TEST BOT: MOTHER BAR A / ENGULFING-OIL B / MOTHER BAR C
+# =====================================================================
+# 2026-10-14 REVISION (Bot B rewrite):
+#   * Bot B is now an ENGULFING strategy on CRUDE OIL (CLS10.m, M5) fed ONLY by the MT5 EA
+#     (POST /mt5-market-data with "symbol":"CLS10.m","timeframe":"M5"). See the ENG_*/OIL_* constants.
+#   * B's DB rows use the new strategy name ENGULFING_OIL_M5; old EMA 5/15 history stays under EXPERIMENTAL_5_15.
+#   * B has its own oil pip/USD accounting (compute_trade_pips dispatches on strategy).
+#   * Bot A and Bot C logic are unchanged.
 # =====================================================================
 # 2026-10-12 REVISION (flip + live A):
 #   * Bot A (Mother Bar V2, M1) is now the LIVE strategy (C -> PAPER).
@@ -152,7 +159,7 @@ RANGING_REGIME_PCT_THRESHOLD = 0.30
 
 # --- EMA EXECUTION SIGNAL (5M chart, fast settings for early impulse capture) ---
 CONTROL_STRATEGY = "CONTROL_MB_V2"  # renamed 2026-09-23: A is now Mother Bar V2 (M1), not EMA 5/9 -- new name keeps its DB rows from mixing with the old harmonic/EMA-5-9 history
-EXPERIMENTAL_STRATEGY = "EXPERIMENTAL_5_15"
+EXPERIMENTAL_STRATEGY = "ENGULFING_OIL_M5"
 CONTROL_EXECUTION_MODE = "LIVE"  # switched 2026-10-12 (your request): A (Mother Bar V2) is the live-account bot again
 EXPERIMENTAL_EXECUTION_MODE = "PAPER"  # stays PAPER -- B's V3 patch needs more forward-test time before going live
 
@@ -168,7 +175,51 @@ BREAKOUT_EXECUTION_MODE = "PAPER"  # switched 2026-10-12 (your request): C back 
 CONTROL_DIRECTION_MODE = "BUY_ONLY"       # A's own switch -- independent of B. NOTE: left at its prior default;
                                            # your S3/V2 mother-bar backtest numbers weren't confirmed as BUY_ONLY vs BOTH,
                                            # toggle via the existing /a-direction command if you ran them as BOTH.
-EXPERIMENTAL_DIRECTION_MODE = "BUY_ONLY"  # B's own switch -- independent of A
+EXPERIMENTAL_DIRECTION_MODE = "BOTH"  # LEGACY: unused by the engulfing Bot B (see OIL_DIRECTION_MODE); kept so old references don't break
+
+# =====================================================================
+# BOT B -- ENGULFING ON CRUDE OIL (M5), DATA FROM MT5  (2026-10-14 rewrite)
+# =====================================================================
+# Replaces the EMA 5/15 gold engine. Everything about B below is oil-only;
+# A and C are untouched.
+#   * Data: ONLY the MT5 EA push (POST /mt5-market-data with "symbol":"CLS10.m"
+#     and "timeframe":"M5"). No Twelve Data fallback -- if the push is stale
+#     B simply holds. The last bar in the push must be a CLOSED bar.
+#   * Pattern: last closed bar engulfs the previous bar's BODY.
+#   * Filters: engulfing candle RANGE >= ENG_MIN_RANGE_ATR x ATR(14);
+#     engulfed BODY <= ENG_MAX_BODY_RATIO x engulfing BODY (smaller = better,
+#     the ratio is logged and bucketed in /analyze).
+#   * Direction switch (/b_both, /b_ma40): BOTH = trade either side;
+#     MA40 = BUY only while close > SMA40, SELL only while close < SMA40.
+#   * Stacking: a new same-direction engulfing is allowed while earlier B
+#     trades are still open, but only if the move is still strong (ADX, DI,
+#     MA40 slope and price side all agree), up to ENG_STACK_MAX open trades.
+#   * SL = engulfing candle low (BUY) / high (SELL).
+#     TP = engulfing range projected beyond the engulfing high (BUY) / low (SELL).
+#     TP2 uses ENG_TP2_RANGE_MULT (default = TP1, so both lots exit together).
+OIL_MT5_SYMBOL = (os.getenv("OIL_MT5_SYMBOL", "CLS10.m").strip() or "CLS10.m")
+OIL_SYMBOL_HINTS = ("CLS", "OIL", "WTI", "XTI")   # a push whose "symbol" contains one of these goes to the oil cache
+OIL_PIP_SIZE = 0.01                               # 1 oil "pip" = 0.01 price (CLS10.m quotes 2 decimals)
+OIL_LOT_SIZE = float(os.getenv("OIL_LOT_SIZE", "0.1") or 0.1)   # lots per position (your screenshot: 0.1)
+OIL_USD_PER_PRICE_UNIT_PER_LOT = 1000.0           # confirmed from your screenshot: 0.1 lot, -0.03 move = -$3.00
+OIL_PIPS_PER_PRICE_UNIT = 1.0 / OIL_PIP_SIZE      # 100 pips per $1.00 move
+OIL_USD_PER_PIP = OIL_PIP_SIZE * OIL_USD_PER_PRICE_UNIT_PER_LOT * OIL_LOT_SIZE   # $ per pip per ONE position
+OIL_FALLBACK_SL_DIST = 0.50
+
+ENG_MA_PERIOD = 40
+ENG_MIN_RANGE_ATR = 1.0         # engulfing candle range must be at least this x ATR(14)
+ENG_MAX_RANGE_ATR = None        # optional ceiling (e.g. 3.0 to skip news-spike candles); None = off
+ENG_MAX_BODY_RATIO = 0.62       # engulfed body / engulfing body must be <= this
+ENG_MIN_RISK_ABS = 0.10         # skip if the SL distance is under this (spread/noise), price units
+ENG_TP_RANGE_MULT = 1.0         # TP1 = beyond engulfing extreme by 1.0 x engulfing range
+ENG_TP2_RANGE_MULT = 1.0        # TP2 multiple; equal to TP1 => both lots exit at the same price
+ENG_STACK_MAX = 3               # max simultaneously open B trades in one direction
+ENG_STACK_ADX_MIN = 22.0        # "movement still strong" gate for stacking: ADX >= this
+ENG_SLOPE_BARS = 3              # MA40 slope measured over this many bars
+
+OIL_DIRECTION_MODE = "BOTH"     # BOTH | MA40  (persisted in bot_settings as "oil_direction_mode")
+OIL_DIRECTION_MODES = {"BOTH", "MA40"}
+mt5_market_cache_oil = {"df": None, "updated_at": None, "source": None}   # B's oil M5 feed, pushed by the MT5 EA
 ONE_DIRECTION_MODES = {"BUY_ONLY", "DYNAMIC", "BOTH"}
 
 # --- STRATEGY A REPLACEMENT: RANGE BRACKET BREAKOUT (5M) ---
@@ -640,7 +691,7 @@ def backfill_dual_lot_accounting():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p,
+            SELECT id, action, strategy, COALESCE(entry_price, price, 0) AS entry_p,
                    COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p,
                    COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
                    COALESCE(outcome, 'PENDING') AS outcome_val
@@ -907,7 +958,8 @@ def update_open_trades(current_high: float, current_low: float, only_strategies=
             if new_outcome and new_outcome != current_outcome:
                 trade_for_calc = {
                     "action": action, "entry_price": entry_price, "sl_price": sl,
-                    "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome
+                    "tp1_price": tp1, "tp2_price": tp2, "exit_price": float(exit_price), "outcome": new_outcome,
+                    "strategy": trade.get("strategy")
                 }
                 result_pips, result_usd = compute_trade_pips(trade_for_calc)
                 result_r = compute_r_multiple(action, entry_price, float(exit_price), sl, tp1, tp2, new_outcome)
@@ -1895,31 +1947,35 @@ def compute_trade_pips(trade: dict) -> tuple[float, float]:
     exit_p = float(trade.get("exit_price") or entry)
     outcome = str(trade.get("outcome") or trade.get("outcome_val") or "PENDING")
 
+    if trade.get("strategy") == EXPERIMENTAL_STRATEGY:   # Bot B trades crude oil, not gold
+        pip_mult, usd_per_pip, fallback_sl = OIL_PIPS_PER_PRICE_UNIT, OIL_USD_PER_PIP, OIL_FALLBACK_SL_DIST
+    else:
+        pip_mult, usd_per_pip, fallback_sl = 10.0, 0.10, 2.5
     sl_dist = abs(entry - sl) if sl > 0 else abs(entry - exit_p)
-    if sl_dist == 0: sl_dist = 2.5
+    if sl_dist == 0: sl_dist = fallback_sl
     tp1_dist = abs(tp1 - entry) if tp1 > 0 else sl_dist * 1.5
     tp2_dist = abs(tp2 - entry) if tp2 > 0 else sl_dist * 2.5
 
     if "LOSS" in outcome:
         # Neither lot ever reached TP1 -- both close at SL. Two 0.01 lots,
         # each risking sl_dist, so the combined loss is 2x a single-lot SL.
-        total_pips = -(sl_dist * 10.0) * 2.0
+        total_pips = -(sl_dist * pip_mult) * 2.0
     elif outcome == "CLOSED (TP1 HIT / SL BE)":
         # Lot 1 banked tp1_dist in full. Lot 2 (the runner) was stopped at
         # breakeven -- zero pips, not a loss and not additional profit.
-        total_pips = tp1_dist * 10.0
+        total_pips = tp1_dist * pip_mult
     elif outcome == "WIN (TP1 HIT)":
         # Interim state: lot 1 has closed at TP1; lot 2 is still open and
         # not yet resolved, so only lot 1's pips are realized so far.
-        total_pips = tp1_dist * 10.0
+        total_pips = tp1_dist * pip_mult
     elif outcome in ["WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"]:
         # Lot 1 closed at TP1, lot 2 (the runner) continued on to TP2 --
         # both legs are realized profit, so both are counted in full.
-        total_pips = (tp1_dist + tp2_dist) * 10.0
+        total_pips = (tp1_dist + tp2_dist) * pip_mult
     else:
         diff = (exit_p - entry) if action == "BUY" else (entry - exit_p)
-        total_pips = diff * 10.0 * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
-    profit_usd = total_pips * 0.10
+        total_pips = diff * pip_mult * 2.0  # PENDING/unclassified fallback: treat as 2-lot mark-to-market
+    profit_usd = total_pips * usd_per_pip
     return total_pips, profit_usd
 
 def compute_r_multiple(action: str, entry: float, exit_price: float, sl: float, tp1: float = 0.0, tp2: float = 0.0, outcome: str = "PENDING") -> float:
@@ -2385,7 +2441,7 @@ def _flip_menu(bot: str) -> list:
     names = {"fib25": "Fib 25%", "fib50": "Fib 50%", "fib618": "Fib 62%", "fib75": "Fib 75%",
              "closebreak": "Close Break", "momentum": "Momentum Break"}
     out = [{"command": f"{bot}_flip_status", "description": f"{bot.upper()}: entry + flip ON/OFF status"},
-           {"command": "compare", "description": "Compare Mother Bar A vs EMA B vs C"}]
+           {"command": "compare", "description": "Compare A vs B (oil engulfing) vs C"}]
     for k in _FLIP_CMD_KEYS:
         for sfx in ("on", "off"):
             out.append({"command": f"{bot}_flip_{k}_{sfx}", "description": f"{bot.upper()}: flip {names[k]} {sfx.upper()}"})
@@ -3129,6 +3185,395 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
 async def evaluate_breakout_strategy(client, market_df_5m, adx_15m_true, now_wib):
     await evaluate_extreme_strategy(client, market_df_5m, now_wib)
 
+# =====================================================================
+# BOT B ENGINE -- ENGULFING ON CRUDE OIL M5 (2026-10-14)
+# See the constants block (ENG_* / OIL_*) for the rules.
+# =====================================================================
+_eng_state = {"last_signal_time": None, "last_bar": None, "trades_today": 0, "trade_day": None,
+              "last_reason": "No oil bar evaluated yet"}
+
+
+def _eng_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    d = _extreme_indicators(df, MB_CONFIG_C)      # ATR(14), ADX/DI(14) -- same formulas as C
+    d["ma40"] = d["close"].rolling(ENG_MA_PERIOD).mean()
+    return d
+
+
+def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None):
+    """Looks only at the LAST closed bar (engulfing) and the one before it (engulfed).
+    Returns (action, info). action is BUY/SELL on a valid setup, else HOLD with info['reason']."""
+    direction_mode = direction_mode or OIL_DIRECTION_MODE
+    need = ENG_MA_PERIOD + ENG_SLOPE_BARS + 2
+    if d is None or len(d) < need:
+        return "HOLD", {"reason": f"Insufficient oil history ({0 if d is None else len(d)}/{need} bars)"}
+    cur, prev = d.iloc[-1], d.iloc[-2]
+    atr = float(cur["atr"]) if not pd.isna(cur["atr"]) else 0.0
+    ma = float(cur["ma40"]) if not pd.isna(cur["ma40"]) else 0.0
+    if atr <= 0 or ma <= 0:
+        return "HOLD", {"reason": "ATR / MA40 not ready"}
+    o, h, l, c = (float(cur[k]) for k in ("open", "high", "low", "close"))
+    po, pc = float(prev["open"]), float(prev["close"])
+    body, pbody, rng = abs(c - o), abs(pc - po), h - l
+
+    if c > o and pc < po and o <= pc and c >= po:
+        action = "BUY"
+    elif c < o and pc > po and o >= pc and c <= po:
+        action = "SELL"
+    else:
+        return "HOLD", {"reason": "No engulfing on last closed bar"}
+
+    sign = 1.0 if action == "BUY" else -1.0
+    range_atr = rng / atr
+    ratio = (pbody / body) if body > 0 else 1.0
+    ma_prev = d["ma40"].iloc[-1 - ENG_SLOPE_BARS]
+    slope_atr = sign * (ma - float(ma_prev)) / atr if not pd.isna(ma_prev) else 0.0
+    adx = float(cur["adx"]) if not pd.isna(cur["adx"]) else 0.0
+    pdi = float(cur["plus_di"]) if not pd.isna(cur["plus_di"]) else 0.0
+    mdi = float(cur["minus_di"]) if not pd.isna(cur["minus_di"]) else 0.0
+    di_gap = sign * (pdi - mdi)
+    ma_dist_atr = sign * (c - ma) / atr          # >0 = price on the trade's side of MA40
+    risk = (c - l) if action == "BUY" else (h - c)
+    strong = adx >= ENG_STACK_ADX_MIN and di_gap > 0 and slope_atr > 0 and ma_dist_atr > 0
+    info = {
+        "bar_time": str(cur["datetime"]) if "datetime" in d.columns else "", "atr": atr, "ma40": ma, "adx": adx,
+        "di_gap": di_gap, "slope_atr": slope_atr, "ma_dist_atr": ma_dist_atr, "range": rng, "range_atr": range_atr,
+        "body": body, "prev_body": pbody, "body_ratio": ratio, "strong": strong, "risk": risk,
+        "high": h, "low": l, "close": c,
+    }
+
+    if range_atr < ENG_MIN_RANGE_ATR:
+        info["reason"] = f"{action} engulfing too small: range {range_atr:.2f} ATR < {ENG_MIN_RANGE_ATR:.2f}"
+        return "HOLD", info
+    if ENG_MAX_RANGE_ATR is not None and range_atr > ENG_MAX_RANGE_ATR:
+        info["reason"] = f"{action} engulfing too large: range {range_atr:.2f} ATR > {ENG_MAX_RANGE_ATR:.2f}"
+        return "HOLD", info
+    if pbody <= 0:
+        info["reason"] = "Engulfed candle is a doji (zero body)"
+        return "HOLD", info
+    if ratio > ENG_MAX_BODY_RATIO:
+        info["reason"] = f"{action} engulfed body {ratio*100:.0f}% of engulfing body > {ENG_MAX_BODY_RATIO*100:.0f}%"
+        return "HOLD", info
+    if risk < ENG_MIN_RISK_ABS:
+        info["reason"] = f"{action} SL distance {risk:.3f} < min {ENG_MIN_RISK_ABS:.2f}"
+        return "HOLD", info
+    if direction_mode == "MA40" and ma_dist_atr <= 0:
+        info["reason"] = f"{action} blocked by MA40 direction mode (price on wrong side of MA40)"
+        return "HOLD", info
+
+    if action == "BUY":
+        sl = l
+        tp1 = h + ENG_TP_RANGE_MULT * rng
+        tp2 = h + ENG_TP2_RANGE_MULT * rng
+    else:
+        sl = h
+        tp1 = l - ENG_TP_RANGE_MULT * rng
+        tp2 = l - ENG_TP2_RANGE_MULT * rng
+    info.update({"sl": sl, "tp1": tp1, "tp2": tp2, "reason": f"Valid {action} engulfing"})
+    return action, info
+
+
+def _eng_open_count(action: str) -> int:
+    """Open (unresolved) B trades in this direction. Fails to 0 if DB is unreachable."""
+    if not DATABASE_URL:
+        return 0
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""SELECT COUNT(*) AS n FROM signals
+                       WHERE strategy = %s AND status = 'EXECUTED' AND action = %s
+                         AND outcome IN ('PENDING', 'WIN (TP1 HIT)')""", (EXPERIMENTAL_STRATEGY, action))
+        n = int(cur.fetchone()["n"] or 0)
+        cur.close(); conn.close()
+        return n
+    except Exception as e:
+        logging.warning(f"[ENG B] open-count check failed: {e}")
+        return 0
+
+
+async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, df_raw: pd.DataFrame):
+    _extreme_roll_day(now_wib, _eng_state)
+    if not is_forex_market_open(now_wib):
+        return
+    d = _eng_indicators(df_raw)
+    action, m = detect_engulfing_signal(d)
+    _eng_state["last_bar"] = m.get("bar_time")
+    _eng_state["last_reason"] = m.get("reason", "")
+    if action == "HOLD":
+        return
+
+    open_same = _eng_open_count(action)
+    if open_same >= ENG_STACK_MAX:
+        _eng_state["last_reason"] = f"{action} skipped: {open_same} open trades already (max {ENG_STACK_MAX})"
+        logging.info(f"[ENG B] {_eng_state['last_reason']}")
+        return
+    if open_same >= 1 and not m["strong"]:
+        _eng_state["last_reason"] = (f"{action} stack skipped: move not strong (ADX {m['adx']:.1f}, DI gap {m['di_gap']:+.1f}, "
+                                     f"MA40 slope {m['slope_atr']:+.2f} ATR, MA dist {m['ma_dist_atr']:+.2f} ATR)")
+        logging.info(f"[ENG B] {_eng_state['last_reason']}")
+        return
+    stack_idx = open_same + 1
+
+    price, sl, tp1, tp2 = m["close"], m["sl"], m["tp1"], m["tp2"]
+    risk = m["risk"]
+    trigger = f"{'Bullish' if action == 'BUY' else 'Bearish'} Engulfing"
+    regime = "MA40_WITH" if m["ma_dist_atr"] > 0 else "MA40_AGAINST"
+    side_txt = "ABOVE_MA40" if price > m["ma40"] else "BELOW_MA40"
+    reasoning = (f"{trigger}; range={m['range']:.3f} ({m['range_atr']:.2f} ATR), engulfed body={m['body_ratio']*100:.0f}% of engulfing, "
+                 f"ATR={m['atr']:.3f}, ADX={m['adx']:.1f}, MA40={m['ma40']:.3f} (dist {m['ma_dist_atr']:+.2f} ATR), "
+                 f"stack #{stack_idx}, direction mode={OIL_DIRECTION_MODE}, data=MT5.")
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO signals (
+                timestamp,status,action,trigger_type,price,entry_price,sl,sl_price,
+                tp1,tp1_price,tp2,tp2_price,confidence,adx_15m,stoch_rsi_15m,
+                divergence_type,reasoning,outcome,outcome_timestamp,trend_15m,adx_15m_true,
+                entry_extension_atr,entry_climax_ratio,regime,ema_sep_atr_5m,strategy,execution_mode,created_at
+            )
+            VALUES (%s,'EXECUTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,'PENDING','',%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            RETURNING id
+        """, (
+            (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            action, trigger, price, price, sl, sl, tp1, tp1, tp2, tp2,
+            0.90, m["adx"], f"STACK_{stack_idx}", reasoning, side_txt, m["adx"],
+            m["range_atr"], m["body_ratio"], regime, m["ma_dist_atr"], EXPERIMENTAL_STRATEGY, EXPERIMENTAL_EXECUTION_MODE
+        ))
+        row = cur.fetchone(); sid = int(row["id"]) if row else None
+        conn.commit(); cur.close(); conn.close()
+        _eng_state["last_signal_time"] = datetime.now(timezone.utc)
+        _eng_state["trades_today"] += 1
+        _eng_state["last_reason"] = f"{trigger} #{sid} executed ({EXPERIMENTAL_EXECUTION_MODE})"
+
+        mode_tag = "[PAPER]" if EXPERIMENTAL_EXECUTION_MODE == "PAPER" else "[LIVE]"
+        mode_footer = "PAPER ONLY" if EXPERIMENTAL_EXECUTION_MODE == "PAPER" else "LIVE - MT5 will execute this (make sure your EA trades the symbol field!)"
+        usd_risk = risk * OIL_USD_PER_PRICE_UNIT_PER_LOT * OIL_LOT_SIZE * 2
+        await send_telegram_alert(
+            client,
+            f"🕯️ *BOT B ENGULFING OIL {mode_tag} SIGNAL #{sid}*\n\n"
+            f"Asset: *{OIL_MT5_SYMBOL}* (M5)\nAction: *{action}*\nPattern: *{trigger}*\n"
+            f"Entry: *{price:.2f}*\nSL: *{sl:.2f}* (risk {risk:.2f}, about ${usd_risk:.2f} on 2 x {OIL_LOT_SIZE} lot)\n"
+            f"TP1: *{tp1:.2f}*\nTP2: *{tp2:.2f}*\n"
+            f"Engulfing range: *{m['range']:.2f}* ({m['range_atr']:.2f} ATR) | Engulfed body: *{m['body_ratio']*100:.0f}%* of engulfing\n"
+            f"ADX: *{m['adx']:.1f}* | MA40 dist: *{m['ma_dist_atr']:+.2f} ATR* ({regime.replace('_', ' ')})\n"
+            f"Stack: *#{stack_idx}* of max {ENG_STACK_MAX} | Direction mode: *{OIL_DIRECTION_MODE}*\n\n"
+            f"{mode_footer}",
+            EXPERIMENTAL_TELEGRAM_CHAT_ID, EXPERIMENTAL_TELEGRAM_BOT_TOKEN
+        )
+    except Exception as e:
+        logging.error(f"[ENG B DB ERROR] {e}")
+
+
+# ---------- Bot B reporting helpers (oil accounting) ----------
+def _oil_closed_rows():
+    """Fully closed B trades only (interim 'WIN (TP1 HIT)' with an open runner is excluded)."""
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        SELECT id, action, trigger_type, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+               COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price,
+               COALESCE(outcome, 'PENDING') AS outcome_val, COALESCE(timestamp, created_at::text, '') AS log_time,
+               adx_15m, divergence_type, regime, entry_extension_atr, entry_climax_ratio, ema_sep_atr_5m
+        FROM signals
+        WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s
+          AND outcome NOT IN ('PENDING', 'WIN (TP1 HIT)')
+        ORDER BY id ASC
+    """, (EXPERIMENTAL_STRATEGY,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def _oil_trade_metrics(r):
+    trade = {"action": r["action"], "entry_price": r["entry_p"], "sl_price": r["sl_p"], "tp1_price": r["tp1_p"],
+             "tp2_price": r["tp2_p"], "exit_price": r["exit_price"], "outcome": r["outcome_val"], "strategy": EXPERIMENTAL_STRATEGY}
+    pips, usd = compute_trade_pips(trade)
+    r_mult = compute_r_multiple(r["action"], float(r["entry_p"]), float(r["exit_price"]), float(r["sl_p"]),
+                                float(r["tp1_p"]), float(r["tp2_p"]), r["outcome_val"])
+    return r_mult, pips, usd
+
+
+def _oil_counts():
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""SELECT COUNT(*) FILTER (WHERE status = 'EXECUTED') AS executed,
+                          COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome IN ('PENDING', 'WIN (TP1 HIT)')) AS open_n,
+                          COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome IN ('PENDING', 'WIN (TP1 HIT)') AND action = 'BUY') AS open_buy,
+                          COUNT(*) FILTER (WHERE status = 'EXECUTED' AND outcome IN ('PENDING', 'WIN (TP1 HIT)') AND action = 'SELL') AS open_sell
+                   FROM signals WHERE strategy = %s""", (EXPERIMENTAL_STRATEGY,))
+    row = cur.fetchone(); cur.close(); conn.close()
+    return {k: int(row[k] or 0) for k in ("executed", "open_n", "open_buy", "open_sell")}
+
+
+def build_oil_stats_text() -> str:
+    rows = _oil_closed_rows(); cnt = _oil_counts()
+    mets = [_oil_trade_metrics(r) for r in rows]
+    n = len(mets)
+    if n == 0:
+        return (f"📊 *BOT B ENGULFING OIL -- PERFORMANCE*\n\nExecuted: *{cnt['executed']}* | Open: *{cnt['open_n']}*\n"
+                "No closed trades yet.")
+    wins = sum(1 for r, _, _ in mets if r > 0); losses = n - wins
+    tot_r = sum(r for r, _, _ in mets); tot_pips = sum(p for _, p, _ in mets); tot_usd = sum(u for _, _, u in mets)
+    gw = sum(p for _, p, _ in mets if p > 0); gl = sum(-p for _, p, _ in mets if p < 0)
+    pf = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
+    streak = best = 0
+    for r, _, _ in mets:
+        streak = streak + 1 if r <= 0 else 0
+        best = max(best, streak)
+    def side(act):
+        s = [m for row, m in zip(rows, mets) if row["action"] == act]
+        if not s: return f"{act}: n=0"
+        return f"{act}: n={len(s)}, WR={sum(1 for r,_,_ in s if r>0)/len(s)*100:.0f}%, ${sum(u for _,_,u in s):+.2f}"
+    return (
+        "📊 *BOT B ENGULFING OIL -- PERFORMANCE*\n"
+        "――――――――――――――――――――\n"
+        f"Executed: *{cnt['executed']}* | Closed: *{n}* | Open: *{cnt['open_n']}* (BUY {cnt['open_buy']} / SELL {cnt['open_sell']})\n"
+        f"Wins / Losses: *{wins} / {losses}* | Win rate: *{wins/n*100:.1f}%*\n\n"
+        f"💰 Net pips (2 lots, 1 pip = 0.01): *{tot_pips:+.0f}*\n"
+        f"💰 Net USD (2 x {OIL_LOT_SIZE} lot): *${tot_usd:+.2f}*\n"
+        f"📐 Total R: *{tot_r:+.2f}R* | Avg R: *{tot_r/n:+.3f}R*\n"
+        f"⚖️ Profit factor: *{'inf' if pf == float('inf') else f'{pf:.2f}'}* | Max loss streak: *{best}*\n\n"
+        f"↔️ {side('BUY')}\n↔️ {side('SELL')}\n\n"
+        f"Direction mode: *{OIL_DIRECTION_MODE}* | Mode: *{EXPERIMENTAL_EXECUTION_MODE}*"
+    )
+
+
+def build_oil_pips_text() -> str:
+    rows = _oil_closed_rows()
+    if not rows:
+        return "💵 *BOT B DETAILED PIPS REPORT*\n\nNo closed trades yet."
+    tot = gw = gl = 0.0; nw = nl = 0; tp_hit = be = sl_hit = 0
+    for r in rows:
+        _, pips, _ = _oil_trade_metrics(r)
+        tot += pips
+        if pips > 0: gw += pips; nw += 1
+        elif pips < 0: gl += -pips; nl += 1
+        ov = r["outcome_val"]
+        if ov in ("WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"): tp_hit += 1
+        elif ov == "CLOSED (TP1 HIT / SL BE)": be += 1
+        elif "LOSS" in ov: sl_hit += 1
+    usd = tot * OIL_USD_PER_PIP
+    return (
+        "💵 *BOT B DETAILED PIPS & EARNINGS REPORT (OIL)*\n"
+        "――――――――――――――――――――\n"
+        f"Total net pips: *{tot:+.0f}* | Net USD (2 x {OIL_LOT_SIZE} lot): *${usd:+.2f}*\n\n"
+        f"🎯 TP hit (both lots): *{tp_hit}* | TP1 then BE: *{be}* | SL hit (both lots): *{sl_hit}*\n\n"
+        f"Gross gain: *+{gw:.0f} pips* | Gross loss: *-{gl:.0f} pips*\n"
+        f"Avg win: *+{(gw/nw if nw else 0):.0f} pips* | Avg loss: *-{(gl/nl if nl else 0):.0f} pips*\n"
+        f"Pip efficiency: *{gw/(gl+1e-5):.2f}*\n"
+        "――――――――――――――――――――\n"
+        f"Note: 1 pip = 0.01 price; 1 pip = ${OIL_USD_PER_PIP:.2f} per {OIL_LOT_SIZE} lot position (from your screenshot: 0.03 move on 0.1 lot = $3.00)."
+    )
+
+
+def _bucket_body_ratio(x):
+    if x is None: return "Ratio N/A"
+    x = float(x)
+    if x <= 0.25: return "Engulfed 0-25% of engulfing body (tiny)"
+    if x <= 0.40: return "Engulfed 25-40%"
+    if x <= 0.50: return "Engulfed 40-50%"
+    return "Engulfed 50-62% (borderline)"
+
+def _bucket_range_atr(x):
+    if x is None: return "Range N/A"
+    x = float(x)
+    if x < 1.25: return "Range 1.0-1.25 ATR"
+    if x < 1.75: return "Range 1.25-1.75 ATR"
+    if x < 2.5: return "Range 1.75-2.5 ATR"
+    return "Range 2.5+ ATR (big candle)"
+
+def _bucket_ma_dist(x):
+    if x is None: return "MA40 distance N/A"
+    x = float(x)
+    if x <= 0: return "Against MA40 (counter-trend)"
+    if x < 1.0: return "With MA40, 0-1 ATR away"
+    if x < 2.0: return "With MA40, 1-2 ATR away"
+    if x < 3.0: return "With MA40, 2-3 ATR away"
+    return "With MA40, 3+ ATR (extended)"
+
+def _bucket_stack(div):
+    m = re.match(r"STACK_(\d+)", div or "")
+    if not m: return "Stack N/A"
+    k = int(m.group(1))
+    return "Entry #1 (fresh)" if k == 1 else ("Stack #2" if k == 2 else "Stack #3+")
+
+
+def build_oil_analyze_text() -> str:
+    rows = _oil_closed_rows()
+    if not rows:
+        return ("📐 *BOT B ENGULFING OIL -- ANALYSIS*\n\n_Not enough closed trades yet to analyze._")
+    dims = {k: {} for k in ("dir", "ratio", "range", "ma", "stack", "adx", "sess")}
+    all_m = []
+    outcome_counts = {"tp": 0, "be": 0, "sl": 0}
+    for r in rows:
+        met = _oil_trade_metrics(r)
+        all_m.append(met)
+        dims["dir"].setdefault(r["action"], []).append(met)
+        dims["ratio"].setdefault(_bucket_body_ratio(r["entry_climax_ratio"]), []).append(met)
+        dims["range"].setdefault(_bucket_range_atr(r["entry_extension_atr"]), []).append(met)
+        dims["ma"].setdefault(_bucket_ma_dist(r["ema_sep_atr_5m"]), []).append(met)
+        dims["stack"].setdefault(_bucket_stack(r["divergence_type"]), []).append(met)
+        dims["adx"].setdefault(bucket_adx(float(r["adx_15m"] or 0.0)), []).append(met)
+        dims["sess"].setdefault(bucket_session(r["log_time"]), []).append(met)
+        ov = r["outcome_val"]
+        if ov in ("WIN (TP2 HIT)", "WIN (TP2 HIT FULL)"): outcome_counts["tp"] += 1
+        elif ov == "CLOSED (TP1 HIT / SL BE)": outcome_counts["be"] += 1
+        elif "LOSS" in ov: outcome_counts["sl"] += 1
+    n = len(all_m)
+    wr = sum(1 for x in all_m if x[0] > 0) / n * 100
+    parts = [
+        "📐 *BOT B ENGULFING OIL -- ANALYSIS*",
+        "――――――――――――――――――――",
+        f"Sample: *{n} closed trades*",
+        f"Win rate: *{wr:.1f}%* | Avg R: *{sum(x[0] for x in all_m)/n:+.2f}*",
+        f"Total pips: *{sum(x[1] for x in all_m):+.0f}* | Total $: *${sum(x[2] for x in all_m):+.2f}* (2 x {OIL_LOT_SIZE} lot)",
+        f"TP: *{outcome_counts['tp']}* | TP1 then BE: *{outcome_counts['be']}* | SL: *{outcome_counts['sl']}*",
+        "",
+        "↔️ *By Direction:*", format_entry_condition_segment(dims["dir"]), "",
+        "🕯️ *By Engulfed/Engulfing Body Ratio (smaller = better?):*", format_entry_condition_segment(dims["ratio"]), "",
+        "📏 *By Engulfing Range vs ATR:*", format_entry_condition_segment(dims["range"]), "",
+        "📈 *By MA40 Alignment / Distance:*", format_entry_condition_segment(dims["ma"]), "",
+        "🧱 *By Stack Position (multiple entries in same direction):*", format_entry_condition_segment(dims["stack"]), "",
+        "💪 *By 5M ADX:*", format_entry_condition_segment(dims["adx"]), "",
+        "🕐 *By Session:*", format_entry_condition_segment(dims["sess"]), "",
+        "――――――――――――――――――――",
+        "💡 Buckets need n>=5 to be flagged. The body-ratio and MA40 buckets tell you whether to tighten "
+        f"ENG_MAX_BODY_RATIO (now {ENG_MAX_BODY_RATIO}) or switch the direction mode to MA40.",
+    ]
+    return "\n".join(parts)
+
+
+def build_oil_status_text() -> str:
+    cache = mt5_market_cache_oil
+    ts = cache.get("updated_at")
+    age = (datetime.now(timezone.utc) - ts).total_seconds() if ts else None
+    fresh = _mt5_cache_fresh(cache)
+    lines = ["🕯️ *BOT B ENGULFING OIL -- STATUS*", "――――――――――――――――――――",
+             f"Symbol: *{OIL_MT5_SYMBOL}* (M5, MT5 push only)",
+             f"Execution: *{EXPERIMENTAL_EXECUTION_MODE}* | Direction mode: *{OIL_DIRECTION_MODE}*",
+             f"Oil feed: *{'FRESH' if fresh else 'STALE / none'}*" + (f" (last push {age:.0f}s ago)" if age is not None else " (nothing received yet)")]
+    if cache.get("df") is not None:
+        try:
+            d = _eng_indicators(cache["df"]); last = d.iloc[-1]
+            side = "above" if last["close"] > last["ma40"] else "below"
+            lines += [f"Last bar: *{last['datetime']}* close *{float(last['close']):.2f}*",
+                      f"ATR14: *{float(last['atr']):.3f}* | ADX: *{float(last['adx']):.1f}* | MA40: *{float(last['ma40']):.3f}* (price {side})"]
+        except Exception:
+            pass
+    try:
+        c = _oil_counts()
+        lines.append(f"Open B trades: *{c['open_n']}* (BUY {c['open_buy']} / SELL {c['open_sell']}), stack max *{ENG_STACK_MAX}* per side")
+    except Exception:
+        pass
+    lines += [f"Signals today: *{_eng_state['trades_today']}*", f"Last scan: {_eng_state['last_reason']}", "",
+              f"Rules: range >= {ENG_MIN_RANGE_ATR} ATR, engulfed body <= {ENG_MAX_BODY_RATIO*100:.0f}%, SL = engulfing extreme, TP = {ENG_TP_RANGE_MULT}x range beyond it. "
+              f"Stack needs ADX >= {ENG_STACK_ADX_MIN:.0f}, DI + MA40 slope agreeing.", "",
+              get_macro_status_line()]
+    return "\n".join(lines)
+
+
+def _symbol_for_strategy(strategy):
+    return OIL_MT5_SYMBOL if strategy == EXPERIMENTAL_STRATEGY else None
+
+
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
     proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, 
@@ -3638,6 +4083,7 @@ async def background_scanning_loop():
         last_processed_candle_time = None
         last_claimed_bucket = None
         last_claimed_minute_bucket_a = None
+        last_oil_bar_ts = None
 
         while True:
             try:
@@ -3688,6 +4134,19 @@ async def background_scanning_loop():
                     except Exception as e:
                         logging.error(f"[MB A LOOP ERROR] {e}")
 
+                # BOT B (engulfing, crude oil M5): driven purely by new closed bars pushed by the MT5 EA.
+                # Settles B's open trades on the new bar first, then looks for a fresh engulfing.
+                try:
+                    if _mt5_cache_fresh(mt5_market_cache_oil):
+                        df_oil = mt5_market_cache_oil["df"]
+                        oil_bar_ts = df_oil["datetime"].iloc[-1]
+                        if oil_bar_ts != last_oil_bar_ts:
+                            last_oil_bar_ts = oil_bar_ts
+                            update_open_trades(float(df_oil["high"].iloc[-1]), float(df_oil["low"].iloc[-1]), only_strategies=(EXPERIMENTAL_STRATEGY,))
+                            await evaluate_engulfing_oil(client, now_wib, df_oil)
+                except Exception as e:
+                    logging.error(f"[ENG B LOOP ERROR] {e}")
+
                 if now_wib.minute % 5 != 0 or now_wib.second > 45:
                     await asyncio.sleep(2)
                     continue
@@ -3721,7 +4180,7 @@ async def background_scanning_loop():
 
                 curr_high = float(df_5m["high"].iloc[-1])
                 curr_low = float(df_5m["low"].iloc[-1])
-                update_open_trades(curr_high, curr_low, exclude_strategies=(CONTROL_STRATEGY,))
+                update_open_trades(curr_high, curr_low, exclude_strategies=(CONTROL_STRATEGY, EXPERIMENTAL_STRATEGY))
 
                 # Build the 15M confluence frame LOCALLY from the shared 5M
                 # snapshot. This removes a second Twelve Data feed entirely.
@@ -3764,14 +4223,7 @@ async def background_scanning_loop():
                 # (evaluate_control_mb_strategy) -- Mother Bar V2, no
                 # longer the shared-5M harmonic engine, no longer PAPER.
 
-                # EXPERIMENT B: same system + same exhaustion guard, EMA 5/15, PAPER.
-                # It receives the exact same candles and 15M confluence snapshot.
-                await evaluate_strategy_cycle(
-                    client, df_5m, trend_15m, adx_15m_true, now_wib,
-                    EXPERIMENTAL_STRATEGY, EXPERIMENTAL_EMA_FAST, EXPERIMENTAL_EMA_SLOW,
-                    EXPERIMENTAL_EXECUTION_MODE, EXPERIMENTAL_TELEGRAM_BOT_TOKEN,
-                    EXPERIMENTAL_TELEGRAM_CHAT_ID, directional_bias
-                )
+                # BOT B (engulfing, crude oil) runs in its own MT5-driven branch above -- not on the gold 5M snapshot.
 
                 # STRATEGY C: Extreme-frequency M5 engine. It prefers real MT5
                 # bars received through /mt5-market-data, with shared Twelve Data
@@ -3791,14 +4243,16 @@ async def background_scanning_loop():
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE
+    global CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE
     global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     init_db()
     # Restore direction-mode toggles (/oneway_on, /c_both, etc.) set before the
     # last restart -- these used to live only in memory and silently reset to
     # BUY_ONLY / BOTH on every redeploy or crash.
     CONTROL_DIRECTION_MODE = get_setting("control_direction_mode", CONTROL_DIRECTION_MODE)
-    EXPERIMENTAL_DIRECTION_MODE = get_setting("experimental_direction_mode", EXPERIMENTAL_DIRECTION_MODE)
+    OIL_DIRECTION_MODE = get_setting("oil_direction_mode", OIL_DIRECTION_MODE)
+    if OIL_DIRECTION_MODE not in OIL_DIRECTION_MODES:
+        OIL_DIRECTION_MODE = "BOTH"
     EXTREME_DIRECTION_MODE = get_setting("extreme_direction_mode", EXTREME_DIRECTION_MODE)
     logging.info(
         f"[SETTINGS] Restored direction modes -- Control: {CONTROL_DIRECTION_MODE}, "
@@ -3864,20 +4318,21 @@ async def lifespan(app: FastAPI):
                     res_b = await client.post(set_b, data={"url": webhook_b})
                     logging.info(f"[EXPERIMENTAL WEBHOOK SETUP] {res_b.text}")
                     await client.post(f"https://api.telegram.org/bot{EXPERIMENTAL_TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands":[
-                        {"command":"start","description":"Show A/B bot commands"},
-                        {"command":"help","description":"Show A/B command menu"},
-                        {"command":"stats","description":"A/B performance dashboard"},
-                        {"command":"compare","description":"Compare Mother Bar A vs EMA B vs C"},
-                        {"command":"status","description":"Read-only system status"},
+                        {"command":"start","description":"Show Bot B (oil engulfing) commands"},
+                        {"command":"help","description":"Show Bot B command menu"},
+                        {"command":"status","description":"Oil feed, MA40, open trades, last scan"},
+                        {"command":"stats","description":"Bot B performance dashboard"},
+                        {"command":"pips","description":"Pips and USD breakdown (oil)"},
+                        {"command":"analyze","description":"Body ratio / range / MA40 / stack analysis"},
                         {"command":"last","description":"Last 10 trades"},
-                        {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
-                        {"command":"oneway_off","description":"Disable dynamic mode; BUY only"},
-                        {"command":"both","description":"Allow BUY and SELL"},
+                        {"command":"compare","description":"Compare A vs B (oil engulfing) vs C"},
+                        {"command":"b_both","description":"Direction: BUY and SELL engulfing"},
+                        {"command":"b_ma40","description":"Direction: one way only, decided by MA40"},
                         {"command":"macro","description":"Gold macro context (yields, USD, COT)"},
                         {"command":"live_a","description":"Send A's signals to live MT5"},
                         {"command":"live_b","description":"Send B's signals to live MT5"},
                         {"command":"live_c","description":"Send C's signals to live MT5"}
-                    ]})
+]})
                 if BREAKOUT_TELEGRAM_BOT_TOKEN:
                     webhook_c = f"{APP_URL.rstrip('/')}/telegram-webhook-c"
                     set_c = f"https://api.telegram.org/bot{BREAKOUT_TELEGRAM_BOT_TOKEN}/setWebhook"
@@ -3937,6 +4392,19 @@ async def mt5_market_data(request: Request):
                 return {"ok": False, "error": "unauthorized"}
         payload = await request.json()
         timeframe = str(payload.get("timeframe", "M5")).upper()
+        symbol = str(payload.get("symbol", "")).upper()
+        if str(payload.get("feed", "")).upper() == "OIL" or any(h in symbol for h in OIL_SYMBOL_HINTS):
+            # Bot B's crude-oil M5 feed -- kept completely separate from the gold caches.
+            if timeframe != "M5":
+                return {"ok": False, "error": "oil_feed_requires_M5"}
+            df_oil = _df_from_mt5_payload(payload, max_bars=250)
+            if df_oil is None or len(df_oil) < ENG_MA_PERIOD + ENG_SLOPE_BARS + 2:
+                return {"ok": False, "error": "invalid_or_insufficient_oil_m5_bars"}
+            mt5_market_cache_oil["df"] = df_oil
+            mt5_market_cache_oil["updated_at"] = datetime.now(timezone.utc)
+            mt5_market_cache_oil["source"] = "MT5_EA"
+            return {"ok": True, "source": "MT5_EA", "feed": "OIL", "timeframe": "M5", "bars": len(df_oil),
+                    "last_bar": str(df_oil["datetime"].iloc[-1]), "updated_at": mt5_market_cache_oil["updated_at"].isoformat()}
         df = _df_from_mt5_payload(payload, max_bars=300 if timeframe == "M1" else 150)
         min_bars = MB_LOOKBACK_BARS + 3 if timeframe == "M1" else EXTREME_ATR_PERIOD + 3
         if df is None or len(df) < min_bars:
@@ -3959,7 +4427,7 @@ async def mt5_market_data(request: Request):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": f"A/B/C scanner active: A=Mother Bar V2 (M1) {CONTROL_EXECUTION_MODE} + B=EMA 5/15 {EXPERIMENTAL_EXECUTION_MODE} + C=Mother Bar Micro-Breakout {BREAKOUT_EXECUTION_MODE}.", "comparison": "/ab-comparison"}
+    return {"status": "ok", "message": f"A/B/C scanner active: A=Mother Bar V2 (M1) {CONTROL_EXECUTION_MODE} + B=Engulfing Oil M5 {EXPERIMENTAL_EXECUTION_MODE} + C=Mother Bar Micro-Breakout {BREAKOUT_EXECUTION_MODE}.", "comparison": "/ab-comparison"}
 
 
 # =====================================================================
@@ -3998,7 +4466,7 @@ async def get_latest_signal():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+            SELECT id, action, strategy, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                    COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
             FROM signals
             WHERE status = 'EXECUTED' AND execution_mode = 'LIVE'
@@ -4009,7 +4477,7 @@ async def get_latest_signal():
         conn.close()
 
         if row:
-            result = {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "trading_enabled": True}
+            result = {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "strategy": row["strategy"], "symbol": _symbol_for_strategy(row["strategy"]), "trading_enabled": True}
         else:
             result = {"signal": None, "trading_enabled": True}
         _latest_signal_cache["response"] = result
@@ -4050,7 +4518,7 @@ async def get_pending_signals(since_id: int = 0, limit: int = 20):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
+            SELECT id, action, strategy, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p,
                    COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, COALESCE(timestamp, created_at::text, '') AS log_time
             FROM signals
             WHERE status = 'EXECUTED' AND execution_mode = 'LIVE' AND id > %s
@@ -4064,7 +4532,7 @@ async def get_pending_signals(since_id: int = 0, limit: int = 20):
             {"id": int(r["id"]), "action": str(r["action"]).upper(),
              "entry": float(r["entry_p"]), "sl": float(r["sl_p"]),
              "tp1": float(r["tp1_p"]), "tp2": float(r["tp2_p"]),
-             "timestamp": str(r["log_time"])}
+             "timestamp": str(r["log_time"]), "strategy": r["strategy"], "symbol": _symbol_for_strategy(r["strategy"])}
             for r in rows
         ]
         return {"signals": signals, "trading_enabled": True}
@@ -4172,7 +4640,7 @@ def format_compare_reply(stats: dict) -> str:
         return "\n".join(lines)
 
     candidates = [(lbl, d.get("usd", 0.0)) for lbl, d in (
-        ("\U0001f534 Mother Bar A (M1)", a), ("\U0001f535 EMA 5/15 (B)", b), ("\u26a1 Mother Bar Micro (C)", c)) if d.get("closed")]
+        ("\U0001f534 Mother Bar A (M1)", a), ("\U0001f535 Engulfing Oil (B)", b), ("\u26a1 Mother Bar Micro (C)", c)) if d.get("closed")]
     if candidates:
         best_label, best_usd = max(candidates, key=lambda x: x[1])
         leader = best_label if sum(1 for _, v in candidates if v == best_usd) == 1 else "\U0001f91d Tied"
@@ -4181,9 +4649,9 @@ def format_compare_reply(stats: dict) -> str:
     return (
         "\U0001f52c *A/B/C STRATEGY DASHBOARD*\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "XAU/USD \u2022 all-time, CLOSED trades only \u2022 2x0.01-lot accounting for all three\n\n"
+        "XAU/USD \u2022 all-time, CLOSED trades only \u2022 2-lot accounting per signal (B = crude oil lots, not gold)\n\n"
         f"\U0001f534 *A \u2014 MOTHER BAR V2 (M1)* \u2014 now *{mode_now[CONTROL_STRATEGY]}*\n{block(CONTROL_STRATEGY, a)}\n\n"
-        f"\U0001f535 *B \u2014 EMA 5/15* \u2014 now *{mode_now[EXPERIMENTAL_STRATEGY]}*\n{block(EXPERIMENTAL_STRATEGY, b)}\n\n"
+        f"\U0001f535 *B \u2014 ENGULFING OIL M5* \u2014 now *{mode_now[EXPERIMENTAL_STRATEGY]}*\n{block(EXPERIMENTAL_STRATEGY, b)}\n\n"
         f"\u26a1 *C \u2014 MOTHER BAR MICRO* \u2014 now *{mode_now[BREAKOUT_STRATEGY]}*\n{block(BREAKOUT_STRATEGY, c)}\n\n"
         f"\U0001f3c6 *LEADER (net USD):* {leader}\n"
         "\n_Samples differ in size and period; leader is by net USD, not total R._"
@@ -4213,7 +4681,7 @@ async def ab_comparison():
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 async def _handle_telegram_webhook(request: Request, bot_role: str):
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE
     global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     try:
         data = await request.json()
@@ -4225,7 +4693,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/compare", "/last", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/macro", "/live_a", "/live_b", "/live_c"}
         BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare"} | C_FLIP_COMMANDS
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
@@ -4239,7 +4707,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
             if raw_text in ["/help", "/start"]:
                 live_bot_label = (
                     "A (Mother Bar V2, M1)" if CONTROL_EXECUTION_MODE == "LIVE"
-                    else "B (EMA 5/15)" if EXPERIMENTAL_EXECUTION_MODE == "LIVE"
+                    else "B (Engulfing Oil M5)" if EXPERIMENTAL_EXECUTION_MODE == "LIVE"
                     else "C (Mother Bar Micro)" if BREAKOUT_EXECUTION_MODE == "LIVE"
                     else "none (all PAPER)"
                 )
@@ -4279,19 +4747,20 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                 elif bot_role == "experimental":
                     reply = (
-                        "🔬 *EXPERIMENTAL A/B BOT COMMANDS:*\n\n"
-                        "• `/stats` - Detailed B performance dashboard (TP1/TP2/SL breakdown, $, efficiency)\n"
-                        "• `/compare` - A vs B vs C summary comparison\n"
-                        "• `/status` - Read-only system status\n"
-                        "• `/last` - Last 10 experimental trades\n"
-                         "• `/oneway_on` - Dynamic 1H direction ON\n"
-                         "• `/oneway_off` - Dynamic direction OFF → BUY ONLY\n"
-                         "• `/both` - Allow BUY + SELL\n"
+                        "🕯️ *BOT B -- ENGULFING ON CRUDE OIL (M5) COMMANDS:*\n\n"
+                        "• `/status` - Oil feed freshness, MA40, open trades, last scan result\n"
+                        "• `/stats` - Performance dashboard (W/L, pips, USD, R, profit factor, streaks)\n"
+                        "• `/pips` - Detailed pips and USD report (TP / BE / SL breakdown)\n"
+                        "• `/analyze` - Breakdown by engulfed-body ratio, range vs ATR, MA40 distance, stack position, ADX, session\n"
+                        "• `/last` - Last 10 trades\n"
+                        "• `/compare` - A vs B vs C dashboard\n"
+                        "• `/b_both` - Trade engulfing in both directions\n"
+                        "• `/b_ma40` - One direction only: BUY above MA40, SELL below MA40\n"
                         "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
-                        "• `/macro` - Macro context for gold (real yields, USD, COT positioning)\n"
-                        "• `/help` - Display this command menu\n\n"
-                        f"{'🔴 Strategy: *EMA 5/15 — LIVE (real MT5 trades)*' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else '⚪ Strategy: *EMA 5/15 — PAPER only*'}\n"
-                        f"{'🚨 This bot IS connected to live MT5 execution. Use /pause on the Control bot for the emergency kill switch.' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else f'ℹ️ Live MT5 execution is currently on *{live_bot_label}*, not this one.'}\n"
+                        "• `/macro` - Gold macro context\n"
+                        "• `/help` - This menu\n\n"
+                        f"🕯️ Strategy: *Engulfing on {OIL_MT5_SYMBOL} M5* | Direction mode: *{OIL_DIRECTION_MODE}*\n"
+                        f"{'🔴 LIVE -- this bot is connected to live MT5 execution.' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else f'⚪ PAPER only -- live MT5 execution is currently on *{live_bot_label}*.'}\n"
                     )
                 else:
                     reply = (
@@ -4318,7 +4787,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     )
                 await send_reply(reply)
 
-            elif raw_text in ("/oneway_on", "/oneway_off", "/both") and bot_role in ("control", "experimental"):
+            elif raw_text in ("/oneway_on", "/oneway_off", "/both") and bot_role == "control":
                 if raw_text == "/oneway_on":
                     new_mode = "DYNAMIC"
                     mode_text = "DYNAMIC — 1H EMA200 decides allowed direction"
@@ -4356,7 +4825,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                 set_setting("control_execution_mode", CONTROL_EXECUTION_MODE)
                 set_setting("experimental_execution_mode", EXPERIMENTAL_EXECUTION_MODE)
                 set_setting("breakout_execution_mode", BREAKOUT_EXECUTION_MODE)
-                live_label = {"/live_a": "A (Mother Bar V2, M1)", "/live_b": "B (EMA 5/15)", "/live_c": "C (Mother Bar Micro)"}[raw_text]
+                live_label = {"/live_a": "A (Mother Bar V2, M1)", "/live_b": "B (Engulfing Oil M5)", "/live_c": "C (Mother Bar Micro)"}[raw_text]
                 logging.info(
                     f"[LIVE TOGGLE] Now live: {live_label} -- "
                     f"A={CONTROL_EXECUTION_MODE}, B={EXPERIMENTAL_EXECUTION_MODE}, C={BREAKOUT_EXECUTION_MODE}"
@@ -4424,6 +4893,29 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     _note += "\n\u26a0\ufe0f C's Momentum Break ENTRY is OFF, so nothing will fire or flip until you send /c_momentum_on."
                 await send_reply(entry_flip_status_text(_bot, _note))
 
+            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/b_both", "/b_ma40"):
+                try:
+                    if raw_text == "/stats":
+                        reply = build_oil_stats_text()
+                    elif raw_text == "/pips":
+                        reply = build_oil_pips_text()
+                    elif raw_text == "/analyze":
+                        reply = build_oil_analyze_text()
+                    elif raw_text == "/status":
+                        reply = build_oil_status_text()
+                    else:
+                        OIL_DIRECTION_MODE = "BOTH" if raw_text == "/b_both" else "MA40"
+                        set_setting("oil_direction_mode", OIL_DIRECTION_MODE)
+                        reply = (
+                            "🎛️ *BOT B DIRECTION MODE UPDATED*\n\n"
+                            f"Mode: *{OIL_DIRECTION_MODE}*\n"
+                            + ("BOTH -- engulfing BUY and SELL are both allowed." if OIL_DIRECTION_MODE == "BOTH"
+                               else f"MA40 -- BUY only while price is above the {ENG_MA_PERIOD} MA, SELL only while below it.")
+                        )
+                    await send_reply(reply)
+                except Exception as e:
+                    await send_reply(f"⚠️ Error: {e}")
+
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:
                     now_wib = datetime.now(timezone.utc) + timedelta(hours=7)
@@ -4473,7 +4965,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         f"\U0001f4c8 *STRATEGY:*\n"
                         f"\u2022 Direction Mode ({'A' if bot_role == 'control' else 'B'}): *{active_direction_mode}*\n"
                         f"\u2022 A Execution (M1): *Mother Bar V2 -- Close/Fib TP1 1.25x/TP2 8x, Momentum TP1 2x/TP2 15x, reject risk > max($15, 2.25x ATR)*\n"
-                        f"\u2022 B Execution (5M): *EMA {EXPERIMENTAL_EMA_FAST}/{EXPERIMENTAL_EMA_SLOW}*\n"
+                        f"\u2022 B Execution (M5): *Engulfing on {OIL_MT5_SYMBOL}, MT5 feed*\n"
                         f"\u2022 Confluence (15M): *EMA {TREND_15M_EMA_FAST}/{TREND_15M_EMA_SLOW}* (derived locally from M5)\n"
                         f"\u2022 Strategy C: *Mother Bar Micro-Breakout (MBMB)* | Max {EXTREME_MAX_TRADES_PER_DAY_LABEL}/day\n"
                         f"\u2022 Live MT5 Execution: *{'A' if CONTROL_EXECUTION_MODE == 'LIVE' else ('B' if EXPERIMENTAL_EXECUTION_MODE == 'LIVE' else ('C' if BREAKOUT_EXECUTION_MODE == 'LIVE' else 'none'))}* (toggle with /live_a, /live_b, /live_c)\n\n"
@@ -4774,65 +5266,6 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     await send_reply(reply)
                 except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
 
-            elif bot_role == "experimental" and raw_text == "/stats":
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*) AS total FROM signals WHERE status = 'EXECUTED' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
-                    total_executed = cur.fetchone()["total"] or 0
-                    cur.execute("SELECT COUNT(*) AS vetoes FROM signals WHERE status = 'VETOED' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
-                    total_vetoes = cur.fetchone()["vetoes"] or 0
-                    cur.execute("SELECT COUNT(*) AS pending FROM signals WHERE status = 'EXECUTED' AND outcome = 'PENDING' AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
-                    total_pending = cur.fetchone()["pending"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp1_wins FROM signals WHERE strategy = %s AND (outcome LIKE 'WIN (TP1%%' OR outcome LIKE 'CLOSED%%')", (EXPERIMENTAL_STRATEGY,))
-                    tp1_wins = cur.fetchone()["tp1_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS tp2_wins FROM signals WHERE strategy = %s AND outcome LIKE 'WIN (TP2%%'", (EXPERIMENTAL_STRATEGY,))
-                    tp2_wins = cur.fetchone()["tp2_wins"] or 0
-                    cur.execute("SELECT COUNT(*) AS losses FROM signals WHERE strategy = %s AND outcome LIKE 'LOSS%%'", (EXPERIMENTAL_STRATEGY,))
-                    losses = cur.fetchone()["losses"] or 0
-
-                    cur.execute("SELECT action, COALESCE(entry_price, price, 0) AS entry_p, COALESCE(sl_price, sl, 0) AS sl_p, COALESCE(tp1_price, tp1, 0) AS tp1_p, COALESCE(tp2_price, tp2, 0) AS tp2_p, exit_price, COALESCE(outcome, 'PENDING') AS outcome_val FROM signals WHERE status = 'EXECUTED' AND exit_price IS NOT NULL AND strategy = %s", (EXPERIMENTAL_STRATEGY,))
-                    closed_trades = cur.fetchall()
-                    total_pips = win_pips = loss_pips = 0.0
-                    total_wins_count = tp1_wins + tp2_wins
-
-                    for t in closed_trades:
-                        trade_pips, _ = compute_trade_pips({"action": t["action"], "entry_price": t["entry_p"], "sl_price": t["sl_p"], "tp1_price": t["tp1_p"], "tp2_price": t["tp2_p"], "exit_price": t["exit_price"], "outcome": t["outcome_val"]})
-                        total_pips += trade_pips
-                        if trade_pips > 0: win_pips += trade_pips
-                        elif trade_pips < 0: loss_pips += abs(trade_pips)
-
-                    win_rate = (total_wins_count / total_executed * 100) if total_executed > 0 else 0.0
-                    est_dollar = total_pips * 0.10
-                    avg_win = (win_pips / total_wins_count) if total_wins_count > 0 else 0.0
-                    avg_loss = (loss_pips / losses) if losses > 0 else 0.0
-                    profit_factor = (win_pips / loss_pips) if loss_pips > 0 else (win_pips if win_pips > 0 else 0.0)
-                    cur.close(); conn.close()
-
-                    reply = (
-                        f"\U0001f4ca *PERFORMANCE ANALYTICS DASHBOARD (LIVE)*\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f4b0 *NET PIPS & PROFIT:*\n"
-                        f"\u2022 Net Pips (2x0.01 lot): *{total_pips:+.1f} pips*\n"
-                        f"\u2022 Net Profit (2x0.01 Lot, actual MT5 exposure): *${est_dollar:+.2f}*\n\n"
-                        f"\U0001f4c8 *WIN / LOSS BREAKDOWN:*\n"
-                        f"\u2022 Total Executed: *{total_executed}*\n"
-                        f"\u2022 Total Wins: *{total_wins_count} ({win_rate:.1f}%)*\n"
-                        f"  \u2514\u2500 Hit TP1 (BE Runner): *{tp1_wins}*\n"
-                        f"  \u2514\u2500 Hit TP2 (Full Target): *{tp2_wins}*\n"
-                        f"\u2022 Total Losses (SL Hit): *{losses}*\n"
-                        f"\u2022 Active Pending: *{total_pending}*\n\n"
-                        f"\u26a1 *SYSTEM & AI EFFICIENCY:*\n"
-                        f"\u2022 Total Signals: *{total_executed + total_vetoes}*\n"
-                        f"\u2022 AI Vetoed Signals: *{total_vetoes}*\n\n"
-                        f"\U0001f3af *RISK & TRADE METRICS:*\n"
-                        f"\u2022 Avg Win: *+{avg_win:.1f} pips* | Avg Loss: *-{avg_loss:.1f} pips*\n"
-                        f"\u2022 Profit Factor: *{profit_factor:.2f}*\n"
-                        f"\u2022 Win Rate: *{win_rate:.1f}%*"
-                    )
-                    await send_reply(reply)
-                except Exception as e: await send_reply(f"\u26a0\ufe0f Error querying stats: {e}")
-
             elif raw_text == "/compare":
                 try:
                     await send_reply(format_compare_reply(compute_strategy_comparison()))
@@ -4925,7 +5358,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                 pips, profit_usd = compute_trade_pips({
                                     "action": action, "entry_price": entry, "sl_price": l["sl_p"],
                                     "tp1_price": l["tp1_p"], "tp2_price": l["tp2_p"], "exit_price": exit_p,
-                                    "outcome": outcome
+                                    "outcome": outcome,
+                                    "strategy": (CONTROL_STRATEGY if bot_role == 'control' else EXPERIMENTAL_STRATEGY)
                                 })
                                 r_multiple = compute_r_multiple(
                                     action, entry, exit_p, float(l["sl_p"] or 0.0),
@@ -4943,7 +5377,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                                 icon = "\U0001f7e1"
 
                             reply += (
-                                f"{icon} *ID #{trade_id} | {action} XAU/USD*\n"
+                                f"{icon} *ID #{trade_id} | {action} {'XAU/USD' if bot_role == 'control' else OIL_MT5_SYMBOL}*\n"
                                 f"\u2022 Entry: ${entry:.2f} \u2192 Exit: *${(exit_p if exit_p else 0.0):.2f}*\n"
                                 f"\u2022 Outcome: *{outcome}*\n"
                                 f"\u2022 Result: {pip_str} | Time: {date_str}\n"

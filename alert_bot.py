@@ -55,6 +55,7 @@ import psycopg2
 import gc
 import logging
 import uuid
+import time as _time
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
@@ -62,6 +63,7 @@ import httpx
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -73,7 +75,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return "/get-latest-signal" not in msg and "/get-pending-signals" not in msg
+        return "/get-latest-signal" not in msg and "/get-pending-signals" not in msg and "/oil-levels" not in msg
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
@@ -217,6 +219,17 @@ ENG_STACK_MAX = 3               # max simultaneously open B trades in one direct
 ENG_STACK_ADX_MIN = 22.0        # "movement still strong" gate for stacking: ADX >= this
 ENG_SLOPE_BARS = 3              # MA40 slope measured over this many bars
 
+# --- Shadow context tags (2026-10-15): TAG ONLY, they never block or change a trade ---
+ENG_SHADOW_ENABLED = True
+ENG_CTX_SWING_BARS = 40         # swing level = extreme of this many M5 bars before the engulfed candle
+ENG_CTX_SWING_NEAR_ATR = 0.5    # "at swing" = engulfing extreme within this x ATR of the prior swing (or beyond it)
+ENG_CTX_ROUND_GRID = 0.50       # round-number grid in price units (95.00, 94.50, ...)
+ENG_CTX_ROUND_NEAR_ATR = 0.25   # "near round" = extreme within this x ATR of a grid level
+ENG_CTX_PUSH_MIN_BARS = 3       # exhaustion: this many same-direction candles into the engulfed bar ...
+ENG_CTX_STRETCH_ATR = 1.5       # ... or the engulfed close stretched this x ATR from EMA20
+ENG_CHART_ON_SIGNAL = True       # send a chart image with every Bot B signal
+ENG_CHART_BARS = 60             # candles shown in the Telegram chart
+ENG_SHADOW_MAX_BARS = 36        # shadow trade is closed as TIMEOUT after this many M5 bars (3h)
 OIL_DIRECTION_MODE = "BOTH"     # BOTH | MA40  (persisted in bot_settings as "oil_direction_mode")
 OIL_DIRECTION_MODES = {"BOTH", "MA40"}
 mt5_market_cache_oil = {"df": None, "updated_at": None, "source": None}   # B's oil M5 feed, pushed by the MT5 EA
@@ -608,6 +621,22 @@ def init_db():
             );
         """)
 
+        # Bot B shadow log: every engulfing candidate (passed OR rejected) with context tags and a simulated outcome.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS eng_shadow (
+                id SERIAL PRIMARY KEY,
+                bar_time TEXT UNIQUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                action TEXT, geom TEXT, passed BOOLEAN, reject_reason TEXT,
+                entry REAL, sl REAL, tp1 REAL, risk REAL,
+                atr REAL, range_atr REAL, body_ratio REAL, adx REAL, ma_dist_atr REAL,
+                swing_dist_atr REAL, at_swing BOOLEAN, sweep BOOLEAN,
+                round_dist_atr REAL, near_round BOOLEAN,
+                push_bars INTEGER, push_atr REAL, ema20_stretch_atr REAL, exhausted BOOLEAN,
+                ctx_score INTEGER,
+                outcome TEXT DEFAULT 'OPEN', r_result REAL, mfe_r REAL, mae_r REAL, bars_held INTEGER, resolved_at TIMESTAMPTZ
+            );
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_time ON bot_events(event_time DESC);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_cycle ON bot_events(cycle_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_type ON bot_events(event_type);")
@@ -3272,6 +3301,382 @@ def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None):
     return action, info
 
 
+
+# ---------- Bot B SHADOW CONTEXT (tag-only; never affects trading) ----------
+def _eng_context_tags(d: pd.DataFrame, action: str) -> dict:
+    """Where / how did this engulfing form? Looks at the last closed bar (engulfing) and the one before (engulfed)."""
+    cur, prev = d.iloc[-1], d.iloc[-2]
+    atr = float(cur["atr"])
+    sign = 1.0 if action == "BUY" else -1.0
+    h, l, c = float(cur["high"]), float(cur["low"]), float(cur["close"])
+    ph, pl, pc = float(prev["high"]), float(prev["low"]), float(prev["close"])
+    tags = {"swing_dist_atr": None, "at_swing": False, "sweep": False, "round_dist_atr": None, "near_round": False,
+            "push_bars": 0, "push_atr": 0.0, "ema20_stretch_atr": 0.0, "exhausted": False, "ctx_score": 0}
+    # 1) swing-level location + 2) sweep & reject. Level = extreme of the N bars BEFORE the engulfed candle.
+    prior = d.iloc[-2 - ENG_CTX_SWING_BARS:-2]
+    if len(prior) >= 10 and atr > 0:
+        if action == "BUY":
+            level = float(prior["low"].min()); ext = min(l, pl)
+            dist = (ext - level) / atr
+            tags["sweep"] = bool(ext < level and c > level)
+        else:
+            level = float(prior["high"].max()); ext = max(h, ph)
+            dist = (level - ext) / atr
+            tags["sweep"] = bool(ext > level and c < level)
+        tags["swing_dist_atr"] = dist                 # <= 0 means the engulfing made a new extreme (stop-run territory)
+        tags["at_swing"] = bool(dist <= ENG_CTX_SWING_NEAR_ATR)
+    # round number nearest to the engulfing's extreme (low for BUY, high for SELL)
+    if atr > 0:
+        ext_r = l if action == "BUY" else h
+        nearest = round(ext_r / ENG_CTX_ROUND_GRID) * ENG_CTX_ROUND_GRID
+        tags["round_dist_atr"] = abs(ext_r - nearest) / atr
+        tags["near_round"] = bool(tags["round_dist_atr"] <= ENG_CTX_ROUND_NEAR_ATR)
+    # 3) exhaustion: same-direction push into the engulfed candle, and stretch from EMA20
+    n, i = 0, len(d) - 2
+    oldest_open = float(prev["open"])
+    while i >= 0 and n < 15:
+        bo, bc = float(d["open"].iloc[i]), float(d["close"].iloc[i])
+        against = (bc < bo) if action == "BUY" else (bc > bo)
+        if not against:
+            break
+        n += 1; oldest_open = bo; i -= 1
+    tags["push_bars"] = n
+    if atr > 0:
+        tags["push_atr"] = sign * (oldest_open - pc) / atr if n else 0.0
+        ema20 = d["close"].ewm(span=20, adjust=False).mean()
+        tags["ema20_stretch_atr"] = sign * (float(ema20.iloc[-2]) - pc) / atr
+    tags["exhausted"] = bool(n >= ENG_CTX_PUSH_MIN_BARS or tags["ema20_stretch_atr"] >= ENG_CTX_STRETCH_ATR)
+    tags["ctx_score"] = int(tags["at_swing"]) + int(tags["sweep"]) + int(tags["exhausted"])
+    return tags
+
+
+def _eng_shadow_candidate(d: pd.DataFrame, action: str, m: dict):
+    """Any engulfing-looking last bar, whether or not it passed the trading filters.
+    geom BODY  = the bot's own strict body engulfing; geom RANGE = candle covers the previous candle's
+    whole high-low range with opposite colour (what the eye often calls an engulfing)."""
+    cur, prev = d.iloc[-1], d.iloc[-2]
+    o, h, l, c = (float(cur[k]) for k in ("open", "high", "low", "close"))
+    po, ph, pl, pc = (float(prev[k]) for k in ("open", "high", "low", "close"))
+    atr = float(cur["atr"]) if not pd.isna(cur["atr"]) else 0.0
+    if atr <= 0:
+        return None
+    if "range_atr" in m:                                      # strict body geometry already passed in detect_engulfing_signal
+        act = "BUY" if c > o else "SELL"
+        geom = "BODY"
+        passed = action in ("BUY", "SELL")
+        reason = "PASSED FILTERS" if passed else str(m.get("reason", ""))[:200]
+    elif ((c > o and pc < po) or (c < o and pc > po)) and h >= ph and l <= pl:
+        act = "BUY" if c > o else "SELL"
+        geom, passed, reason = "RANGE", False, "Range-only engulfing (candle bodies not fully engulfed)"
+    else:
+        return None
+    rng, body, pbody = h - l, abs(c - o), abs(pc - po)
+    risk = (c - l) if act == "BUY" else (h - c)
+    if risk <= 0 or rng <= 0:
+        return None
+    tp1 = (h + ENG_TP_RANGE_MULT * rng) if act == "BUY" else (l - ENG_TP_RANGE_MULT * rng)
+    adx = float(cur["adx"]) if not pd.isna(cur["adx"]) else 0.0
+    ma = float(cur["ma40"]) if not pd.isna(cur["ma40"]) else 0.0
+    sign = 1.0 if act == "BUY" else -1.0
+    return {"action": act, "geom": geom, "passed": passed, "reject_reason": reason,
+            "entry": c, "sl": (l if act == "BUY" else h), "tp1": tp1, "risk": risk, "atr": atr,
+            "range_atr": rng / atr, "body_ratio": (pbody / body) if body > 0 else 1.0, "adx": adx,
+            "ma_dist_atr": (sign * (c - ma) / atr) if ma > 0 else 0.0,
+            "bar_time": str(cur["datetime"])}
+
+
+def _eng_shadow_log(d: pd.DataFrame, action: str, m: dict):
+    """Computes tags (always) and stores the candidate (if DB). Returns (cand, tags) or (None, None). Never raises."""
+    try:
+        if not ENG_SHADOW_ENABLED:
+            return None, None
+        cand = _eng_shadow_candidate(d, action, m)
+        if not cand:
+            return None, None
+        tags = _eng_context_tags(d, cand["action"])
+        if DATABASE_URL:
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO eng_shadow (bar_time, action, geom, passed, reject_reason, entry, sl, tp1, risk, atr, range_atr,
+                    body_ratio, adx, ma_dist_atr, swing_dist_atr, at_swing, sweep, round_dist_atr, near_round,
+                    push_bars, push_atr, ema20_stretch_atr, exhausted, ctx_score)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (bar_time) DO NOTHING
+            """, (cand["bar_time"], cand["action"], cand["geom"], cand["passed"], cand["reject_reason"], cand["entry"],
+                  cand["sl"], cand["tp1"], cand["risk"], cand["atr"], cand["range_atr"], cand["body_ratio"], cand["adx"],
+                  cand["ma_dist_atr"], tags["swing_dist_atr"], tags["at_swing"], tags["sweep"], tags["round_dist_atr"],
+                  tags["near_round"], tags["push_bars"], tags["push_atr"], tags["ema20_stretch_atr"], tags["exhausted"],
+                  tags["ctx_score"]))
+            conn.commit(); cur.close(); conn.close()
+        return cand, tags
+    except Exception as e:
+        logging.warning(f"[ENG B SHADOW] log failed (trading unaffected): {e}")
+        return None, None
+
+
+def _eng_shadow_mark(bar_time, reason: str):
+    """A candidate that passed the filters but was then skipped (stack rules): record why."""
+    try:
+        if not (ENG_SHADOW_ENABLED and DATABASE_URL and bar_time):
+            return
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("UPDATE eng_shadow SET passed = FALSE, reject_reason = %s WHERE bar_time = %s", (str(reason)[:200], str(bar_time)))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logging.warning(f"[ENG B SHADOW] mark failed: {e}")
+
+
+def _eng_shadow_resolve(d: pd.DataFrame):
+    """Simulate every OPEN shadow candidate on the bars that closed after it: TP1 vs SL, SL first if both in one bar.
+    R = distance / risk (TP1 => ENG_TP_RANGE_MULT x range / risk, SL => -1, TIMEOUT => open P/L after ENG_SHADOW_MAX_BARS)."""
+    try:
+        if not (ENG_SHADOW_ENABLED and DATABASE_URL):
+            return
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT id, bar_time, action, entry, sl, tp1, risk FROM eng_shadow WHERE outcome = 'OPEN' ORDER BY id")
+        rows = cur.fetchall()
+        dts = pd.to_datetime(d["datetime"])
+        for r in rows:
+            try:
+                fut = d[dts > pd.to_datetime(r["bar_time"])]
+                if fut.empty:
+                    continue
+                buy = r["action"] == "BUY"
+                entry, sl, tp1, risk = float(r["entry"]), float(r["sl"]), float(r["tp1"]), float(r["risk"])
+                mfe = mae = 0.0; outcome = None; res_r = None; bars = 0
+                for _, b in fut.iterrows():
+                    bars += 1
+                    hi, lo, cl = float(b["high"]), float(b["low"]), float(b["close"])
+                    mfe = max(mfe, ((hi - entry) if buy else (entry - lo)) / risk)
+                    mae = max(mae, ((entry - lo) if buy else (hi - entry)) / risk)
+                    hit_sl = (lo <= sl) if buy else (hi >= sl)
+                    hit_tp = (hi >= tp1) if buy else (lo <= tp1)
+                    if hit_sl:                                   # SL wins ties (conservative)
+                        outcome, res_r = "SL", -1.0; break
+                    if hit_tp:
+                        outcome, res_r = "TP1", abs(tp1 - entry) / risk; break
+                    if bars >= ENG_SHADOW_MAX_BARS:
+                        outcome, res_r = "TIMEOUT", ((cl - entry) if buy else (entry - cl)) / risk; break
+                if outcome:
+                    cur.execute("""UPDATE eng_shadow SET outcome=%s, r_result=%s, mfe_r=%s, mae_r=%s, bars_held=%s, resolved_at=NOW()
+                                   WHERE id=%s""", (outcome, res_r, mfe, mae, bars, r["id"]))
+            except Exception as e:
+                logging.warning(f"[ENG B SHADOW] resolve row {r.get('id')} failed: {e}")
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logging.warning(f"[ENG B SHADOW] resolve failed (trading unaffected): {e}")
+
+
+def _ctx_line(tags) -> str:
+    if not tags:
+        return ""
+    sd = tags["swing_dist_atr"]
+    return (f"Context (tag only): swing {'YES' if tags['at_swing'] else 'no'}"
+            f"{'' if sd is None else f' ({sd:+.2f} ATR)'} | sweep {'YES' if tags['sweep'] else 'no'} | "
+            f"push {tags['push_bars']} bars, EMA20 stretch {tags['ema20_stretch_atr']:+.1f} ATR "
+            f"({'EXHAUSTED' if tags['exhausted'] else 'no'}) | round no. {'YES' if tags['near_round'] else 'no'} | "
+            f"score {tags['ctx_score']}/3")
+
+
+def build_oil_ctx_text() -> str:
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""SELECT geom, passed, at_swing, sweep, near_round, exhausted, push_bars, ctx_score, outcome, r_result
+                   FROM eng_shadow""")
+    allrows = cur.fetchall(); cur.close(); conn.close()
+    open_n = sum(1 for r in allrows if r["outcome"] == "OPEN")
+    rows = [r for r in allrows if r["outcome"] != "OPEN" and r["r_result"] is not None]
+    if not rows:
+        return (f"🔬 *BOT B CONTEXT SHADOW*\n\nCandidates logged: *{len(allrows)}* | Still open: *{open_n}*\n"
+                "No resolved shadow trades yet -- they resolve on later M5 bars.")
+
+    def agg(rs):
+        n = len(rs)
+        if n == 0:
+            return None
+        tp = sum(1 for r in rs if r["outcome"] == "TP1")
+        rr = [float(r["r_result"]) for r in rs]
+        return n, tp / n * 100.0, sum(rr) / n, sum(rr)
+
+    def line(label, rs):
+        a = agg(rs)
+        if not a:
+            return f"• {label}: n=0"
+        n, wr, avg, tot = a
+        flag = " ⚠️" if n < 10 else ""
+        return f"• {label}: n={n}{flag} | TP1 {wr:.0f}% | AvgR {avg:+.2f} | SumR {tot:+.1f}"
+
+    def push_bucket(r):
+        b = r["push_bars"] or 0
+        return "0-1" if b <= 1 else ("2" if b == 2 else ("3-4" if b <= 4 else "5+"))
+
+    out = [f"🔬 *BOT B CONTEXT SHADOW* (tag only, simulated TP1 vs SL)",
+           f"Resolved: *{len(rows)}* | Open: *{open_n}* | ⚠️ = n under 10, treat as noise", "",
+           "*All engulfing candidates:*", line("All", rows),
+           line("Passed bot filters", [r for r in rows if r["passed"]]),
+           line("Rejected by filters", [r for r in rows if not r["passed"]]),
+           line("Geometry BODY", [r for r in rows if r["geom"] == "BODY"]),
+           line("Geometry RANGE only", [r for r in rows if r["geom"] == "RANGE"]), "",
+           "*Swing level:*", line("At swing level", [r for r in rows if r["at_swing"]]),
+           line("Not at swing", [r for r in rows if not r["at_swing"]]), "",
+           "*Sweep and reject:*", line("Sweep YES", [r for r in rows if r["sweep"]]),
+           line("Sweep no", [r for r in rows if not r["sweep"]]), "",
+           "*Exhaustion before it:*", line("Exhausted", [r for r in rows if r["exhausted"]]),
+           line("Not exhausted", [r for r in rows if not r["exhausted"]])]
+    for b in ("0-1", "2", "3-4", "5+"):
+        out.append(line(f"Push {b} bars", [r for r in rows if push_bucket(r) == b]))
+    out += ["", "*Round number:*", line("Near round", [r for r in rows if r["near_round"]]),
+            line("Not near round", [r for r in rows if not r["near_round"]]), "",
+            "*Context score (swing + sweep + exhausted):*"]
+    for sc in (0, 1, 2, 3):
+        out.append(line(f"Score {sc}", [r for r in rows if (r["ctx_score"] or 0) == sc]))
+    return "\n".join(out)
+
+
+
+# ---------- Bot B Telegram chart image (2026-10-15) ----------
+_LEVEL_COLORS = {"SWH": "#ef5350", "SWL": "#66bb6a", "RNGH": "#42a5f5", "RNGL": "#42a5f5", "RND0": "#ffd54f", "RND5": "#78909c"}
+_LEVEL_STYLES = {"SWH": "-", "SWL": "-", "RNGH": "--", "RNGL": "--", "RND0": ":", "RND5": ":"}
+
+
+def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None):
+    """PNG bytes of the last `bars` M5 candles with MA40, S/R levels, candidate markers and (optionally) the signal's
+    entry/SL/TP1. Returns None if matplotlib is missing. Blocking -- call via asyncio.to_thread."""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except Exception as e:
+        logging.warning(f"[ENG B CHART] matplotlib unavailable: {e}")
+        return None
+    bars = bars or ENG_CHART_BARS
+    d_all = _eng_indicators(df)
+    d = d_all.tail(bars).reset_index(drop=True)
+    if len(d) < 10:
+        return None
+    atr = float(d_all.iloc[-1]["atr"]) if not pd.isna(d_all.iloc[-1]["atr"]) else 0.0
+    levels = _oil_level_list(d_all)
+
+    BG, FG = "#0f1720", "#cfd8dc"
+    fig, ax = plt.subplots(figsize=(8, 7.2), dpi=110)
+    fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
+    for i in range(len(d)):
+        o, h, l, c = (float(d.at[i, k]) for k in ("open", "high", "low", "close"))
+        col = "#26a69a" if c >= o else "#ef5350"
+        ax.vlines(i, l, h, color=col, linewidth=1.0)
+        ax.add_patch(Rectangle((i - 0.35, min(o, c)), 0.7, max(abs(c - o), 1e-4), facecolor=col, edgecolor=col))
+    ax.plot(d.index, d["ma40"], color="#ffa726", linewidth=1.3, label=f"MA{ENG_MA_PERIOD}")
+
+    y_lo, y_hi = float(d["low"].min()), float(d["high"].max())
+    if signal:
+        y_lo = min(y_lo, float(signal["sl"]), float(signal["tp1"])); y_hi = max(y_hi, float(signal["sl"]), float(signal["tp1"]))
+    pad = max((y_hi - y_lo) * 0.08, 0.05)
+    y_lo, y_hi = y_lo - pad, y_hi + pad
+    right = len(d) + 14
+
+    for kind, price, label in levels:
+        if y_lo <= price <= y_hi:
+            ax.axhline(price, color=_LEVEL_COLORS.get(kind, "#90a4ae"), linestyle=_LEVEL_STYLES.get(kind, ":"), linewidth=1.0, alpha=0.85)
+            ax.text(right - 0.3, price, (label if kind.startswith("RND") else f"{label} {price:.2f}"), color=_LEVEL_COLORS.get(kind, "#90a4ae"), fontsize=7.5, va="bottom", ha="right")
+
+    # candidate markers from the shadow log
+    if DATABASE_URL:
+        try:
+            keys = {str(d.at[i, "datetime"]): i for i in range(len(d))}
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("SELECT bar_time, action, passed, geom, ctx_score, sl FROM eng_shadow WHERE bar_time = ANY(%s)", (list(keys.keys()),))
+            rows = cur.fetchall(); cur.close(); conn.close()
+            off = max(atr * 0.15, 0.01)
+            for r in rows:
+                i = keys.get(str(r["bar_time"]))
+                if i is None:
+                    continue
+                buy = r["action"] == "BUY"
+                col = ("#00e676" if buy else "#ff1744") if r["passed"] else "#78909c"
+                y = float(r["sl"]) - off if buy else float(r["sl"]) + off
+                ax.scatter([i], [y], marker="^" if buy else "v", s=70 if r["passed"] else 40, color=col, zorder=5)
+                ax.text(i, y - atr * 0.45 if buy else y + atr * 0.45, f"{int(r['ctx_score'] or 0)}{'r' if r['geom'] == 'RANGE' else ''}",
+                        color=col, fontsize=8, ha="center", va="center", zorder=5)
+        except Exception as e:
+            logging.warning(f"[ENG B CHART] marker query failed: {e}")
+
+    if signal:
+        x0 = len(d) - 1
+        for key, col, name in (("entry", "#eceff1", "Entry"), ("sl", "#ff5252", "SL"), ("tp1", "#69f0ae", "TP1")):
+            v = float(signal[key])
+            ax.hlines(v, x0, right - 1, colors=col, linestyles="--", linewidth=1.4)
+            ax.text(x0 + 0.5, v, f"{name} {v:.2f}", color=col, fontsize=8, va="bottom", ha="left", fontweight="bold")
+
+    ax.set_xlim(-1, right); ax.set_ylim(y_lo, y_hi)
+    step = 6
+    ticks = list(range(0, len(d), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([pd.Timestamp(d.at[i, "datetime"]).strftime("%H:%M") for i in ticks], color=FG, fontsize=8)
+    ax.tick_params(axis="y", colors=FG, labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color("#37474f")
+    ax.grid(color="#1c2833", linewidth=0.5)
+    ax.yaxis.tick_right()
+    title = f"{OIL_MT5_SYMBOL} M5 | last {len(d)} bars | ATR {atr:.2f} | close {float(d.iloc[-1]['close']):.2f}"
+    if signal:
+        title = f"{signal.get('action', '')} signal #{signal.get('id', '')} | " + title
+    ax.set_title(title, color="white", fontsize=10)
+    ax.legend(loc="upper left", facecolor=BG, edgecolor="#37474f", labelcolor=FG, fontsize=8)
+    fig.text(0.01, 0.005, "Arrows: bright = passed filters, grey = rejected; digit = context score 0-3 (swing + sweep + exhausted), r = range-only. "
+             "Times = MT5 server time.", color="#78909c", fontsize=6.5)
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _oil_chart_caption(df: pd.DataFrame, extra: str = "") -> str:
+    d = _eng_indicators(df)
+    last = d.iloc[-1]
+    price = float(last["close"]); atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+    lv = _oil_level_list(d)
+    below = max((x for x in lv if x[1] <= price), key=lambda x: x[1], default=None)
+    above = min((x for x in lv if x[1] > price), key=lambda x: x[1], default=None)
+    def fmt(x):
+        if not x:
+            return "none"
+        name = x[2] if x[0].startswith("RND") else f"{x[2]} {x[1]:.2f}"
+        return f"{name} ({abs(price - x[1]) / atr:.1f} ATR)" if atr > 0 else name
+    return (extra + f"Close {price:.2f} | ATR {atr:.2f}\nNearest support: {fmt(below)}\nNearest resistance: {fmt(above)}")[:1000]
+
+
+async def send_telegram_photo(client: httpx.AsyncClient, png: bytes, caption: str, chat_id: str, bot_token: str):
+    chat_id = "".join(str(chat_id or "").split())
+    if not (png and bot_token and chat_id):
+        return
+    try:
+        res = await client.post(f"https://api.telegram.org/bot{bot_token}/sendPhoto",
+                                data={"chat_id": chat_id, "caption": caption[:1000]},
+                                files={"photo": ("oil_chart.png", png, "image/png")}, timeout=30.0)
+        if res.status_code != 200:
+            logging.error(f"[TELEGRAM PHOTO] HTTP {res.status_code}: {res.text[:200]}")
+    except Exception as e:
+        logging.error(f"[TELEGRAM PHOTO EXCEPTION] {e}")
+
+
+async def send_oil_chart(client: httpx.AsyncClient, chat_id: str, bot_token: str, signal: dict = None, extra_caption: str = "") -> str:
+    """Render + send. Returns '' on success or a short error text for the caller to show. Never raises."""
+    try:
+        df = mt5_market_cache_oil.get("df")
+        if df is None or len(df) < ENG_MA_PERIOD + ENG_SLOPE_BARS + 2:
+            return "No oil data yet -- the MT5 EA has not pushed enough CLS10.m bars."
+        png = await asyncio.to_thread(render_oil_chart_png, df, ENG_CHART_BARS, signal)
+        if not png:
+            return "Chart could not be drawn. Add `matplotlib` to requirements.txt on Render and redeploy."
+        await send_telegram_photo(client, png, _oil_chart_caption(df, extra_caption), chat_id, bot_token)
+        return ""
+    except Exception as e:
+        logging.error(f"[ENG B CHART] {e}")
+        return f"Chart error: {e}"
+
+
 def _eng_open_count(action: str) -> int:
     """Open (unresolved) B trades in this direction. Fails to 0 if DB is unreachable."""
     if not DATABASE_URL:
@@ -3297,17 +3702,22 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
     action, m = detect_engulfing_signal(d)
     _eng_state["last_bar"] = m.get("bar_time")
     _eng_state["last_reason"] = m.get("reason", "")
+    # Shadow layer: log every engulfing candidate with context tags, settle older ones. Cannot affect trading.
+    _shadow_cand, _ctx = _eng_shadow_log(d, action, m)
+    _eng_shadow_resolve(d)
     if action == "HOLD":
         return
 
     open_same = _eng_open_count(action)
     if open_same >= ENG_STACK_MAX:
         _eng_state["last_reason"] = f"{action} skipped: {open_same} open trades already (max {ENG_STACK_MAX})"
+        _eng_shadow_mark(m.get("bar_time"), _eng_state["last_reason"])
         logging.info(f"[ENG B] {_eng_state['last_reason']}")
         return
     if open_same >= 1 and not m["strong"]:
         _eng_state["last_reason"] = (f"{action} stack skipped: move not strong (ADX {m['adx']:.1f}, DI gap {m['di_gap']:+.1f}, "
                                      f"MA40 slope {m['slope_atr']:+.2f} ATR, MA dist {m['ma_dist_atr']:+.2f} ATR)")
+        _eng_shadow_mark(m.get("bar_time"), _eng_state["last_reason"])
         logging.info(f"[ENG B] {_eng_state['last_reason']}")
         return
     stack_idx = open_same + 1
@@ -3319,7 +3729,7 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
     side_txt = "ABOVE_MA40" if price > m["ma40"] else "BELOW_MA40"
     reasoning = (f"{trigger}; range={m['range']:.3f} ({m['range_atr']:.2f} ATR), engulfed body={m['body_ratio']*100:.0f}% of engulfing, "
                  f"ATR={m['atr']:.3f}, ADX={m['adx']:.1f}, MA40={m['ma40']:.3f} (dist {m['ma_dist_atr']:+.2f} ATR), "
-                 f"stack #{stack_idx}, direction mode={OIL_DIRECTION_MODE}, data=MT5.")
+                 f"stack #{stack_idx}, direction mode={OIL_DIRECTION_MODE}, data=MT5. {_ctx_line(_ctx)}")
     if not DATABASE_URL:
         return
     try:
@@ -3356,10 +3766,15 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
             f"TP1: *{tp1:.2f}*\nTP2: *{tp2:.2f}*\n"
             f"Engulfing range: *{m['range']:.2f}* ({m['range_atr']:.2f} ATR) | Engulfed body: *{m['body_ratio']*100:.0f}%* of engulfing\n"
             f"ADX: *{m['adx']:.1f}* | MA40 dist: *{m['ma_dist_atr']:+.2f} ATR* ({regime.replace('_', ' ')})\n"
-            f"Stack: *#{stack_idx}* of max {ENG_STACK_MAX} | Direction mode: *{OIL_DIRECTION_MODE}*\n\n"
+            f"Stack: *#{stack_idx}* of max {ENG_STACK_MAX} | Direction mode: *{OIL_DIRECTION_MODE}*\n"
+            f"{_ctx_line(_ctx)}\n\n"
             f"{mode_footer}",
             EXPERIMENTAL_TELEGRAM_CHAT_ID, EXPERIMENTAL_TELEGRAM_BOT_TOKEN
         )
+        if ENG_CHART_ON_SIGNAL:
+            await send_oil_chart(client, EXPERIMENTAL_TELEGRAM_CHAT_ID, EXPERIMENTAL_TELEGRAM_BOT_TOKEN,
+                                 signal={"id": sid, "action": action, "entry": price, "sl": sl, "tp1": tp1},
+                                 extra_caption=f"{trigger} #{sid} {action} | Entry {price:.2f} SL {sl:.2f} TP1 {tp1:.2f}\n")
     except Exception as e:
         logging.error(f"[ENG B DB ERROR] {e}")
 
@@ -4450,6 +4865,90 @@ LATEST_SIGNAL_CACHE_TTL_SECONDS = 12
 # the database's compute/connection limits being hit: constant fresh connections never let
 # the compute endpoint go idle long enough to auto-suspend.
 
+
+# ---------- Bot B chart overlay: S/R levels + candidate markers for the MT5 EA (2026-10-15) ----------
+_oil_levels_cache = {"text": "", "at": 0.0}
+OIL_LEVELS_TTL_SEC = 20          # server-side cache so EA polling cannot hammer Postgres
+OIL_LEVELS_ROUND_SPAN = 1.5      # draw round-number lines within +/- this many price units of the last close
+OIL_LEVELS_MAX_MARKERS = 40
+
+
+def _oil_level_list(d: pd.DataFrame):
+    """[(kind, price, label)] -- swing H/L, range H/L and round numbers. Shared by /oil-levels and the Telegram chart."""
+    last_close = float(d.iloc[-1]["close"])
+    out, seen = [], []
+
+    def add(kind, price, label):
+        if any(abs(price - x) < 0.015 for x in seen):
+            return
+        seen.append(price)
+        out.append((kind, price, label))
+
+    sw = d.iloc[-ENG_CTX_SWING_BARS:]
+    add("SWH", float(sw["high"].max()), f"Swing H ({ENG_CTX_SWING_BARS} bars)")
+    add("SWL", float(sw["low"].min()), f"Swing L ({ENG_CTX_SWING_BARS} bars)")
+    add("RNGH", float(d["high"].max()), f"Range H ({len(d)} bars)")
+    add("RNGL", float(d["low"].min()), f"Range L ({len(d)} bars)")
+    g = ENG_CTX_ROUND_GRID
+    k = int((last_close - OIL_LEVELS_ROUND_SPAN) // g)
+    while k * g <= last_close + OIL_LEVELS_ROUND_SPAN:
+        lvl = k * g
+        if lvl > 0:
+            whole = abs(lvl - round(lvl)) < 1e-9
+            add("RND0" if whole else "RND5", lvl, f"Round {lvl:.2f}")
+        k += 1
+    return out
+
+
+def _oil_levels_text() -> str:
+    """Plain-text lines the EA parses (no JSON, no '|' inside fields):
+       META|last_bar_epoch|last_close|atr|bars
+       LVL|kind|price|label        kind: SWH SWL RNGH RNGL RND0 RND5
+       MRK|bar_epoch|BUY/SELL|price|passed 0/1|score|geom|short text"""
+    df = mt5_market_cache_oil.get("df")
+    if df is None or len(df) < ENG_MA_PERIOD + ENG_SLOPE_BARS + 2:
+        return "ERR|no oil data yet\n"
+    d = _eng_indicators(df)
+    last = d.iloc[-1]
+    atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+    last_close = float(last["close"])
+    last_epoch = int(pd.Timestamp(last["datetime"]).value // 10**9)     # naive MT5 server time treated as UTC == the EA's raw epoch
+    out = [f"META|{last_epoch}|{last_close:.3f}|{atr:.3f}|{len(d)}"]
+    for kind, price, label in _oil_level_list(d):
+        out.append(f"LVL|{kind}|{price:.2f}|{label}")
+
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("""SELECT bar_time, action, passed, geom, ctx_score, reject_reason, sl, outcome, at_swing, sweep, exhausted
+                           FROM eng_shadow ORDER BY id DESC LIMIT %s""", (OIL_LEVELS_MAX_MARKERS,))
+            for r in cur.fetchall():
+                try:
+                    ep = int(pd.Timestamp(r["bar_time"]).value // 10**9)
+                except Exception:
+                    continue
+                tag = ("S" if r["at_swing"] else "-") + ("W" if r["sweep"] else "-") + ("E" if r["exhausted"] else "-")
+                reason = str(r["reject_reason"] or "").replace("|", "/").replace("\n", " ")[:60]
+                text = f"{r['geom']} {tag} {r['outcome']}" + ("" if r["passed"] else f" - {reason}")
+                out.append(f"MRK|{ep}|{r['action']}|{float(r['sl']):.3f}|{1 if r['passed'] else 0}|{int(r['ctx_score'] or 0)}|{r['geom']}|{text}")
+            cur.close(); conn.close()
+        except Exception as e:
+            logging.warning(f"[OIL LEVELS] marker query failed: {e}")
+    return "\n".join(out) + "\n"
+
+
+@app.get("/oil-levels")
+async def oil_levels():
+    now = _time.time()
+    if now - _oil_levels_cache["at"] > OIL_LEVELS_TTL_SEC or not _oil_levels_cache["text"]:
+        try:
+            _oil_levels_cache["text"] = _oil_levels_text()
+        except Exception as e:
+            logging.warning(f"[OIL LEVELS] failed: {e}")
+            _oil_levels_cache["text"] = f"ERR|{type(e).__name__}\n"
+        _oil_levels_cache["at"] = now
+    return PlainTextResponse(_oil_levels_cache["text"])
+
 @app.get("/get-latest-signal")
 async def get_latest_signal():
     global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME
@@ -4699,7 +5198,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/macro", "/live_a", "/live_b", "/live_c"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/ctx", "/chart", "/macro", "/live_a", "/live_b", "/live_c"}
         BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare"} | C_FLIP_COMMANDS
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
@@ -4759,6 +5258,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/pips` - Detailed pips and USD report (TP / BE / SL breakdown)\n"
                         "• `/analyze` - Breakdown by engulfed-body ratio, range vs ATR, MA40 distance, stack position, ADX, session\n"
                         "• `/last` - Last 10 trades\n"
+                        "• `/chart` - Chart image: candles, MA40, S/R levels, engulfing markers\n"
+                        "• `/ctx` - Shadow context stats (swing / sweep / exhaustion) for every engulfing candidate\n"
                         "• `/compare` - A vs B vs C dashboard\n"
                         "• `/b_both` - Trade engulfing in both directions\n"
                         "• `/b_ma40` - One direction only: BUY above MA40, SELL below MA40\n"
@@ -4899,7 +5400,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     _note += "\n\u26a0\ufe0f C's Momentum Break ENTRY is OFF, so nothing will fire or flip until you send /c_momentum_on."
                 await send_reply(entry_flip_status_text(_bot, _note))
 
-            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/b_both", "/b_ma40"):
+            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/ctx", "/chart", "/b_both", "/b_ma40"):
                 try:
                     if raw_text == "/stats":
                         reply = build_oil_stats_text()
@@ -4909,6 +5410,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         reply = build_oil_analyze_text()
                     elif raw_text == "/status":
                         reply = build_oil_status_text()
+                    elif raw_text == "/ctx":
+                        reply = build_oil_ctx_text()
+                    elif raw_text == "/chart":
+                        _err = await send_oil_chart(client, sender_chat_id, active_token)
+                        reply = _err or None
                     else:
                         OIL_DIRECTION_MODE = "BOTH" if raw_text == "/b_both" else "MA40"
                         set_setting("oil_direction_mode", OIL_DIRECTION_MODE)
@@ -4918,7 +5424,8 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                             + ("BOTH -- engulfing BUY and SELL are both allowed." if OIL_DIRECTION_MODE == "BOTH"
                                else f"MA40 -- BUY only while price is above the {ENG_MA_PERIOD} MA, SELL only while below it.")
                         )
-                    await send_reply(reply)
+                    if reply:
+                        await send_reply(reply)
                 except Exception as e:
                     await send_reply(f"⚠️ Error: {e}")
 

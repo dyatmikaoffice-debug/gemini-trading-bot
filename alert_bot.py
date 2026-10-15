@@ -200,7 +200,7 @@ EXPERIMENTAL_DIRECTION_MODE = "BOTH"  # LEGACY: unused by the engulfing Bot B (s
 OIL_MT5_SYMBOL = (os.getenv("OIL_MT5_SYMBOL", "CLS10.m").strip() or "CLS10.m")
 OIL_SYMBOL_HINTS = ("CLS", "OIL", "WTI", "XTI")   # a push whose "symbol" contains one of these goes to the oil cache
 OIL_PIP_SIZE = 0.01                               # 1 oil "pip" = 0.01 price (CLS10.m quotes 2 decimals)
-OIL_LOT_SIZE = float(os.getenv("OIL_LOT_SIZE", "0.1") or 0.1)   # lots per position (your screenshot: 0.1)
+OIL_LOT_SIZE = float(os.getenv("OIL_LOT_SIZE", "0.03") or 0.03)   # lots per position (changed 2026-10-15: 0.1 -> 0.03 per leg, 2 legs per signal)
 OIL_USD_PER_PRICE_UNIT_PER_LOT = 1000.0           # confirmed from your screenshot: 0.1 lot, -0.03 move = -$3.00
 OIL_PIPS_PER_PRICE_UNIT = 1.0 / OIL_PIP_SIZE      # 100 pips per $1.00 move
 OIL_USD_PER_PIP = OIL_PIP_SIZE * OIL_USD_PER_PRICE_UNIT_PER_LOT * OIL_LOT_SIZE   # $ per pip per ONE position
@@ -3574,6 +3574,12 @@ def _symbol_for_strategy(strategy):
     return OIL_MT5_SYMBOL if strategy == EXPERIMENTAL_STRATEGY else None
 
 
+def _lot_for_strategy(strategy):
+    """Lots PER LEG the EA should use for this strategy. Only B (oil) is specified here;
+    None = EA keeps its own default lot (A/C gold, 0.01)."""
+    return OIL_LOT_SIZE if strategy == EXPERIMENTAL_STRATEGY else None
+
+
 # --- AI ANALYST EVALUATION ---
 async def analyze_signal_with_ai(
     proposed_action: str, trigger_type: str, current_price: float, df_5m: pd.DataFrame, 
@@ -4477,7 +4483,7 @@ async def get_latest_signal():
         conn.close()
 
         if row:
-            result = {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "strategy": row["strategy"], "symbol": _symbol_for_strategy(row["strategy"]), "trading_enabled": True}
+            result = {"id": int(row["id"]), "action": str(row["action"]).upper(), "entry": float(row["entry_p"]), "sl": float(row["sl_p"]), "tp1": float(row["tp1_p"]), "tp2": float(row["tp2_p"]), "timestamp": str(row["log_time"]), "strategy": row["strategy"], "symbol": _symbol_for_strategy(row["strategy"]), "lot": _lot_for_strategy(row["strategy"]), "trading_enabled": True}
         else:
             result = {"signal": None, "trading_enabled": True}
         _latest_signal_cache["response"] = result
@@ -4532,7 +4538,7 @@ async def get_pending_signals(since_id: int = 0, limit: int = 20):
             {"id": int(r["id"]), "action": str(r["action"]).upper(),
              "entry": float(r["entry_p"]), "sl": float(r["sl_p"]),
              "tp1": float(r["tp1_p"]), "tp2": float(r["tp2_p"]),
-             "timestamp": str(r["log_time"]), "strategy": r["strategy"], "symbol": _symbol_for_strategy(r["strategy"])}
+             "timestamp": str(r["log_time"]), "strategy": r["strategy"], "symbol": _symbol_for_strategy(r["strategy"]), "lot": _lot_for_strategy(r["strategy"])}
             for r in rows
         ]
         return {"signals": signals, "trading_enabled": True}

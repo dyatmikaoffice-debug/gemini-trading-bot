@@ -75,7 +75,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return "/get-latest-signal" not in msg and "/get-pending-signals" not in msg and "/oil-levels" not in msg
+        return "/get-latest-signal" not in msg and "/get-pending-signals" not in msg and "/oil-levels" not in msg and "/gold-levels" not in msg
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
@@ -229,10 +229,24 @@ ENG_CTX_PUSH_MIN_BARS = 3       # exhaustion: this many same-direction candles i
 ENG_CTX_STRETCH_ATR = 1.5       # ... or the engulfed close stretched this x ATR from EMA20
 ENG_CHART_ON_SIGNAL = True       # send a chart image with every Bot B signal
 ENG_CHART_BARS = 60             # candles shown in the Telegram chart
+GOLD_CHART_ON_SIGNAL = True     # send an S/R chart image with every Bot A / Bot C signal (also /chart on those bots)
 ENG_SHADOW_MAX_BARS = 36        # shadow trade is closed as TIMEOUT after this many M5 bars (3h)
 # --- REGIME rule set (2026-10-16): switch with /b_regime and /b_classic (persisted as "eng_ruleset") ---
 ENG_RULESET = "CLASSIC"          # CLASSIC = old filters | REGIME = trend/range/pattern engine + MA40-touch entries
-ENG_RULESETS = {"CLASSIC", "REGIME"}
+ENG_RULESETS = {"CLASSIC", "REGIME", "CONFLUENCE"}
+# --- CONFLUENCE rule set (2026-10-16): MA40 proximity + MA40 slope with the trade; S/R touch is only TAGGED ---
+CF_USE_RELAXED = True            # grey (relaxed) engulfings allowed: range >= RG_MIN_RANGE_ATR, body ratio <= RG_MAX_BODY_RATIO
+CF_TOUCH_MA_ATR = 0.60           # "very close" to MA40: engulfing extreme within this x ATR (touch or pierce up to 1.0 ATR also counts)
+CF_REQUIRE_SR = False            # True = also require an S/R touch; False = S/R touch is only tagged for /whatif
+CF_TOUCH_SR_ATR = 0.30
+CF_SR_MAX_PEN_ATR = 0.5
+CF_SR_KINDS = ("SWL", "SWH", "RNGL", "RNGH", "RND0", "RND5")
+CF_ROOM_KINDS = ("SWL", "SWH", "RNGL", "RNGH")   # swing/range levels only (round numbers excluded from the room check)
+CF_MIN_ROOM_R = 1.0              # next opposing swing/range level must be at least this many R away
+CF_MIN_SLOPE_ATR = 0.15          # MA40 slope with the trade over CF_SLOPE_BARS
+CF_SLOPE_BARS = 6
+CF_SL_SLIP = 0.03                # slippage room added beyond the engulfing extreme (3 points = 0.03 price = $1.50 at 0.05 lot)
+CF_TP_R = 2.0                    # TP = 2R (both legs exit together)
 RG_MIN_RANGE_ATR = 0.6           # REGIME: looser engulfing size (the MA40 touch is the main edge) ...
 RG_MAX_BODY_RATIO = 0.85         # ... and looser engulfed/engulfing body ratio
 RG_SLOPE_BARS = 6                # MA40 slope window (bars) for the trend vote
@@ -3061,6 +3075,11 @@ async def evaluate_extreme_strategy(client: httpx.AsyncClient, market_df_5m: pd.
             f"{mode_footer}",
             BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN
         )
+        if GOLD_CHART_ON_SIGNAL:
+            await send_gold_chart(client, BREAKOUT_TELEGRAM_CHAT_ID, BREAKOUT_TELEGRAM_BOT_TOKEN, "C", df=df,
+                                  signal={"id": sid, "action": action, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                                          "mb_high": metrics.get("mb_high"), "mb_low": metrics.get("mb_low")},
+                                  extra_caption=f"{trigger_db} #{sid} {action} | Entry {price:.2f} SL {sl:.2f} TP1 {tp1:.2f}\n")
     except Exception as e:
         logging.error(f"[MB C DB ERROR] {e}")
 
@@ -3236,6 +3255,11 @@ async def evaluate_control_mb_strategy(client: httpx.AsyncClient, now_wib: datet
             f"{mode_footer}",
             TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
         )
+        if GOLD_CHART_ON_SIGNAL:
+            await send_gold_chart(client, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, "A", df=df,
+                                  signal={"id": sid, "action": action, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                                          "mb_high": metrics.get("mb_high"), "mb_low": metrics.get("mb_low")},
+                                  extra_caption=f"{trigger_db} #{sid} {action} | Entry {price:.2f} SL {sl:.2f} TP1 {tp1:.2f}\n")
     except Exception as e:
         logging.error(f"[MB A DB ERROR] {e}")
 
@@ -3588,9 +3612,16 @@ _LEVEL_COLORS = {"SWH": "#ef5350", "SWL": "#66bb6a", "RNGH": "#42a5f5", "RNGL": 
 _LEVEL_STYLES = {"SWH": "-", "SWL": "-", "RNGH": "--", "RNGL": "--", "RND0": ":", "RND5": ":"}
 
 
-def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None):
-    """PNG bytes of the last `bars` M5 candles with MA40, S/R levels, candidate markers and (optionally) the signal's
-    entry/SL/TP1. Returns None if matplotlib is missing. Blocking -- call via asyncio.to_thread."""
+def _chart_indicators(df: pd.DataFrame, prof: dict) -> pd.DataFrame:
+    return _eng_indicators(df) if prof.get("oil") else _extreme_indicators(df, MB_CONFIG_C)
+
+
+def render_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None, prof: dict = None):
+    """PNG bytes of the last `bars` candles with S/R levels, moving averages and (optionally) the signal's
+    entry/SL/TP. prof = CHART_PROFILES entry (oil M5 / gold M1 / gold M5). Oil profile also draws the shadow-candidate
+    markers and the regime/pattern overlay. Returns None if matplotlib is missing. Blocking -- call via asyncio.to_thread."""
+    prof = prof or CHART_PROFILES["OIL"]
+    is_oil = bool(prof.get("oil"))
     try:
         import io
         import matplotlib
@@ -3598,15 +3629,15 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
     except Exception as e:
-        logging.warning(f"[ENG B CHART] matplotlib unavailable: {e}")
+        logging.warning(f"[CHART] matplotlib unavailable: {e}")
         return None
-    bars = bars or ENG_CHART_BARS
-    d_all = _eng_indicators(df)
+    bars = bars or prof["bars"]
+    d_all = _chart_indicators(df, prof)
     d = d_all.tail(bars).reset_index(drop=True)
     if len(d) < 10:
         return None
     atr = float(d_all.iloc[-1]["atr"]) if not pd.isna(d_all.iloc[-1]["atr"]) else 0.0
-    levels = _oil_level_list(d_all)
+    levels = _oil_level_list(d_all, prof)
 
     BG, FG = "#0f1720", "#cfd8dc"
     fig, ax = plt.subplots(figsize=(8, 7.2), dpi=110)
@@ -3616,12 +3647,21 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
         col = "#26a69a" if c >= o else "#ef5350"
         ax.vlines(i, l, h, color=col, linewidth=1.0)
         ax.add_patch(Rectangle((i - 0.35, min(o, c)), 0.7, max(abs(c - o), 1e-4), facecolor=col, edgecolor=col))
-    ax.plot(d.index, d["ma40"], color="#ffa726", linewidth=1.3, label=f"MA{ENG_MA_PERIOD}")
+    if is_oil:
+        ax.plot(d.index, d["ma40"], color="#ffa726", linewidth=1.3, label=f"MA{ENG_MA_PERIOD}")
+    else:
+        ax.plot(d.index, d["ema9"], color="#ffa726", linewidth=1.2, label=f"EMA{EXTREME_EMA_FAST}")
+        ax.plot(d.index, d["ema21"], color="#42a5f5", linewidth=1.2, label=f"EMA{EXTREME_EMA_SLOW}")
 
     y_lo, y_hi = float(d["low"].min()), float(d["high"].max())
+    sig_vals = []
     if signal:
-        y_lo = min(y_lo, float(signal["sl"]), float(signal["tp1"])); y_hi = max(y_hi, float(signal["sl"]), float(signal["tp1"]))
-    pad = max((y_hi - y_lo) * 0.08, 0.05)
+        sig_vals = [float(signal[k]) for k in ("entry", "sl", "tp1")]
+        tp2v = signal.get("tp2")
+        if tp2v is not None and abs(float(tp2v) - float(signal["tp1"])) > 1e-9:
+            sig_vals.append(float(tp2v))
+        y_lo = min([y_lo] + sig_vals); y_hi = max([y_hi] + sig_vals)
+    pad = max((y_hi - y_lo) * 0.08, prof["pad_min"])
     y_lo, y_hi = y_lo - pad, y_hi + pad
     right = len(d) + 14
 
@@ -3630,8 +3670,8 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
             ax.axhline(price, color=_LEVEL_COLORS.get(kind, "#90a4ae"), linestyle=_LEVEL_STYLES.get(kind, ":"), linewidth=1.0, alpha=0.85)
             ax.text(right - 0.3, price, (label if kind.startswith("RND") else f"{label} {price:.2f}"), color=_LEVEL_COLORS.get(kind, "#90a4ae"), fontsize=7.5, va="bottom", ha="right")
 
-    # candidate markers from the shadow log
-    if DATABASE_URL:
+    # candidate markers from the oil shadow log (oil only)
+    if is_oil and DATABASE_URL:
         try:
             keys = {str(d.at[i, "datetime"]): i for i in range(len(d))}
             conn = get_db_connection(); cur = conn.cursor()
@@ -3649,17 +3689,26 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
                 ax.text(i, y - atr * 0.45 if buy else y + atr * 0.45, f"{int(r['ctx_score'] or 0)}{'r' if r['geom'] == 'RANGE' else ''}",
                         color=col, fontsize=8, ha="center", va="center", zorder=5)
         except Exception as e:
-            logging.warning(f"[ENG B CHART] marker query failed: {e}")
+            logging.warning(f"[CHART] marker query failed: {e}")
 
     if signal:
         x0 = len(d) - 1
-        for key, col, name in (("entry", "#eceff1", "Entry"), ("sl", "#ff5252", "SL"), ("tp1", "#69f0ae", "TP1")):
+        lines = [("entry", "#eceff1", "Entry"), ("sl", "#ff5252", "SL"), ("tp1", "#69f0ae", "TP1")]
+        if len(sig_vals) > 3:
+            lines.append(("tp2", "#b2ff59", "TP2"))
+        for key, col, name in lines:
             v = float(signal[key])
             ax.hlines(v, x0, right - 1, colors=col, linestyles="--", linewidth=1.4)
             ax.text(x0 + 0.5, v, f"{name} {v:.2f}", color=col, fontsize=8, va="bottom", ha="left", fontweight="bold")
+        for key, name in (("mb_high", "MB high"), ("mb_low", "MB low")):
+            if signal.get(key) is not None:
+                v = float(signal[key])
+                if y_lo <= v <= y_hi:
+                    ax.hlines(v, max(len(d) - 25, 0), right - 1, colors="#ce93d8", linestyles="-.", linewidth=1.1)
+                    ax.text(right - 0.3, v, f"{name} {v:.2f}", color="#ce93d8", fontsize=7.5, va="top", ha="right")
 
     ax.set_xlim(-1, right); ax.set_ylim(y_lo, y_hi)
-    step = 6
+    step = prof["tick_step"]
     ticks = list(range(0, len(d), step))
     ax.set_xticks(ticks)
     ax.set_xticklabels([pd.Timestamp(d.at[i, "datetime"]).strftime("%H:%M") for i in ticks], color=FG, fontsize=8)
@@ -3668,34 +3717,40 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
         sp.set_color("#37474f")
     ax.grid(color="#1c2833", linewidth=0.5)
     ax.yaxis.tick_right()
-    title = f"{OIL_MT5_SYMBOL} M5 | last {len(d)} bars | ATR {atr:.2f} | close {float(d.iloc[-1]['close']):.2f}"
+    title = f"{prof['symbol']} {prof['tf']} | last {len(d)} bars | ATR {atr:.2f} | close {float(d.iloc[-1]['close']):.2f}"
     if signal:
         title = f"{signal.get('action', '')} signal #{signal.get('id', '')} | " + title
-    try:
-        rg = _regime_engine(d_all, update_state=False)
-        if rg.get("ok"):
-            N, M = len(d_all), len(d)
-            pat = rg.get("pattern")
-            ptxt = "no pattern"
-            if pat:
-                off = pat["start_full"] - (N - M)                 # chart x = window x + off
-                xa = max(pat["x0"] + off, 0)
-                xs = np.array([xa, M + 1.0])
-                for sl_, b_ in ((pat["su"], pat["bu"]), (pat["sl"], pat["bl"])):
-                    ax.plot(xs, sl_ * (xs - off) + b_, color="#ce93d8", linewidth=1.4, linestyle="-.", alpha=0.95)
-                ptxt = f"{pat['name']} ({rg['pattern_state']}, {pat['width_atr']:.1f} ATR)"
-            elif rg.get("box"):
-                bx = rg["box"]
-                for v in (bx["hi"], bx["lo"]):
-                    ax.hlines(v, max(M - RG_BOX_BARS, 0), M + 1, colors="#ce93d8", linestyles="-.", linewidth=1.2)
-                ptxt = f"range box ({rg['pattern_state']}, {bx['width_atr']:.1f} ATR)"
-            title += f"\n{rg['regime']} | {ptxt} | mode {rg['mode']} | rules {ENG_RULESET}"
-    except Exception as e:
-        logging.warning(f"[ENG B CHART] regime overlay failed: {e}")
+    if is_oil:
+        try:
+            rg = _regime_engine(d_all, update_state=False)
+            if rg.get("ok"):
+                N, M = len(d_all), len(d)
+                pat = rg.get("pattern")
+                ptxt = "no pattern"
+                if pat:
+                    off = pat["start_full"] - (N - M)                 # chart x = window x + off
+                    xa = max(pat["x0"] + off, 0)
+                    xs = np.array([xa, M + 1.0])
+                    for sl_, b_ in ((pat["su"], pat["bu"]), (pat["sl"], pat["bl"])):
+                        ax.plot(xs, sl_ * (xs - off) + b_, color="#ce93d8", linewidth=1.4, linestyle="-.", alpha=0.95)
+                    ptxt = f"{pat['name']} ({rg['pattern_state']}, {pat['width_atr']:.1f} ATR)"
+                elif rg.get("box"):
+                    bx = rg["box"]
+                    for v in (bx["hi"], bx["lo"]):
+                        ax.hlines(v, max(M - RG_BOX_BARS, 0), M + 1, colors="#ce93d8", linestyles="-.", linewidth=1.2)
+                    ptxt = f"range box ({rg['pattern_state']}, {bx['width_atr']:.1f} ATR)"
+                title += f"\n{rg['regime']} | {ptxt} | mode {rg['mode']} | rules {ENG_RULESET}"
+        except Exception as e:
+            logging.warning(f"[CHART] regime overlay failed: {e}")
     ax.set_title(title, color="white", fontsize=9.5)
     ax.legend(loc="upper left", facecolor=BG, edgecolor="#37474f", labelcolor=FG, fontsize=8)
-    fig.text(0.01, 0.005, "Arrows: bright = passed filters, grey = rejected; digit = context score 0-3 (swing + sweep + exhausted), r = range-only. "
-             "Times = MT5 server time.", color="#78909c", fontsize=6.5)
+    if is_oil:
+        foot = ("Arrows: bright = passed filters, grey = rejected; digit = context score 0-3 (swing + sweep + exhausted), r = range-only. "
+                "Times = MT5 server time.")
+    else:
+        foot = (f"Lines: swing H/L ({prof['swing']} bars), range H/L, round numbers every {prof['grid']:g}. "
+                "Dash-dot purple = Mother Bar high/low. Times = MT5 server time.")
+    fig.text(0.01, 0.005, foot, color="#78909c", fontsize=6.5)
     fig.tight_layout(rect=(0, 0.02, 1, 1))
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=BG)
@@ -3703,11 +3758,16 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
     return buf.getvalue()
 
 
-def _oil_chart_caption(df: pd.DataFrame, extra: str = "") -> str:
-    d = _eng_indicators(df)
+def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None):
+    return render_chart_png(df, bars, signal, CHART_PROFILES["OIL"])
+
+
+def _oil_chart_caption(df: pd.DataFrame, extra: str = "", prof: dict = None) -> str:
+    prof = prof or CHART_PROFILES["OIL"]
+    d = _chart_indicators(df, prof)
     last = d.iloc[-1]
     price = float(last["close"]); atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
-    lv = _oil_level_list(d)
+    lv = _oil_level_list(d, prof)
     below = max((x for x in lv if x[1] <= price), key=lambda x: x[1], default=None)
     above = min((x for x in lv if x[1] > price), key=lambda x: x[1], default=None)
     def fmt(x):
@@ -3715,11 +3775,13 @@ def _oil_chart_caption(df: pd.DataFrame, extra: str = "") -> str:
             return "none"
         name = x[2] if x[0].startswith("RND") else f"{x[2]} {x[1]:.2f}"
         return f"{name} ({abs(price - x[1]) / atr:.1f} ATR)" if atr > 0 else name
-    try:
-        rg = _regime_engine(d, update_state=False)
-        mode_line = f"\nMode: {rg['mode']} -- {rg['mode_reason']}" if rg.get("ok") else ""
-    except Exception:
-        mode_line = ""
+    mode_line = ""
+    if prof.get("oil"):
+        try:
+            rg = _regime_engine(d, update_state=False)
+            mode_line = f"\nMode: {rg['mode']} -- {rg['mode_reason']}" if rg.get("ok") else ""
+        except Exception:
+            mode_line = ""
     return (extra + f"Close {price:.2f} | ATR {atr:.2f}\nNearest support: {fmt(below)}\nNearest resistance: {fmt(above)}{mode_line}")[:1000]
 
 
@@ -3750,6 +3812,26 @@ async def send_oil_chart(client: httpx.AsyncClient, chat_id: str, bot_token: str
         return ""
     except Exception as e:
         logging.error(f"[ENG B CHART] {e}")
+        return f"Chart error: {e}"
+
+
+async def send_gold_chart(client: httpx.AsyncClient, chat_id: str, bot_token: str, which: str, signal: dict = None,
+                          extra_caption: str = "", df: pd.DataFrame = None) -> str:
+    """S/R chart for gold. which = 'A' (M1 feed) or 'C' (M5 feed). Uses the df passed in (the one the signal was
+    computed on) or the latest MT5 push. Returns '' on success or a short error text. Never raises."""
+    try:
+        prof = CHART_PROFILES["GOLD_M1" if which == "A" else "GOLD_M5"]
+        if df is None:
+            df = (mt5_market_cache_m1 if which == "A" else mt5_market_cache).get("df")
+        if df is None or len(df) < 30:
+            return f"No gold {prof['tf']} data yet -- the MT5 EA has not pushed {prof['tf']} bars (Twelve Data fallback is not charted)."
+        png = await asyncio.to_thread(render_chart_png, df, prof["bars"], signal, prof)
+        if not png:
+            return "Chart could not be drawn. Add `matplotlib` to requirements.txt on Render and redeploy."
+        await send_telegram_photo(client, png, _oil_chart_caption(df, extra_caption, prof), chat_id, bot_token)
+        return ""
+    except Exception as e:
+        logging.error(f"[GOLD CHART] {e}")
         return f"Chart error: {e}"
 
 
@@ -4077,7 +4159,9 @@ def build_oil_whatif_text() -> str:
            line("CLASSIC (old filters)", [r for r in rows if r["passed"]]),
            line("REGIME (new rules)", [r for r in rows if r["rules_pass"]]),
            line("REGIME: MA40-touch plays", [r for r in rows if r["rules_pass"] and str(r["mode"]).startswith(("TREND", "BREAKOUT"))]),
-           line("REGIME: range-edge plays", [r for r in rows if r["rules_pass"] and r["mode"] == "RANGE_EDGE"]), "",
+           line("REGIME: range-edge plays", [r for r in rows if r["rules_pass"] and r["mode"] == "RANGE_EDGE"]),
+           line("CONFLUENCE: MA40 + S/R touch (2R, +slip SL)", [r for r in rows if r["rules_reason"] == "CONFLUENCE_SR"]),
+           line("CONFLUENCE: MA40 only (2R, +slip SL)", [r for r in rows if r["rules_reason"] == "CONFLUENCE_MA"]), "",
            "*What the rules filtered out:*",
            line("HELD inside narrow range", [r for r in rows if r["mode"] == "HOLD"]),
            line("Counter-trend blocked", [r for r in rows if "counter-trend" in str(r["rules_reason"])]),
@@ -4110,6 +4194,52 @@ def _eng_open_count(action: str) -> int:
         return 0
 
 
+def _cf_plan(d: pd.DataFrame, action: str, m: dict):
+    """CONFLUENCE rule set. Returns (plan_dict, 'ok') or (None, reject_reason).
+    Hard rules: MA40 slope with the trade, close on the trade side of MA40, engulfing extreme at/near MA40,
+    >= CF_MIN_ROOM_R to the next opposing swing/range level. S/R touch is a tag unless CF_REQUIRE_SR."""
+    atr, ma = m["atr"], m["ma40"]
+    h, l, c = m["high"], m["low"], m["close"]
+    buy = action == "BUY"
+    sign = 1.0 if buy else -1.0
+    ext = l if buy else h
+    ma_prev = d["ma40"].iloc[-1 - CF_SLOPE_BARS]
+    slope = sign * (ma - float(ma_prev)) / atr if not pd.isna(ma_prev) else 0.0
+    if slope < CF_MIN_SLOPE_ATR:
+        return None, f"MA40 slope {slope:+.2f} ATR not with trade"
+    if (c > ma) != buy:
+        return None, "closed on wrong side of MA40"
+    ma_gap = sign * (ext - ma) / atr
+    if not (-1.0 <= ma_gap <= CF_TOUCH_MA_ATR):
+        return None, f"no MA40 touch (gap {ma_gap:+.2f} ATR)"
+    # levels come from bars BEFORE the engulfing, so the candle cannot touch its own swing
+    levels = _oil_level_list(d.iloc[:-1])
+    sup = ("SWL", "RNGL", "RND0", "RND5") if buy else ("SWH", "RNGH", "RND0", "RND5")
+    hit = None
+    for kind, price, label in levels:
+        if kind in sup and kind in CF_SR_KINDS:
+            dist = sign * (ext - price) / atr
+            if -CF_SR_MAX_PEN_ATR <= dist <= CF_TOUCH_SR_ATR:
+                hit = (kind, price)
+                break
+    if not hit and CF_REQUIRE_SR:
+        return None, "no S/R level touch"
+    tag = "CONFLUENCE_SR" if hit else "CONFLUENCE_MA"
+    sl = ext - CF_SL_SLIP if buy else ext + CF_SL_SLIP
+    risk = abs(c - sl)
+    if risk <= 0:
+        return None, "bad risk"
+    opp = [p for k, p, _ in levels if k in CF_ROOM_KINDS and ((p > c) if buy else (p < c))]
+    if opp:
+        room = (min(opp) - c if buy else c - max(opp)) / risk
+        if room < CF_MIN_ROOM_R:
+            return None, f"only {room:.1f}R to next swing/range level"
+    tp = c + CF_TP_R * risk if buy else c - CF_TP_R * risk
+    sr_txt = f"{hit[0]} {hit[1]:.2f}" if hit else "no S/R"
+    return {"sl": sl, "tp": tp, "risk": risk, "tag": tag,
+            "reason": f"CONFLUENCE: MA40 gap {ma_gap:+.2f} ATR, {sr_txt}, slope {slope:+.2f}"}, "ok"
+
+
 async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, df_raw: pd.DataFrame):
     _extreme_roll_day(now_wib, _eng_state)
     if not is_forex_market_open(now_wib):
@@ -4120,7 +4250,19 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
                                             max_body_ratio=RG_MAX_BODY_RATIO)    # relaxed engulfing for the REGIME rule set
     rg = _regime_engine(d, update_state=True)
     gate = _rg_gate(d, action_r, m_r, rg) if action_r in ("BUY", "SELL") else None
-    if ENG_RULESET == "REGIME":
+    cf = None
+    if ENG_RULESET == "CONFLUENCE":
+        a_in, m_in = (action_r, m_r) if CF_USE_RELAXED else (action_c, m_c)
+        if a_in in ("BUY", "SELL"):
+            cf, why = _cf_plan(d, a_in, m_in)
+            if cf:
+                action = a_in
+                m = dict(m_in, sl=cf["sl"], tp1=cf["tp"], tp2=cf["tp"], risk=cf["risk"], reason=cf["reason"])
+            else:
+                action, m = "HOLD", dict(m_in, reason=why)
+        else:
+            action, m = "HOLD", m_in
+    elif ENG_RULESET == "REGIME":
         if gate and gate["allowed"]:
             action, m = action_r, m_r
         else:
@@ -4131,6 +4273,14 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
     _eng_state["last_reason"] = f"[{ENG_RULESET}/{rg.get('mode', '?')}] " + m.get("reason", "")
     # Shadow layer: log every engulfing candidate with context + regime tags, settle older ones. Cannot affect trading.
     _shadow_cand, _ctx = _eng_shadow_log(d, action_r, m_r, classic=(action_c, m_c), rg=rg, gate=gate)
+    if cf and DATABASE_URL:
+        try:
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("UPDATE eng_shadow SET sl=%s, tp1=%s, risk=%s, rules_reason=%s WHERE bar_time=%s",
+                        (cf["sl"], cf["tp"], cf["risk"], cf["tag"], str(m.get("bar_time"))))
+            conn.commit(); cur.close(); conn.close()
+        except Exception as e:
+            logging.warning(f"[ENG B CONFLUENCE] shadow update failed: {e}")
     _eng_shadow_resolve(d)
     if action == "HOLD":
         return
@@ -5153,6 +5303,7 @@ async def lifespan(app: FastAPI):
                         {"command":"pips","description":"Pips and USD breakdown"},
                         {"command":"logs","description":"Last 10 executed trades"},
                         {"command":"analyze","description":"Entry condition + ADX gate analysis"},
+                        {"command":"chart","description":"Gold M1 chart with S/R levels"},
                         {"command":"pause","description":"Emergency kill switch (all bots)"},
                         {"command":"resume","description":"Resume auto-trading"},
                         {"command":"oneway_on","description":"Enable dynamic 1H one-direction"},
@@ -5197,6 +5348,7 @@ async def lifespan(app: FastAPI):
                         {"command":"stats","description":"Mother Bar C performance"},
                         {"command":"pips","description":"Pips/earnings report (TP1/TP2/SL)"},
                         {"command":"analyze","description":"Entry condition category breakdown"},
+                        {"command":"chart","description":"Gold M5 chart with S/R levels"},
                         {"command":"last","description":"Last Mother Bar signals"},
                         {"command":"c_both","description":"Allow both BUY and SELL"},
                         {"command":"c_buyonly","description":"Restrict C to BUY only"},
@@ -5302,30 +5454,40 @@ _oil_levels_cache = {"text": "", "at": 0.0}
 OIL_LEVELS_TTL_SEC = 20          # server-side cache so EA polling cannot hammer Postgres
 OIL_LEVELS_ROUND_SPAN = 1.5      # draw round-number lines within +/- this many price units of the last close
 OIL_LEVELS_MAX_MARKERS = 40
+# Chart / level profiles (2026-10-16): the same S/R chart now serves oil (Bot B) and gold (Bot A on M1, Bot C on M5).
+CHART_PROFILES = {
+    "OIL": {"oil": True, "symbol": OIL_MT5_SYMBOL, "tf": "M5", "grid": ENG_CTX_ROUND_GRID, "span": OIL_LEVELS_ROUND_SPAN,
+            "big": 1.0, "tol": 0.015, "swing": ENG_CTX_SWING_BARS, "pad_min": 0.05, "bars": ENG_CHART_BARS, "tick_step": 6},
+    "GOLD_M1": {"oil": False, "symbol": "XAU/USD", "tf": "M1", "grid": 5.0, "span": 20.0,
+                "big": 10.0, "tol": 0.3, "swing": 60, "pad_min": 0.5, "bars": 90, "tick_step": 10},
+    "GOLD_M5": {"oil": False, "symbol": "XAU/USD", "tf": "M5", "grid": 10.0, "span": 40.0,
+                "big": 50.0, "tol": 0.3, "swing": 40, "pad_min": 0.5, "bars": 60, "tick_step": 6},
+}
 
 
-def _oil_level_list(d: pd.DataFrame):
+def _oil_level_list(d: pd.DataFrame, prof: dict = None):
     """[(kind, price, label)] -- swing H/L, range H/L and round numbers. Shared by /oil-levels and the Telegram chart."""
+    prof = prof or CHART_PROFILES["OIL"]
     last_close = float(d.iloc[-1]["close"])
     out, seen = [], []
 
     def add(kind, price, label):
-        if any(abs(price - x) < 0.015 for x in seen):
+        if any(abs(price - x) < prof["tol"] for x in seen):
             return
         seen.append(price)
         out.append((kind, price, label))
 
-    sw = d.iloc[-ENG_CTX_SWING_BARS:]
-    add("SWH", float(sw["high"].max()), f"Swing H ({ENG_CTX_SWING_BARS} bars)")
-    add("SWL", float(sw["low"].min()), f"Swing L ({ENG_CTX_SWING_BARS} bars)")
+    sw = d.iloc[-prof["swing"]:]
+    add("SWH", float(sw["high"].max()), f"Swing H ({prof['swing']} bars)")
+    add("SWL", float(sw["low"].min()), f"Swing L ({prof['swing']} bars)")
     add("RNGH", float(d["high"].max()), f"Range H ({len(d)} bars)")
     add("RNGL", float(d["low"].min()), f"Range L ({len(d)} bars)")
-    g = ENG_CTX_ROUND_GRID
-    k = int((last_close - OIL_LEVELS_ROUND_SPAN) // g)
-    while k * g <= last_close + OIL_LEVELS_ROUND_SPAN:
+    g = prof["grid"]
+    k = int((last_close - prof["span"]) // g)
+    while k * g <= last_close + prof["span"]:
         lvl = k * g
         if lvl > 0:
-            whole = abs(lvl - round(lvl)) < 1e-9
+            whole = abs(lvl / prof["big"] - round(lvl / prof["big"])) < 1e-9
             add("RND0" if whole else "RND5", lvl, f"Round {lvl:.2f}")
         k += 1
     return out
@@ -5366,6 +5528,42 @@ def _oil_levels_text() -> str:
         except Exception as e:
             logging.warning(f"[OIL LEVELS] marker query failed: {e}")
     return "\n".join(out) + "\n"
+
+
+_gold_levels_cache = {}
+GOLD_LEVELS_TTL_SEC = 10
+
+
+def _gold_levels_text(tf: str) -> str:
+    """Same plain-text format as /oil-levels (META / LVL lines, no markers) for the gold M1 (Bot A) or M5 (Bot C) feed."""
+    tf = "M1" if str(tf).upper() == "M1" else "M5"
+    prof = CHART_PROFILES["GOLD_M1" if tf == "M1" else "GOLD_M5"]
+    df = (mt5_market_cache_m1 if tf == "M1" else mt5_market_cache).get("df")
+    if df is None or len(df) < 30:
+        return f"ERR|no gold {tf} data yet\n"
+    d = _extreme_indicators(df, MB_CONFIG_C)
+    last = d.iloc[-1]
+    atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+    last_epoch = int(pd.Timestamp(last["datetime"]).value // 10**9)
+    out = [f"META|{last_epoch}|{float(last['close']):.3f}|{atr:.3f}|{len(d)}"]
+    for kind, price, label in _oil_level_list(d, prof):
+        out.append(f"LVL|{kind}|{price:.2f}|{label}")
+    return "\n".join(out) + "\n"
+
+
+@app.get("/gold-levels")
+async def gold_levels(tf: str = "M1"):
+    now = _time.time()
+    key = "M1" if str(tf).upper() == "M1" else "M5"
+    ent = _gold_levels_cache.get(key)
+    if not ent or now - ent["at"] > GOLD_LEVELS_TTL_SEC:
+        try:
+            txt = _gold_levels_text(key)
+        except Exception as e:
+            logging.warning(f"[GOLD LEVELS] failed: {e}")
+            txt = f"ERR|{type(e).__name__}\n"
+        ent = _gold_levels_cache[key] = {"text": txt, "at": now}
+    return PlainTextResponse(ent["text"])
 
 
 @app.get("/oil-levels")
@@ -5628,9 +5826,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
         if not sender_chat_id or not raw_text: return {"status": "ignored"}
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
-        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/b_classic", "/b_regime", "/regime", "/whatif", "/ctx", "/chart", "/macro", "/live_a", "/live_b", "/live_c"}
-        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare"} | C_FLIP_COMMANDS
+        CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare", "/chart"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/b_classic", "/b_regime", "/b_confluence", "/regime", "/whatif", "/ctx", "/chart", "/macro", "/live_a", "/live_b", "/live_c"}
+        BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare", "/chart"} | C_FLIP_COMMANDS
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
             return {"status": "ignored", "reason": "command_not_available_for_this_bot"}
@@ -5672,6 +5870,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/c_closebreak_on` / `/c_closebreak_off` - Toggle the Close Break entry\n"
                         "• `/c_momentum_on` / `/c_momentum_off` - Toggle the Momentum Break entry\n"
                         "• `/c_flip_status` - Per-entry ON/OFF + FLIP status\n"
+                        "• `/chart` - Gold M5 chart: candles, EMA9/21, S/R levels (swing, range, round numbers)\n"
                         "• `/c_flip_<entry>_on` / `_off` - Flip an entry (fib25, fib50, fib618, fib75, closebreak, momentum)\n"
                         "• `/compare` - A vs B vs C dashboard\n"
                         "• `/live_a` / `/live_b` / `/live_c` - Switch which bot's signals reach live MT5\n"
@@ -5691,7 +5890,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/last` - Last 10 trades\n"
                         "• `/regime` - Trend/range read, pattern in play, current mode\n"
                         "• `/whatif` - Replay shadow candidates under CLASSIC vs REGIME rules ($ at your lot)\n"
-                        "• `/b_classic` / `/b_regime` - Switch the engulfing rule set\n"
+                        "• `/b_classic` / `/b_regime` / `/b_confluence` - Switch the engulfing rule set\n"
                         "• `/chart` - Chart image: candles, MA40, S/R levels, engulfing markers\n"
                         "• `/ctx` - Shadow context stats (swing / sweep / exhaustion) for every engulfing candidate\n"
                         "• `/compare` - A vs B vs C dashboard\n"
@@ -5713,6 +5912,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/analyze` - Forward-test strategy analysis\n"
                         "• `/compare` - A vs B vs C dashboard (closed trades only)\n"
                         "• `/a_flip_status` - Per-entry ON/OFF + FLIP status\n"
+                        "• `/chart` - Gold M1 chart: candles, EMA9/21, S/R levels (swing, range, round numbers)\n"
                         "• `/a_<entry>_on` / `_off` - Entry ON/OFF (fib25, fib50, fib618, fib75, closebreak, momentum)\n"
                         "• `/a_flip_<entry>_on` / `_off` - Flip that entry (BUY\u2194SELL, SL\u2194TP1; A: TP2 = TP1)\n"
                         "• `/pause` - 🚨 Emergency kill switch (stops ALL strategies, including live execution)\n"
@@ -5834,7 +6034,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     _note += "\n\u26a0\ufe0f C's Momentum Break ENTRY is OFF, so nothing will fire or flip until you send /c_momentum_on."
                 await send_reply(entry_flip_status_text(_bot, _note))
 
-            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/ctx", "/chart", "/regime", "/whatif", "/b_classic", "/b_regime", "/b_both", "/b_ma40"):
+            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/ctx", "/chart", "/regime", "/whatif", "/b_classic", "/b_regime", "/b_confluence", "/b_both", "/b_ma40"):
                 try:
                     if raw_text == "/stats":
                         reply = build_oil_stats_text()
@@ -5853,11 +6053,14 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         reply = build_oil_regime_text()
                     elif raw_text == "/whatif":
                         reply = build_oil_whatif_text()
-                    elif raw_text in ("/b_classic", "/b_regime"):
-                        ENG_RULESET = "CLASSIC" if raw_text == "/b_classic" else "REGIME"
+                    elif raw_text in ("/b_classic", "/b_regime", "/b_confluence"):
+                        ENG_RULESET = {"/b_classic": "CLASSIC", "/b_regime": "REGIME", "/b_confluence": "CONFLUENCE"}[raw_text]
                         set_setting("eng_ruleset", ENG_RULESET)
                         reply = ("🎛️ *BOT B RULE SET UPDATED*\n\n" f"Rule set: *{ENG_RULESET}*\n" + (
                             "CLASSIC -- old filters: engulfing >= 1.0 ATR, engulfed body <= 62%, direction mode applies." if ENG_RULESET == "CLASSIC" else
+                            (f"CONFLUENCE -- engulfing (grey allowed) with MA40 slope with the trade, extreme within {CF_TOUCH_MA_ATR} ATR of MA40, "
+                             f"closes on the trade side, >= {CF_MIN_ROOM_R:.0f}R room. SL = extreme +{CF_SL_SLIP} slippage, TP = {CF_TP_R:.0f}R. "
+                             "S/R touch is only tagged. Check /whatif.") if ENG_RULESET == "CONFLUENCE" else
                             "REGIME -- trend/range/pattern engine. Narrow ranges are HELD (shadow/paper only) until they break; wide ranges are played "
                             "at the edges; trends and breakouts only take with-direction engulfings that touch MA40. Same SL/TP rules. "
                             "Check /regime and /whatif."))
@@ -5874,6 +6077,11 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         await send_reply(reply)
                 except Exception as e:
                     await send_reply(f"⚠️ Error: {e}")
+
+            elif raw_text == "/chart" and bot_role in ("control", "breakout"):
+                _chart_err = await send_gold_chart(client, sender_chat_id, active_token, "A" if bot_role == "control" else "C")
+                if _chart_err:
+                    await send_reply(_chart_err)
 
             elif raw_text == "/status":
                 if LAST_MT5_PING_TIME:

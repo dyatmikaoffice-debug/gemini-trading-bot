@@ -230,6 +230,33 @@ ENG_CTX_STRETCH_ATR = 1.5       # ... or the engulfed close stretched this x ATR
 ENG_CHART_ON_SIGNAL = True       # send a chart image with every Bot B signal
 ENG_CHART_BARS = 60             # candles shown in the Telegram chart
 ENG_SHADOW_MAX_BARS = 36        # shadow trade is closed as TIMEOUT after this many M5 bars (3h)
+# --- REGIME rule set (2026-10-16): switch with /b_regime and /b_classic (persisted as "eng_ruleset") ---
+ENG_RULESET = "CLASSIC"          # CLASSIC = old filters | REGIME = trend/range/pattern engine + MA40-touch entries
+ENG_RULESETS = {"CLASSIC", "REGIME"}
+RG_MIN_RANGE_ATR = 0.6           # REGIME: looser engulfing size (the MA40 touch is the main edge) ...
+RG_MAX_BODY_RATIO = 0.85         # ... and looser engulfed/engulfing body ratio
+RG_SLOPE_BARS = 6                # MA40 slope window (bars) for the trend vote
+RG_TREND_SLOPE_ATR = 0.20        # |MA40 slope| over that window, in ATR, for a trend vote
+RG_ER_BARS = 14                  # Kaufman efficiency-ratio window
+RG_ER_MIN = 0.30                 # ER above this = directional
+RG_ADX_MIN = 18.0                # ADX (with DI agreeing) for a trend vote
+RG_SIDE_BARS = 10                # bars checked for "price lives on one side of MA40"
+RG_SIDE_FRAC = 0.70              # fraction of those bars on one side for a trend vote
+RG_TREND_VOTES = 3               # votes (of 4) needed to call TREND; fewer = RANGE. Lower = faster but more false trends
+RG_PIVOT_K = 2                   # fractal pivot: higher/lower than K bars each side
+RG_PATTERN_BARS = 70             # how far back patterns are searched
+RG_MIN_PATTERN_BARS = 12         # a pattern must span at least this many bars
+RG_BREAK_BUF_ATR = 0.25          # a close beyond a pattern line by this x ATR = breakout
+RG_BREAK_MEMORY_BARS = 12        # after a break, play the with-break MA40 touches for this many bars
+RG_FLAT_SLOPE = 0.15             # |line slope| under this (ATR per 10 bars) counts as flat
+RG_FLAG_IMPULSE_ATR = 4.0        # prior move (ATR over RG_FLAG_IMPULSE_BARS) that makes a channel/triangle a flag/pennant
+RG_FLAG_IMPULSE_BARS = 15
+RG_WIDE_RANGE_ATR = 10.0         # pattern/box wider than this (in ATR) = play INSIDE the range (edge fades); narrower = HOLD until break
+RG_BOX_BARS = 40                 # fallback range box (no pattern found)
+RG_EDGE_ATR = 1.0                # edge zone for range fades (capped at 25% of the range width)
+RG_TOUCH_NEAR_ATR = 0.30         # engulfing extreme within this x ATR of MA40 (or beyond it) counts as a touch
+RG_TOUCH_MAX_PEN_ATR = 1.0       # ... but not if it pierced MA40 by more than this x ATR
+OIL_SPREAD_ASSUMED = 0.03        # price units, used only by /whatif net-of-spread numbers
 OIL_DIRECTION_MODE = "BOTH"     # BOTH | MA40  (persisted in bot_settings as "oil_direction_mode")
 OIL_DIRECTION_MODES = {"BOTH", "MA40"}
 mt5_market_cache_oil = {"df": None, "updated_at": None, "source": None}   # B's oil M5 feed, pushed by the MT5 EA
@@ -637,6 +664,9 @@ def init_db():
                 outcome TEXT DEFAULT 'OPEN', r_result REAL, mfe_r REAL, mae_r REAL, bars_held INTEGER, resolved_at TIMESTAMPTZ
             );
         """)
+        for _col in ("regime TEXT", "pattern TEXT", "pattern_state TEXT", "mode TEXT", "width_atr REAL", "rg_votes INTEGER",
+                     "ma_touch_dist REAL", "ma_touch BOOLEAN", "rules_pass BOOLEAN", "rules_reason TEXT"):
+            cursor.execute(f"ALTER TABLE eng_shadow ADD COLUMN IF NOT EXISTS {_col};")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_time ON bot_events(event_time DESC);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_cycle ON bot_events(cycle_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_type ON bot_events(event_type);")
@@ -3228,10 +3258,12 @@ def _eng_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None):
+def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None, min_range_atr: float = None, max_body_ratio: float = None):
     """Looks only at the LAST closed bar (engulfing) and the one before it (engulfed).
     Returns (action, info). action is BUY/SELL on a valid setup, else HOLD with info['reason']."""
     direction_mode = direction_mode or OIL_DIRECTION_MODE
+    min_range_atr = ENG_MIN_RANGE_ATR if min_range_atr is None else min_range_atr
+    max_body_ratio = ENG_MAX_BODY_RATIO if max_body_ratio is None else max_body_ratio
     need = ENG_MA_PERIOD + ENG_SLOPE_BARS + 2
     if d is None or len(d) < need:
         return "HOLD", {"reason": f"Insufficient oil history ({0 if d is None else len(d)}/{need} bars)"}
@@ -3270,8 +3302,8 @@ def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None):
         "high": h, "low": l, "close": c,
     }
 
-    if range_atr < ENG_MIN_RANGE_ATR:
-        info["reason"] = f"{action} engulfing too small: range {range_atr:.2f} ATR < {ENG_MIN_RANGE_ATR:.2f}"
+    if range_atr < min_range_atr:
+        info["reason"] = f"{action} engulfing too small: range {range_atr:.2f} ATR < {min_range_atr:.2f}"
         return "HOLD", info
     if ENG_MAX_RANGE_ATR is not None and range_atr > ENG_MAX_RANGE_ATR:
         info["reason"] = f"{action} engulfing too large: range {range_atr:.2f} ATR > {ENG_MAX_RANGE_ATR:.2f}"
@@ -3279,8 +3311,8 @@ def detect_engulfing_signal(d: pd.DataFrame, direction_mode: str = None):
     if pbody <= 0:
         info["reason"] = "Engulfed candle is a doji (zero body)"
         return "HOLD", info
-    if ratio > ENG_MAX_BODY_RATIO:
-        info["reason"] = f"{action} engulfed body {ratio*100:.0f}% of engulfing body > {ENG_MAX_BODY_RATIO*100:.0f}%"
+    if ratio > max_body_ratio:
+        info["reason"] = f"{action} engulfed body {ratio*100:.0f}% of engulfing body > {max_body_ratio*100:.0f}%"
         return "HOLD", info
     if risk < ENG_MIN_RISK_ABS:
         info["reason"] = f"{action} SL distance {risk:.3f} < min {ENG_MIN_RISK_ABS:.2f}"
@@ -3385,28 +3417,46 @@ def _eng_shadow_candidate(d: pd.DataFrame, action: str, m: dict):
             "bar_time": str(cur["datetime"])}
 
 
-def _eng_shadow_log(d: pd.DataFrame, action: str, m: dict):
-    """Computes tags (always) and stores the candidate (if DB). Returns (cand, tags) or (None, None). Never raises."""
+def _eng_shadow_log(d: pd.DataFrame, action: str, m: dict, classic=None, rg: dict = None, gate: dict = None):
+    """Computes tags (always) and stores the candidate (if DB). `action, m` come from the RELAXED detection (superset),
+    `classic` is the (action, info) of the old filters (sets the 'passed' flag), rg/gate = regime read and REGIME rule verdict.
+    Returns (cand, tags) or (None, None). Never raises."""
     try:
         if not ENG_SHADOW_ENABLED:
             return None, None
         cand = _eng_shadow_candidate(d, action, m)
         if not cand:
             return None, None
+        if classic is not None and cand["geom"] == "BODY":
+            c_act, c_m = classic
+            cand["passed"] = c_act in ("BUY", "SELL")
+            cand["reject_reason"] = "PASSED FILTERS" if cand["passed"] else str(c_m.get("reason", ""))[:200]
         tags = _eng_context_tags(d, cand["action"])
+        rg = rg or {}
+        pat = rg.get("pattern") or {}
+        pattern_name = pat.get("name") or ("BOX" if rg.get("box") else "NONE")
+        wd = rg.get("width_atr")
+        if gate:
+            rules_pass, rules_reason = bool(gate["allowed"]), str(gate["reason"])[:200]
+            touch_d, touch = float(gate["touch_dist"]), bool(gate["touch"])
+        else:
+            rules_pass, rules_reason, touch_d, touch = False, "range-only engulfing / no valid body engulfing", None, False
         if DATABASE_URL:
             conn = get_db_connection(); cur = conn.cursor()
             cur.execute("""
                 INSERT INTO eng_shadow (bar_time, action, geom, passed, reject_reason, entry, sl, tp1, risk, atr, range_atr,
                     body_ratio, adx, ma_dist_atr, swing_dist_atr, at_swing, sweep, round_dist_atr, near_round,
-                    push_bars, push_atr, ema20_stretch_atr, exhausted, ctx_score)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    push_bars, push_atr, ema20_stretch_atr, exhausted, ctx_score,
+                    regime, pattern, pattern_state, mode, width_atr, rg_votes, ma_touch_dist, ma_touch, rules_pass, rules_reason)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (bar_time) DO NOTHING
             """, (cand["bar_time"], cand["action"], cand["geom"], cand["passed"], cand["reject_reason"], cand["entry"],
                   cand["sl"], cand["tp1"], cand["risk"], cand["atr"], cand["range_atr"], cand["body_ratio"], cand["adx"],
                   cand["ma_dist_atr"], tags["swing_dist_atr"], tags["at_swing"], tags["sweep"], tags["round_dist_atr"],
                   tags["near_round"], tags["push_bars"], tags["push_atr"], tags["ema20_stretch_atr"], tags["exhausted"],
-                  tags["ctx_score"]))
+                  tags["ctx_score"],
+                  rg.get("regime"), pattern_name, rg.get("pattern_state"), rg.get("mode"),
+                  (float(wd) if wd is not None else None), rg.get("votes"), touch_d, touch, rules_pass, rules_reason))
             conn.commit(); cur.close(); conn.close()
         return cand, tags
     except Exception as e:
@@ -3420,7 +3470,7 @@ def _eng_shadow_mark(bar_time, reason: str):
         if not (ENG_SHADOW_ENABLED and DATABASE_URL and bar_time):
             return
         conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("UPDATE eng_shadow SET passed = FALSE, reject_reason = %s WHERE bar_time = %s", (str(reason)[:200], str(bar_time)))
+        cur.execute("UPDATE eng_shadow SET passed = FALSE, rules_pass = FALSE, reject_reason = %s WHERE bar_time = %s", (str(reason)[:200], str(bar_time)))
         conn.commit(); cur.close(); conn.close()
     except Exception as e:
         logging.warning(f"[ENG B SHADOW] mark failed: {e}")
@@ -3621,7 +3671,28 @@ def render_oil_chart_png(df: pd.DataFrame, bars: int = None, signal: dict = None
     title = f"{OIL_MT5_SYMBOL} M5 | last {len(d)} bars | ATR {atr:.2f} | close {float(d.iloc[-1]['close']):.2f}"
     if signal:
         title = f"{signal.get('action', '')} signal #{signal.get('id', '')} | " + title
-    ax.set_title(title, color="white", fontsize=10)
+    try:
+        rg = _regime_engine(d_all, update_state=False)
+        if rg.get("ok"):
+            N, M = len(d_all), len(d)
+            pat = rg.get("pattern")
+            ptxt = "no pattern"
+            if pat:
+                off = pat["start_full"] - (N - M)                 # chart x = window x + off
+                xa = max(pat["x0"] + off, 0)
+                xs = np.array([xa, M + 1.0])
+                for sl_, b_ in ((pat["su"], pat["bu"]), (pat["sl"], pat["bl"])):
+                    ax.plot(xs, sl_ * (xs - off) + b_, color="#ce93d8", linewidth=1.4, linestyle="-.", alpha=0.95)
+                ptxt = f"{pat['name']} ({rg['pattern_state']}, {pat['width_atr']:.1f} ATR)"
+            elif rg.get("box"):
+                bx = rg["box"]
+                for v in (bx["hi"], bx["lo"]):
+                    ax.hlines(v, max(M - RG_BOX_BARS, 0), M + 1, colors="#ce93d8", linestyles="-.", linewidth=1.2)
+                ptxt = f"range box ({rg['pattern_state']}, {bx['width_atr']:.1f} ATR)"
+            title += f"\n{rg['regime']} | {ptxt} | mode {rg['mode']} | rules {ENG_RULESET}"
+    except Exception as e:
+        logging.warning(f"[ENG B CHART] regime overlay failed: {e}")
+    ax.set_title(title, color="white", fontsize=9.5)
     ax.legend(loc="upper left", facecolor=BG, edgecolor="#37474f", labelcolor=FG, fontsize=8)
     fig.text(0.01, 0.005, "Arrows: bright = passed filters, grey = rejected; digit = context score 0-3 (swing + sweep + exhausted), r = range-only. "
              "Times = MT5 server time.", color="#78909c", fontsize=6.5)
@@ -3644,7 +3715,12 @@ def _oil_chart_caption(df: pd.DataFrame, extra: str = "") -> str:
             return "none"
         name = x[2] if x[0].startswith("RND") else f"{x[2]} {x[1]:.2f}"
         return f"{name} ({abs(price - x[1]) / atr:.1f} ATR)" if atr > 0 else name
-    return (extra + f"Close {price:.2f} | ATR {atr:.2f}\nNearest support: {fmt(below)}\nNearest resistance: {fmt(above)}")[:1000]
+    try:
+        rg = _regime_engine(d, update_state=False)
+        mode_line = f"\nMode: {rg['mode']} -- {rg['mode_reason']}" if rg.get("ok") else ""
+    except Exception:
+        mode_line = ""
+    return (extra + f"Close {price:.2f} | ATR {atr:.2f}\nNearest support: {fmt(below)}\nNearest resistance: {fmt(above)}{mode_line}")[:1000]
 
 
 async def send_telegram_photo(client: httpx.AsyncClient, png: bytes, caption: str, chat_id: str, bot_token: str):
@@ -3677,6 +3753,346 @@ async def send_oil_chart(client: httpx.AsyncClient, chat_id: str, bot_token: str
         return f"Chart error: {e}"
 
 
+# ---------- Bot B REGIME / PATTERN ENGINE (2026-10-16) ----------
+# Rule set "REGIME": (1) classify TREND vs RANGE fast, (2) find range patterns (rectangle, triangles, wedges, flags,
+# pennants), (3) HOLD signals (shadow/paper only) while a narrow pattern is unbroken, (4) trade only inside a WIDE range
+# (edge fades), (5) after a break or in a trend, take only with-direction engulfings that TOUCH / nearly touch MA40.
+_rg_state = {"break_dir": None, "break_time": None, "break_pattern": None, "last_bar": None}
+
+
+def _rg_pivots(w: pd.DataFrame, k: int):
+    hi, lo, n = w["high"].values, w["low"].values, len(w)
+    ph, pl = [], []
+    for i in range(k, n - k):
+        if hi[i] > max(hi[i - k:i]) and hi[i] >= max(hi[i + 1:i + k + 1]):
+            ph.append((i, float(hi[i])))
+        if lo[i] < min(lo[i - k:i]) and lo[i] <= min(lo[i + 1:i + k + 1]):
+            pl.append((i, float(lo[i])))
+    return ph, pl
+
+
+def _rg_fit(pivots, atr):
+    """Fit a line through the last 3 pivots; if one sits too far off the line, use the last 2 only."""
+    pts = pivots[-3:]
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    s, b = np.polyfit(xs, ys, 1)
+    if len(pts) == 3 and max(abs(y - (s * x + b)) for x, y in pts) > 0.5 * atr:
+        pts = pivots[-2:]
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        s, b = np.polyfit(xs, ys, 1)
+    return float(s), float(b), pts
+
+
+def _rg_detect_pattern(d: pd.DataFrame):
+    """Pattern living in the last RG_PATTERN_BARS closed bars, or None. Line coordinates are in window index space."""
+    n_full = len(d)
+    if n_full < 30:
+        return None
+    atr = float(d["atr"].iloc[-1]) if not pd.isna(d["atr"].iloc[-1]) else 0.0
+    if atr <= 0:
+        return None
+    w = d.iloc[-RG_PATTERN_BARS:].reset_index(drop=True)
+    W = len(w)
+    ph, pl = _rg_pivots(w, RG_PIVOT_K)
+    if len(ph) < 2 or len(pl) < 2:
+        return None
+    su, bu, pu = _rg_fit(ph, atr)
+    sl_, bl, pp = _rg_fit(pl, atr)
+    x0 = min(pu[0][0], pp[0][0]); xn = W - 1
+    if xn - x0 < RG_MIN_PATTERN_BARS:
+        return None
+    up0, lo0 = su * x0 + bu, sl_ * x0 + bl
+    upn, lon = su * xn + bu, sl_ * xn + bl
+    wn, w0 = upn - lon, up0 - lo0
+    if wn < 1.0 * atr or w0 <= 0:
+        return None                                       # lines crossed (apex passed) or too thin to trade
+    # price must have respected the lines: at most 2 closes beyond them since the pattern began
+    buf = RG_BREAK_BUF_ATR * atr
+    outside = 0
+    for x in range(x0, W):
+        cl = float(w["close"].iloc[x])
+        if cl > su * x + bu + buf or cl < sl_ * x + bl - buf:
+            outside += 1
+    if outside > 2:
+        return None
+    su10, sl10 = su * 10.0 / atr, sl_ * 10.0 / atr
+    conv = wn / w0
+    F = RG_FLAT_SLOPE
+    fu, fl = abs(su10) <= F, abs(sl10) <= F
+    # prior impulse (for flags / pennants): move into the pattern start, measured on the full frame
+    start_full = n_full - W + x0
+    imp = 0.0
+    if start_full - RG_FLAG_IMPULSE_BARS >= 0:
+        imp = (float(d["close"].iloc[start_full]) - float(d["close"].iloc[start_full - RG_FLAG_IMPULSE_BARS])) / atr
+    name, bias = None, "NONE"
+    if fu and fl:
+        name = "RECTANGLE"
+    elif su10 < -F and sl10 > F:
+        name = "SYM_TRIANGLE"
+        if abs(imp) >= RG_FLAG_IMPULSE_ATR:
+            name, bias = ("BULL_PENNANT", "UP") if imp > 0 else ("BEAR_PENNANT", "DOWN")
+    elif fu and sl10 > F:
+        name, bias = "ASC_TRIANGLE", "UP"
+    elif fl and su10 < -F:
+        name, bias = "DESC_TRIANGLE", "DOWN"
+    elif su10 > F and sl10 > F:
+        if conv < 0.85 and sl10 > su10:
+            name, bias = "RISING_WEDGE", "DOWN"
+        elif imp <= -RG_FLAG_IMPULSE_ATR:
+            name, bias = "BEAR_FLAG", "DOWN"
+        # a plain rising channel is trend structure, not consolidation -> no pattern (keeps trend pullbacks tradable)
+    elif su10 < -F and sl10 < -F:
+        if conv < 0.85 and su10 < sl10:
+            name, bias = "FALLING_WEDGE", "UP"
+        elif imp >= RG_FLAG_IMPULSE_ATR:
+            name, bias = "BULL_FLAG", "UP"
+        # a plain falling channel is trend structure, not consolidation -> no pattern
+    if name is None:
+        return None                                       # broadening / irregular shapes are ignored
+    return {"name": name, "bias": bias, "su": su, "bu": bu, "sl": sl_, "bl": bl, "x0": x0, "W": W,
+            "up_now": upn, "lo_now": lon, "width_atr": wn / atr, "conv": conv, "impulse_atr": imp,
+            "touches_up": len(pu), "touches_lo": len(pp), "start_full": n_full - W}
+
+
+def _rg_classify(d: pd.DataFrame) -> dict:
+    """Fast TREND/RANGE vote: MA40 slope, efficiency ratio, ADX+DI, and how consistently price sits on one side of MA40."""
+    atr = float(d["atr"].iloc[-1]); c = d["close"]; ma = d["ma40"]
+    slope = (float(ma.iloc[-1]) - float(ma.iloc[-1 - RG_SLOPE_BARS])) / atr if atr > 0 and not pd.isna(ma.iloc[-1 - RG_SLOPE_BARS]) else 0.0
+    seg = c.iloc[-RG_ER_BARS - 1:]
+    path = float(seg.diff().abs().sum())
+    er = abs(float(seg.iloc[-1]) - float(seg.iloc[0])) / path if path > 0 else 0.0
+    adx = float(d["adx"].iloc[-1]) if not pd.isna(d["adx"].iloc[-1]) else 0.0
+    gap = float(d["plus_di"].iloc[-1]) - float(d["minus_di"].iloc[-1]) if not pd.isna(d["plus_di"].iloc[-1]) else 0.0
+    above = float((c.iloc[-RG_SIDE_BARS:] > ma.iloc[-RG_SIDE_BARS:]).mean())
+    up_votes = int(slope >= RG_TREND_SLOPE_ATR) + int(er >= RG_ER_MIN and c.iloc[-1] > c.iloc[-RG_ER_BARS - 1]) + \
+        int(adx >= RG_ADX_MIN and gap > 0) + int(above >= RG_SIDE_FRAC)
+    dn_votes = int(slope <= -RG_TREND_SLOPE_ATR) + int(er >= RG_ER_MIN and c.iloc[-1] < c.iloc[-RG_ER_BARS - 1]) + \
+        int(adx >= RG_ADX_MIN and gap < 0) + int(above <= 1 - RG_SIDE_FRAC)
+    if up_votes >= RG_TREND_VOTES and up_votes > dn_votes:
+        regime, votes = "TREND_UP", up_votes
+    elif dn_votes >= RG_TREND_VOTES and dn_votes > up_votes:
+        regime, votes = "TREND_DOWN", dn_votes
+    else:
+        regime, votes = "RANGE", max(up_votes, dn_votes)
+    return {"regime": regime, "votes": votes, "slope_atr": slope, "er": er, "adx": adx, "di_gap": gap}
+
+
+def _regime_engine(d: pd.DataFrame, update_state: bool = False) -> dict:
+    """Full read of the market. update_state=True is only used once per new bar by the trading loop;
+    display callers (/regime, /chart, /whatif) must pass False so they cannot disturb the break memory."""
+    out = {"ok": False, "regime": "RANGE", "votes": 0, "pattern": None, "pattern_state": "NONE", "box": None,
+           "mode": "HOLD", "mode_reason": "not enough data", "break_dir": None, "width_atr": None}
+    need = ENG_MA_PERIOD + RG_SLOPE_BARS + 5
+    if d is None or len(d) < max(need, 45):
+        return out
+    atr = float(d["atr"].iloc[-1]) if not pd.isna(d["atr"].iloc[-1]) else 0.0
+    if atr <= 0 or pd.isna(d["ma40"].iloc[-1]):
+        return out
+    cls = _rg_classify(d)
+    out.update(cls); out["ok"] = True; out["atr"] = atr
+    cur_close = float(d["close"].iloc[-1]); cur_time = str(d["datetime"].iloc[-1]) if "datetime" in d.columns else ""
+    buf = RG_BREAK_BUF_ATR * atr
+
+    # --- pattern as known BEFORE the current bar, then judge the current bar against its projected lines
+    pat_prev = _rg_detect_pattern(d.iloc[:-1])
+    state, broke = "NONE", None
+    if pat_prev:
+        xc = pat_prev["W"]                                     # index of the current bar in the previous window's coordinates
+        up_c, lo_c = pat_prev["su"] * xc + pat_prev["bu"], pat_prev["sl"] * xc + pat_prev["bl"]
+        if cur_close > up_c + buf:
+            state, broke = "BREAK_UP", "UP"
+        elif cur_close < lo_c - buf:
+            state, broke = "BREAK_DOWN", "DOWN"
+        else:
+            state = "INSIDE"
+        pat = _rg_detect_pattern(d)                            # for display / edges we want the lines including the last bar
+        out["pattern"] = pat or pat_prev
+        if pat is None:
+            out["pattern"] = dict(pat_prev, up_now=up_c, lo_now=lo_c, width_atr=(up_c - lo_c) / atr)
+    else:
+        pat = _rg_detect_pattern(d)
+        if pat:
+            out["pattern"] = pat; state = "INSIDE"
+    # --- no pattern but ranging: use the 40-bar box and its own break test
+    box = None
+    if out["pattern"] is None and cls["regime"] == "RANGE":
+        prior = d.iloc[-RG_BOX_BARS - 1:-1]
+        bh, bl_ = float(prior["high"].max()), float(prior["low"].min())
+        box = {"hi": bh, "lo": bl_, "width_atr": (bh - bl_) / atr}
+        if cur_close > bh + buf:
+            state, broke = "BREAK_UP", "UP"
+        elif cur_close < bl_ - buf:
+            state, broke = "BREAK_DOWN", "DOWN"
+        else:
+            state = "INSIDE"
+        out["box"] = box
+    out["pattern_state"] = state
+
+    # --- break memory (persisted across bars; only mutated by the trading loop)
+    st = _rg_state
+    if update_state and st["last_bar"] != cur_time:
+        st["last_bar"] = cur_time
+        if broke:
+            if st["break_dir"] != broke:
+                st["break_time"] = cur_time
+                st["break_pattern"] = (out["pattern"] or {}).get("name", "BOX") if out["pattern"] else "BOX"
+            st["break_dir"] = broke
+        elif state == "INSIDE":
+            st["break_dir"] = None                               # price is back inside a range: false break / new formation
+    bdir, btime = st["break_dir"], st["break_time"]
+    if broke and not (bdir == broke):                            # display callers: reflect the break found on this very bar
+        bdir, btime = broke, cur_time
+    age = None
+    if bdir and btime and "datetime" in d.columns:
+        try:
+            age = int((pd.to_datetime(d["datetime"]) > pd.to_datetime(btime)).sum())
+        except Exception:
+            age = 0
+    out["break_dir"] = bdir if (bdir and age is not None and age <= RG_BREAK_MEMORY_BARS) else None
+    out["break_age"] = age
+
+    # --- choose the play mode
+    wide_th = RG_WIDE_RANGE_ATR
+    if out["break_dir"]:
+        out["mode"] = "BREAKOUT_" + out["break_dir"]
+        out["mode_reason"] = f"{(st['break_pattern'] or 'range')} broke {out['break_dir']} {age} bars ago -> with-break MA40 touches only"
+    elif state == "INSIDE" and out["pattern"]:
+        p = out["pattern"]; out["width_atr"] = p["width_atr"]
+        if p["width_atr"] <= wide_th:
+            out["mode"] = "HOLD"
+            out["mode_reason"] = f"inside {p['name']} ({p['width_atr']:.1f} ATR wide) -- HOLD (paper only) until it breaks"
+        else:
+            out["mode"] = "RANGE_EDGE"
+            out["mode_reason"] = f"inside WIDE {p['name']} ({p['width_atr']:.1f} ATR) -- edge fades only"
+    elif state == "INSIDE" and box:
+        out["width_atr"] = box["width_atr"]
+        if box["width_atr"] <= wide_th:
+            out["mode"] = "HOLD"
+            out["mode_reason"] = f"narrow range box ({box['width_atr']:.1f} ATR) -- HOLD (paper only) until it breaks"
+        else:
+            out["mode"] = "RANGE_EDGE"
+            out["mode_reason"] = f"WIDE range box ({box['width_atr']:.1f} ATR) -- edge fades only"
+    elif cls["regime"] in ("TREND_UP", "TREND_DOWN"):
+        out["mode"] = cls["regime"]
+        out["mode_reason"] = f"{cls['regime']} ({cls['votes']}/4 votes) -> with-trend MA40 touches only"
+    else:
+        out["mode"] = "HOLD"
+        out["mode_reason"] = "undecided market (no trend, no clear range)"
+    return out
+
+
+def _rg_gate(d: pd.DataFrame, action: str, m: dict, rg: dict) -> dict:
+    """Does the REGIME rule set allow this engulfing? Returns allowed / reason / MA40 touch numbers."""
+    atr, ma = m["atr"], m["ma40"]
+    h, l, c = m["high"], m["low"], m["close"]
+    buy = action == "BUY"
+    touch_dist = ((l - ma) if buy else (ma - h)) / atr         # <= 0: wick reached / pierced MA40; > 0: gap to MA40
+    touch = (-RG_TOUCH_MAX_PEN_ATR <= touch_dist <= RG_TOUCH_NEAR_ATR)
+    side_ok = (c > ma) if buy else (c < ma)                    # closed back on the trade's side of MA40
+    res = {"allowed": False, "reason": "", "mode": rg.get("mode", "HOLD"), "touch_dist": touch_dist, "touch": bool(touch and side_ok)}
+    if not rg.get("ok"):
+        res["reason"] = "regime engine not ready"; return res
+    mode = rg["mode"]
+    if mode == "HOLD":
+        res["reason"] = "HELD: " + rg["mode_reason"]
+    elif mode in ("TREND_UP", "BREAKOUT_UP", "TREND_DOWN", "BREAKOUT_DOWN"):
+        want_buy = mode.endswith("UP")
+        if buy != want_buy:
+            res["reason"] = f"counter-trend {action} blocked ({mode})"
+        elif not touch:
+            res["reason"] = f"{action} not at MA40 (gap {touch_dist:+.2f} ATR, need <= {RG_TOUCH_NEAR_ATR:.2f}) ({mode})"
+        elif not side_ok:
+            res["reason"] = f"{action} did not close back on the trend side of MA40 ({mode})"
+        else:
+            res["allowed"] = True; res["reason"] = f"{mode}: {action} off MA40 (gap {touch_dist:+.2f} ATR)"
+    elif mode == "RANGE_EDGE":
+        p, box = rg.get("pattern"), rg.get("box")
+        if p:
+            upper, lower = p["up_now"], p["lo_now"]
+        elif box:
+            upper, lower = box["hi"], box["lo"]
+        else:
+            res["reason"] = "range edges unknown"; return res
+        zone = min(RG_EDGE_ATR * atr, 0.25 * (upper - lower))
+        if buy and l <= lower + zone:
+            res["allowed"] = True; res["reason"] = f"RANGE_EDGE: BUY at range low ({l - lower:+.2f} from {lower:.2f})"
+        elif (not buy) and h >= upper - zone:
+            res["allowed"] = True; res["reason"] = f"RANGE_EDGE: SELL at range high ({upper - h:+.2f} from {upper:.2f})"
+        else:
+            res["reason"] = f"RANGE_EDGE: {action} is not at the range edge (zone {zone:.2f})"
+    return res
+
+
+def build_oil_regime_text() -> str:
+    df = mt5_market_cache_oil.get("df")
+    if df is None:
+        return "No oil data yet."
+    d = _eng_indicators(df)
+    rg = _regime_engine(d, update_state=False)
+    if not rg.get("ok"):
+        return "Regime engine needs more bars."
+    lines = ["🧭 *BOT B REGIME*", f"Rule set in use: *{ENG_RULESET}*",
+             f"Regime: *{rg['regime']}* ({rg['votes']}/4 votes) | slope {rg['slope_atr']:+.2f} ATR | ER {rg['er']:.2f} | ADX {rg['adx']:.1f}"]
+    p = rg.get("pattern")
+    if p:
+        lines.append(f"Pattern: *{p['name']}* ({rg['pattern_state']}), bias {p['bias']}, width {p['width_atr']:.1f} ATR, "
+                     f"lines {p['lo_now']:.2f} - {p['up_now']:.2f}")
+    elif rg.get("box"):
+        b = rg["box"]
+        lines.append(f"No pattern. Range box {b['lo']:.2f} - {b['hi']:.2f} ({b['width_atr']:.1f} ATR), state {rg['pattern_state']}")
+    else:
+        lines.append("No range pattern.")
+    if rg.get("break_dir"):
+        lines.append(f"Break: *{rg['break_dir']}* {rg.get('break_age')} bars ago (memory {RG_BREAK_MEMORY_BARS} bars)")
+    lines.append(f"Mode: *{rg['mode']}* -- {rg['mode_reason']}")
+    last = d.iloc[-1]
+    lines.append(f"Price {float(last['close']):.2f} | MA40 {float(last['ma40']):.2f} ({(float(last['close']) - float(last['ma40'])) / rg['atr']:+.1f} ATR)")
+    return "\n".join(lines)
+
+
+def build_oil_whatif_text() -> str:
+    """Replay every resolved shadow candidate under each rule set. $ = R x risk x $1000/lot x lot x 2 legs; 'net' also pays the assumed spread."""
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""SELECT passed, rules_pass, rules_reason, mode, pattern, regime, ma_touch, outcome, r_result, risk
+                   FROM eng_shadow WHERE outcome <> 'OPEN' AND r_result IS NOT NULL""")
+    rows = cur.fetchall(); cur.close(); conn.close()
+    if not rows:
+        return "🧪 *BOT B WHAT-IF*\n\nNo resolved shadow trades yet."
+    per_lot = OIL_USD_PER_PRICE_UNIT_PER_LOT * OIL_LOT_SIZE * 2.0
+
+    def line(label, rs):
+        n = len(rs)
+        if n == 0:
+            return f"• {label}: n=0"
+        tp = sum(1 for r in rs if r["outcome"] == "TP1")
+        gross = sum(float(r["r_result"]) * float(r["risk"] or 0) for r in rs) * per_lot
+        net = gross - n * OIL_SPREAD_ASSUMED * per_lot
+        avg = sum(float(r["r_result"]) for r in rs) / n
+        return f"• {label}: n={n}{' ⚠️' if n < 10 else ''} | TP1 {tp / n * 100:.0f}% | AvgR {avg:+.2f} | ${gross:+.0f} gross, ${net:+.0f} net"
+
+    out = [f"🧪 *BOT B WHAT-IF* (simulated, {OIL_LOT_SIZE} lot x 2 legs, spread {OIL_SPREAD_ASSUMED} assumed)",
+           f"Resolved candidates: *{len(rows)}* | ⚠️ = n under 10", "",
+           "*Rule sets:*",
+           line("All candidates (no filter)", rows),
+           line("CLASSIC (old filters)", [r for r in rows if r["passed"]]),
+           line("REGIME (new rules)", [r for r in rows if r["rules_pass"]]),
+           line("REGIME: MA40-touch plays", [r for r in rows if r["rules_pass"] and str(r["mode"]).startswith(("TREND", "BREAKOUT"))]),
+           line("REGIME: range-edge plays", [r for r in rows if r["rules_pass"] and r["mode"] == "RANGE_EDGE"]), "",
+           "*What the rules filtered out:*",
+           line("HELD inside narrow range", [r for r in rows if r["mode"] == "HOLD"]),
+           line("Counter-trend blocked", [r for r in rows if "counter-trend" in str(r["rules_reason"])]),
+           line("Not at MA40", [r for r in rows if "not at MA40" in str(r["rules_reason"])]),
+           line("Touched MA40 (any mode)", [r for r in rows if r["ma_touch"]]), "",
+           "*By regime:*"]
+    for k in ("TREND_UP", "TREND_DOWN", "RANGE"):
+        out.append(line(k, [r for r in rows if r["regime"] == k]))
+    pats = sorted({r["pattern"] for r in rows if r["pattern"] and r["pattern"] != "NONE"})
+    if pats:
+        out += ["", "*By pattern in play:*"] + [line(p, [r for r in rows if r["pattern"] == p]) for p in pats]
+    return "\n".join(out)[:3900]
+
+
+
 def _eng_open_count(action: str) -> int:
     """Open (unresolved) B trades in this direction. Fails to 0 if DB is unreachable."""
     if not DATABASE_URL:
@@ -3699,11 +4115,22 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
     if not is_forex_market_open(now_wib):
         return
     d = _eng_indicators(df_raw)
-    action, m = detect_engulfing_signal(d)
+    action_c, m_c = detect_engulfing_signal(d)                                   # CLASSIC filters
+    action_r, m_r = detect_engulfing_signal(d, direction_mode="BOTH", min_range_atr=RG_MIN_RANGE_ATR,
+                                            max_body_ratio=RG_MAX_BODY_RATIO)    # relaxed engulfing for the REGIME rule set
+    rg = _regime_engine(d, update_state=True)
+    gate = _rg_gate(d, action_r, m_r, rg) if action_r in ("BUY", "SELL") else None
+    if ENG_RULESET == "REGIME":
+        if gate and gate["allowed"]:
+            action, m = action_r, m_r
+        else:
+            action, m = "HOLD", dict(m_r, reason=(gate["reason"] if gate else m_r.get("reason", "")))
+    else:
+        action, m = action_c, m_c
     _eng_state["last_bar"] = m.get("bar_time")
-    _eng_state["last_reason"] = m.get("reason", "")
-    # Shadow layer: log every engulfing candidate with context tags, settle older ones. Cannot affect trading.
-    _shadow_cand, _ctx = _eng_shadow_log(d, action, m)
+    _eng_state["last_reason"] = f"[{ENG_RULESET}/{rg.get('mode', '?')}] " + m.get("reason", "")
+    # Shadow layer: log every engulfing candidate with context + regime tags, settle older ones. Cannot affect trading.
+    _shadow_cand, _ctx = _eng_shadow_log(d, action_r, m_r, classic=(action_c, m_c), rg=rg, gate=gate)
     _eng_shadow_resolve(d)
     if action == "HOLD":
         return
@@ -3729,7 +4156,7 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
     side_txt = "ABOVE_MA40" if price > m["ma40"] else "BELOW_MA40"
     reasoning = (f"{trigger}; range={m['range']:.3f} ({m['range_atr']:.2f} ATR), engulfed body={m['body_ratio']*100:.0f}% of engulfing, "
                  f"ATR={m['atr']:.3f}, ADX={m['adx']:.1f}, MA40={m['ma40']:.3f} (dist {m['ma_dist_atr']:+.2f} ATR), "
-                 f"stack #{stack_idx}, direction mode={OIL_DIRECTION_MODE}, data=MT5. {_ctx_line(_ctx)}")
+                 f"stack #{stack_idx}, direction mode={OIL_DIRECTION_MODE}, data=MT5. Ruleset={ENG_RULESET} mode={rg.get('mode')}. {_ctx_line(_ctx)}")
     if not DATABASE_URL:
         return
     try:
@@ -3767,6 +4194,7 @@ async def evaluate_engulfing_oil(client: httpx.AsyncClient, now_wib: datetime, d
             f"Engulfing range: *{m['range']:.2f}* ({m['range_atr']:.2f} ATR) | Engulfed body: *{m['body_ratio']*100:.0f}%* of engulfing\n"
             f"ADX: *{m['adx']:.1f}* | MA40 dist: *{m['ma_dist_atr']:+.2f} ATR* ({regime.replace('_', ' ')})\n"
             f"Stack: *#{stack_idx}* of max {ENG_STACK_MAX} | Direction mode: *{OIL_DIRECTION_MODE}*\n"
+            f"Ruleset: *{ENG_RULESET}* | Mode: *{rg.get('mode')}*\n"
             f"{_ctx_line(_ctx)}\n\n"
             f"{mode_footer}",
             EXPERIMENTAL_TELEGRAM_CHAT_ID, EXPERIMENTAL_TELEGRAM_BOT_TOKEN
@@ -3963,7 +4391,7 @@ def build_oil_status_text() -> str:
     fresh = _mt5_cache_fresh(cache)
     lines = ["🕯️ *BOT B ENGULFING OIL -- STATUS*", "――――――――――――――――――――",
              f"Symbol: *{OIL_MT5_SYMBOL}* (M5, MT5 push only)",
-             f"Execution: *{EXPERIMENTAL_EXECUTION_MODE}* | Direction mode: *{OIL_DIRECTION_MODE}*",
+             f"Execution: *{EXPERIMENTAL_EXECUTION_MODE}* | Direction mode: *{OIL_DIRECTION_MODE}* | Rule set: *{ENG_RULESET}*",
              f"Oil feed: *{'FRESH' if fresh else 'STALE / none'}*" + (f" (last push {age:.0f}s ago)" if age is not None else " (nothing received yet)")]
     if cache.get("df") is not None:
         try:
@@ -4664,7 +5092,7 @@ async def background_scanning_loop():
 # --- FASTAPI LIFESPAN & AUTOMATED WEBHOOK SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE
+    global CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE, ENG_RULESET
     global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     init_db()
     # Restore direction-mode toggles (/oneway_on, /c_both, etc.) set before the
@@ -4674,6 +5102,9 @@ async def lifespan(app: FastAPI):
     OIL_DIRECTION_MODE = get_setting("oil_direction_mode", OIL_DIRECTION_MODE)
     if OIL_DIRECTION_MODE not in OIL_DIRECTION_MODES:
         OIL_DIRECTION_MODE = "BOTH"
+    ENG_RULESET = get_setting("eng_ruleset", ENG_RULESET)
+    if ENG_RULESET not in ENG_RULESETS:
+        ENG_RULESET = "CLASSIC"
     EXTREME_DIRECTION_MODE = get_setting("extreme_direction_mode", EXTREME_DIRECTION_MODE)
     logging.info(
         f"[SETTINGS] Restored direction modes -- Control: {CONTROL_DIRECTION_MODE}, "
@@ -5186,7 +5617,7 @@ async def ab_comparison():
 
 # --- WEBHOOK ENDPOINT FOR TELEGRAM COMMANDS ---
 async def _handle_telegram_webhook(request: Request, bot_role: str):
-    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE
+    global SYSTEM_TRADING_ENABLED, LAST_MT5_PING_TIME, CONTROL_DIRECTION_MODE, EXPERIMENTAL_DIRECTION_MODE, EXTREME_DIRECTION_MODE, OIL_DIRECTION_MODE, ENG_RULESET
     global CONTROL_EXECUTION_MODE, EXPERIMENTAL_EXECUTION_MODE, BREAKOUT_EXECUTION_MODE
     try:
         data = await request.json()
@@ -5198,7 +5629,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
 
         # Each Telegram bot has its own command surface. Bot B is read-only/paper-only.
         CONTROL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/logs", "/analyze", "/pause", "/resume", "/oneway_on", "/oneway_off", "/both", "/macro", "/live_a", "/live_b", "/live_c", "/compare"} | A_ENTRY_COMMANDS | A_FLIP_COMMANDS
-        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/ctx", "/chart", "/macro", "/live_a", "/live_b", "/live_c"}
+        EXPERIMENTAL_COMMANDS = {"/start", "/help", "/status", "/stats", "/pips", "/analyze", "/compare", "/last", "/b_both", "/b_ma40", "/b_classic", "/b_regime", "/regime", "/whatif", "/ctx", "/chart", "/macro", "/live_a", "/live_b", "/live_c"}
         BREAKOUT_COMMANDS = {"/start", "/help", "/status", "/stats", "/last", "/pips", "/analyze", "/c_both", "/c_buyonly", "/c_sellonly", "/macro", "/live_a", "/live_b", "/live_c", "/c_fib25_on", "/c_fib25_off", "/c_fib50_on", "/c_fib50_off", "/c_fib618_on", "/c_fib618_off", "/c_fib75_on", "/c_fib75_off", "/c_closebreak_on", "/c_closebreak_off", "/c_momentum_on", "/c_momentum_off", "/compare"} | C_FLIP_COMMANDS
         allowed = BREAKOUT_COMMANDS if bot_role == "breakout" else (EXPERIMENTAL_COMMANDS if bot_role == "experimental" else CONTROL_COMMANDS)
         if raw_text not in allowed:
@@ -5258,6 +5689,9 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                         "• `/pips` - Detailed pips and USD report (TP / BE / SL breakdown)\n"
                         "• `/analyze` - Breakdown by engulfed-body ratio, range vs ATR, MA40 distance, stack position, ADX, session\n"
                         "• `/last` - Last 10 trades\n"
+                        "• `/regime` - Trend/range read, pattern in play, current mode\n"
+                        "• `/whatif` - Replay shadow candidates under CLASSIC vs REGIME rules ($ at your lot)\n"
+                        "• `/b_classic` / `/b_regime` - Switch the engulfing rule set\n"
                         "• `/chart` - Chart image: candles, MA40, S/R levels, engulfing markers\n"
                         "• `/ctx` - Shadow context stats (swing / sweep / exhaustion) for every engulfing candidate\n"
                         "• `/compare` - A vs B vs C dashboard\n"
@@ -5400,7 +5834,7 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     _note += "\n\u26a0\ufe0f C's Momentum Break ENTRY is OFF, so nothing will fire or flip until you send /c_momentum_on."
                 await send_reply(entry_flip_status_text(_bot, _note))
 
-            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/ctx", "/chart", "/b_both", "/b_ma40"):
+            elif bot_role == "experimental" and raw_text in ("/stats", "/pips", "/analyze", "/status", "/ctx", "/chart", "/regime", "/whatif", "/b_classic", "/b_regime", "/b_both", "/b_ma40"):
                 try:
                     if raw_text == "/stats":
                         reply = build_oil_stats_text()
@@ -5415,6 +5849,18 @@ async def _handle_telegram_webhook(request: Request, bot_role: str):
                     elif raw_text == "/chart":
                         _err = await send_oil_chart(client, sender_chat_id, active_token)
                         reply = _err or None
+                    elif raw_text == "/regime":
+                        reply = build_oil_regime_text()
+                    elif raw_text == "/whatif":
+                        reply = build_oil_whatif_text()
+                    elif raw_text in ("/b_classic", "/b_regime"):
+                        ENG_RULESET = "CLASSIC" if raw_text == "/b_classic" else "REGIME"
+                        set_setting("eng_ruleset", ENG_RULESET)
+                        reply = ("🎛️ *BOT B RULE SET UPDATED*\n\n" f"Rule set: *{ENG_RULESET}*\n" + (
+                            "CLASSIC -- old filters: engulfing >= 1.0 ATR, engulfed body <= 62%, direction mode applies." if ENG_RULESET == "CLASSIC" else
+                            "REGIME -- trend/range/pattern engine. Narrow ranges are HELD (shadow/paper only) until they break; wide ranges are played "
+                            "at the edges; trends and breakouts only take with-direction engulfings that touch MA40. Same SL/TP rules. "
+                            "Check /regime and /whatif."))
                     else:
                         OIL_DIRECTION_MODE = "BOTH" if raw_text == "/b_both" else "MA40"
                         set_setting("oil_direction_mode", OIL_DIRECTION_MODE)
